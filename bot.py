@@ -173,7 +173,11 @@ CREATE TABLE IF NOT EXISTS agents (
     username TEXT,
     dm_ok    INTEGER NOT NULL DEFAULT 0,
     active   INTEGER NOT NULL DEFAULT 1,
-    role     TEXT NOT NULL DEFAULT 'agent'
+    role     TEXT NOT NULL DEFAULT 'agent',
+    status   TEXT NOT NULL DEFAULT 'active',
+    requested_at TEXT,
+    decided_by   INTEGER,
+    decided_at   TEXT
 );
 CREATE TABLE IF NOT EXISTS presets (
     name   TEXT PRIMARY KEY,
@@ -195,6 +199,14 @@ if "role" not in _cols:
     db.execute(
         "ALTER TABLE agents ADD COLUMN role TEXT NOT NULL DEFAULT 'agent'"
     )
+for _col, _ddl in [
+    ("status", "TEXT NOT NULL DEFAULT 'active'"),
+    ("requested_at", "TEXT"),
+    ("decided_by", "INTEGER"),
+    ("decided_at", "TEXT"),
+]:
+    if _col not in _cols:
+        db.execute(f"ALTER TABLE agents ADD COLUMN {_col} {_ddl}")
 for _name, _cfg in SEED_PRESETS.items():
     db.execute(
         "INSERT OR IGNORE INTO presets (name, config) VALUES (?,?)",
@@ -287,6 +299,30 @@ def is_admin(user_id: int) -> bool:
     return bool(row and row["role"] == "admin")
 
 
+def agent_status(user_id: int) -> str | None:
+    """'active', 'pending', 'declined', or None if never seen."""
+    if is_owner(user_id):
+        return "active"
+    row = q1("SELECT status FROM agents WHERE user_id=?", (user_id,))
+    return row["status"] if row else None
+
+
+def has_access(user_id: int) -> bool:
+    return agent_status(user_id) == "active"
+
+
+def admin_ids() -> list:
+    """Everyone who should see access requests."""
+    ids = set(ADMIN_IDS)
+    ids |= {
+        r["user_id"]
+        for r in q(
+            "SELECT user_id FROM agents WHERE role='admin' AND status='active'"
+        )
+    }
+    return sorted(ids)
+
+
 def role_of(user_id: int) -> str:
     if is_owner(user_id):
         return "owner"
@@ -360,7 +396,7 @@ def render_day(day_id: int) -> tuple[str, InlineKeyboardMarkup]:
 
 
 def week_stats(week_id: int) -> dict:
-    roster = q("SELECT * FROM agents WHERE active=1")
+    roster = q("SELECT * FROM agents WHERE status='active'")
     confirmed = {
         r["user_id"] for r in q("SELECT user_id FROM confirmations WHERE week_id=?", (week_id,))
     }
@@ -871,6 +907,8 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def on_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
+    if not await gate_cb(query):
+        return
     raw = query.data.split(":", 1)[1]
     if raw == "noop":
         await query.answer()
@@ -929,6 +967,8 @@ async def on_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def on_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
+    if not await gate_cb(query):
+        return
     kind, raw = query.data.split(":", 1)
     week_id = int(raw)
     user = query.from_user
@@ -1090,6 +1130,8 @@ async def cmd_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat.type != constants.ChatType.PRIVATE:
         await update.message.reply_text("DM me /plan to fill in your whole week at once 🙂")
         return
+    if not await gate(update):
+        return
     w = open_week()
     if not w:
         await update.message.reply_text("No week is open right now.")
@@ -1117,6 +1159,8 @@ async def refresh_plan(query, user_id: int, week_id: int, day_id: int | None = N
 
 async def on_plan_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
+    if not await gate_cb(query):
+        return
     raw = query.data.split(":", 1)[1]
     if raw == "noop":
         await query.answer()
@@ -1172,6 +1216,8 @@ async def on_plan_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def on_plan_nav(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Move between the day list and a single day."""
     query = update.callback_query
+    if not await gate_cb(query):
+        return
     raw = query.data.split(":", 1)[1]
     user = query.from_user
     w = open_week()
@@ -1194,6 +1240,8 @@ async def on_plan_nav(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
 async def on_plan_quick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
+    if not await gate_cb(query):
+        return
     action = query.data.split(":", 1)[1]
     user = query.from_user
     w = open_week()
@@ -1391,20 +1439,196 @@ async def cmd_savepreset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    touch_agent(update.effective_user, dm_ok=1)
+    user = update.effective_user
+    if update.effective_chat.type != constants.ChatType.PRIVATE:
+        return
+
+    status = agent_status(user.id)
+
+    if status == "active":
+        touch_agent(user, dm_ok=1)
+        await update.message.reply_text(
+            "You're all set ✅\n\n"
+            "Send /plan when a week is open to pick your slots.\n"
+            "/myshifts — what you're signed up for\n"
+            "/help — everything I can do"
+        )
+        return
+
+    if status == "pending":
+        await update.message.reply_text(
+            "Your request is still waiting for approval. "
+            "I'll message you the moment it's approved 👍"
+        )
+        return
+
+    if status == "declined":
+        await update.message.reply_text(
+            "Your access request wasn't approved. "
+            "Please speak to your manager if you think that's a mistake."
+        )
+        return
+
+    # Brand new — create the request
+    async with write_lock:
+        run(
+            "INSERT OR REPLACE INTO agents "
+            "(user_id, name, username, dm_ok, active, role, status, requested_at) "
+            "VALUES (?,?,?,1,1,'agent','pending',?)",
+            (user.id, user.full_name, user.username, now().isoformat()),
+        )
+
     await update.message.reply_text(
-        "You're set up ✅\n\n"
-        "I'll send you a reminder the evening before each of your shifts.\n\n"
-        "👉 When a new week is posted, send me /plan — you get your whole week in "
-        "one message and can tap it all through without scrolling the group.\n\n"
-        "/myshifts — what you're signed up for\n"
-        "/summary — the current board"
+        "👋 Thanks! I've sent your request to the team admins.\n\n"
+        "You'll get a message here once you're approved."
     )
+
+    handle = f"@{user.username}" if user.username else "no username"
+    text = (
+        "🔔 <b>Access request</b>\n\n"
+        f"<b>{esc(user.full_name)}</b>\n"
+        f"{handle} · <code>{user.id}</code>\n\n"
+        "Approve only if you recognise this person."
+    )
+    kb = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("✅ Approve", callback_data=f"ap:{user.id}"),
+                InlineKeyboardButton("🚫 Decline", callback_data=f"dn:{user.id}"),
+            ]
+        ]
+    )
+    sent = 0
+    for aid in admin_ids():
+        try:
+            await context.bot.send_message(
+                aid, text, reply_markup=kb, parse_mode=constants.ParseMode.HTML
+            )
+            sent += 1
+        except Exception as e:
+            log.info("Couldn't notify admin %s: %s", aid, e)
+    if not sent:
+        log.warning("Access request from %s but no admin could be reached.", user.id)
+
+
+async def on_access_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    kind, raw = query.data.split(":", 1)
+    target_id = int(raw)
+    decider = query.from_user
+
+    if not is_admin(decider.id):
+        await query.answer("Only admins can approve access.", show_alert=True)
+        return
+
+    row = q1("SELECT * FROM agents WHERE user_id=?", (target_id,))
+    if not row:
+        await query.answer("That request no longer exists.", show_alert=True)
+        return
+    if row["status"] != "pending":
+        await query.answer(
+            f"Already handled — {esc(row['name'])} is {row['status']}.", show_alert=True
+        )
+        return
+
+    approve = kind == "ap"
+    new_status = "active" if approve else "declined"
+    async with write_lock:
+        run(
+            "UPDATE agents SET status=?, decided_by=?, decided_at=? WHERE user_id=?",
+            (new_status, decider.id, now().isoformat(), target_id),
+        )
+
+    verdict = "approved ✅" if approve else "declined 🚫"
+    await query.answer(f"{row['name']} {verdict}")
+    try:
+        await query.edit_message_text(
+            f"🔔 <b>Access request</b>\n\n<b>{esc(row['name'])}</b>\n\n"
+            f"{verdict} by {esc(decider.full_name)}",
+            parse_mode=constants.ParseMode.HTML,
+        )
+    except BadRequest:
+        pass
+
+    try:
+        if approve:
+            await context.bot.send_message(
+                target_id,
+                "✅ You've been approved!\n\n"
+                "Send /plan when a week is open to pick your slots.\n"
+                "/help — everything I can do",
+            )
+            await refresh_menu_for(context.bot, target_id)
+        else:
+            await context.bot.send_message(
+                target_id,
+                "Your access request wasn't approved. "
+                "Please speak to your manager if you think that's a mistake.",
+            )
+    except Exception:
+        pass
+
+
+async def gate(update: Update) -> bool:
+    """True if this person may use the bot. Replies if not."""
+    uid = update.effective_user.id
+    status = agent_status(uid)
+    if status == "active":
+        return True
+    msg = {
+        "pending": "Your request is still waiting for approval 👍",
+        "declined": "You don't have access. Please speak to your manager.",
+    }.get(status, "Send /start to request access.")
+    if update.message:
+        await update.message.reply_text(msg)
+    return False
+
+
+async def gate_cb(query) -> bool:
+    """Same, for button taps."""
+    status = agent_status(query.from_user.id)
+    if status == "active":
+        return True
+    msg = {
+        "pending": "Your access request is still pending approval.",
+        "declined": "You don't have access to this.",
+    }.get(status, "Send /start to the bot to request access.")
+    await query.answer(msg, show_alert=True)
+    return False
+
+
+async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        return
+    rows = q(
+        "SELECT * FROM agents WHERE status='pending' ORDER BY requested_at"
+    )
+    if not rows:
+        await update.message.reply_text("No one is waiting for approval.")
+        return
+    await update.message.reply_text(f"{len(rows)} waiting for approval:")
+    for r in rows:
+        handle = f"@{r['username']}" if r["username"] else "no username"
+        kb = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("✅ Approve", callback_data=f"ap:{r['user_id']}"),
+                    InlineKeyboardButton("🚫 Decline", callback_data=f"dn:{r['user_id']}"),
+                ]
+            ]
+        )
+        await update.message.reply_text(
+            f"<b>{esc(r['name'])}</b>\n{handle} · <code>{r['user_id']}</code>",
+            reply_markup=kb,
+            parse_mode=constants.ParseMode.HTML,
+        )
 
 
 async def cmd_myshifts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat.type != constants.ChatType.PRIVATE:
         await update.message.reply_text("Message me directly for that 🙂")
+        return
+    if not await gate(update):
         return
     w = latest_week()
     if not w:
@@ -1432,6 +1656,8 @@ async def cmd_myshifts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat.type != constants.ChatType.PRIVATE:
         await update.message.reply_text("Use /schedule here, or message me directly.")
+        return
+    if not await gate(update):
         return
     w = latest_week()
     if not w:
@@ -1542,7 +1768,8 @@ async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def cmd_roster(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat.type != constants.ChatType.PRIVATE:
         return
-    rows = q("SELECT * FROM agents WHERE active=1 ORDER BY name")
+    rows = q("SELECT * FROM agents WHERE status='active' ORDER BY name")
+    waiting = q1("SELECT COUNT(*) c FROM agents WHERE status='pending'")["c"]
     if not rows:
         await update.message.reply_text(
             "Roster is empty. Agents join it by tapping a slot, or by sending me /start."
@@ -1556,6 +1783,8 @@ async def cmd_roster(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     ]
     lines.append("\n🔕 = hasn't sent me /start, so can't get shift reminders.")
     lines.append("Remove someone with <code>/removeagent @handle</code> or their ID.")
+    if waiting:
+        lines.append(f"\n⏳ {waiting} waiting for approval — see /pending")
     await update.message.reply_text("\n".join(lines), parse_mode=constants.ParseMode.HTML)
 
 
@@ -1638,7 +1867,10 @@ async def cmd_removeagent(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     async with write_lock:
-        run("UPDATE agents SET active=0 WHERE user_id=?", (row["user_id"],))
+        run(
+            "UPDATE agents SET active=0, status='declined' WHERE user_id=?",
+            (row["user_id"],),
+        )
         freed = 0
         w = open_week()
         if w:
@@ -2030,6 +2262,7 @@ def main() -> None:
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("chatid", cmd_chatid))
+    app.add_handler(CommandHandler("pending", cmd_pending))
     app.add_handler(CommandHandler("shiftcall", cmd_shiftcall))
     app.add_handler(CommandHandler("myshifts", cmd_myshifts))
     app.add_handler(CommandHandler("plan", cmd_plan))
@@ -2049,6 +2282,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_confirm, pattern=r"^[cu]:\d+$"))
     app.add_handler(CallbackQueryHandler(on_plan_toggle, pattern=r"^p:"))
     app.add_handler(CallbackQueryHandler(on_plan_nav, pattern=r"^pd:"))
+    app.add_handler(CallbackQueryHandler(on_access_decision, pattern=r"^(ap|dn):\d+$"))
     app.add_handler(CallbackQueryHandler(on_plan_quick, pattern=r"^pq:"))
 
     log.info("Avails bot running.")
