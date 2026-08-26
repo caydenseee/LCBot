@@ -1023,13 +1023,23 @@ def render_plan(user_id: int, week_id: int) -> tuple[str, InlineKeyboardMarkup]:
     for d in q("SELECT * FROM days WHERE week_id=? ORDER BY idx", (week_id,)):
         slots = q("SELECT * FROM slots WHERE day_id=? ORDER BY idx", (d["id"],))
         picked = [s["label"] for s in slots if s["id"] in mine]
-        free = sum(1 for s in slots if not slot_holders(s["id"]))
+        free = sum(
+            1 for s in slots
+            if s["id"] not in mine and len(slot_holders(s["id"])) < SLOT_CAPACITY
+        )
         lines.append(
             f"<b>{d['name']}</b>: {', '.join(picked) if picked else '—'}"
         )
-        tag = f" · {len(picked)}" if picked else (f" · {free} free" if free else " · full")
+        if picked and free:
+            label = f"{d['name']}  ✅ {len(picked)} yours · {free} available"
+        elif picked:
+            label = f"{d['name']}  ✅ {len(picked)} yours · none left"
+        elif free:
+            label = f"{d['name']}  ·  {free} available"
+        else:
+            label = f"{d['name']}  ·  none left"
         rows.append(
-            [InlineKeyboardButton(f"{d['name']}{tag}", callback_data=f"pd:{d['id']}")]
+            [InlineKeyboardButton(label, callback_data=f"pd:{d['id']}")]
         )
 
     lines += [
@@ -1056,14 +1066,15 @@ def render_plan_day(user_id: int, day_id: int) -> tuple[str, InlineKeyboardMarku
     for s in q("SELECT * FROM slots WHERE day_id=? ORDER BY idx", (day_id,)):
         holders = slot_holders(s["id"])
         if s["id"] in mine:
-            state, mark = "you", "✅"
+            state, mark, btn = "claimed by you", "✅", "✅ {} — yours"
         elif len(holders) >= SLOT_CAPACITY:
-            state, mark = esc(", ".join(h["name"] for h in holders)), "🔒"
+            state = "taken by " + esc(", ".join(h["name"] for h in holders))
+            mark, btn = "🔒", "🔒 {} — taken"
         else:
-            state, mark = "free", "▫️"
+            state, mark, btn = "available", "▫️", "▫️ {} — available"
         lines.append(f"{mark} {s['label']} — {state}")
         rows.append(
-            [InlineKeyboardButton(f"{mark} {s['label']}", callback_data=f"p:{s['id']}")]
+            [InlineKeyboardButton(btn.format(s["label"]), callback_data=f"p:{s['id']}")]
         )
 
     lines += [
