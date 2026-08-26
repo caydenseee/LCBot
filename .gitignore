@@ -1,0 +1,10 @@
+run-local.sh
+bot.env
+.env
+*.db
+*.db.backup
+*.key
+*.service
+venv/
+__pycache__/
+*.pyc
