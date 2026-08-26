@@ -95,6 +95,8 @@ BOARD_MODE = (os.environ.get("BOARD_MODE", "").strip().lower() or "single")
 # "on" keeps tap-to-claim buttons on the group board. "off" makes the group
 # board a clean read-only summary and moves all claiming into /plan.
 GROUP_BUTTONS = (os.environ.get("GROUP_BUTTONS", "").strip().lower() or "on") != "off"
+# Short how-to posted under a new board. Set to "off" once the team knows the drill.
+POST_INTRO = (os.environ.get("POST_INTRO", "").strip().lower() or "on") != "off"
 
 DAY_NAMES = ["MON", "TUE", "WED", "THURS", "FRI", "SAT", "SUN"]
 DAY_ABBR = {"MON": "M", "TUE": "T", "WED": "W", "THURS": "Th",
@@ -833,20 +835,22 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             )
             run("UPDATE days SET msg_id=? WHERE id=?", (msg.message_id, d["id"]))
 
-    intro = [
-        "☝️ <b>Two ways to fill this in — whichever suits you.</b>",
-        "",
-        "📱 <b>Easiest:</b> DM me <code>/plan</code> and do your whole week in one "
-        "message, without scrolling. There's a <i>Same as last week</i> button there "
-        "to start from what you actually did last week, then change whatever's different.",
-        "",
-        "Or just tap the buttons above, day by day.",
-        "",
-        "Either way, finish with <b>✅ Slots</b> on the pinned message.",
-    ]
-    await bot.send_message(
-        GROUP_CHAT_ID, "\n".join(intro), parse_mode=constants.ParseMode.HTML
-    )
+    if POST_INTRO:
+        if GROUP_BUTTONS:
+            intro = [
+                "☝️ Tap the buttons above to claim your slots, "
+                "or DM me <code>/plan</code> to do the whole week at once.",
+                "",
+                "Finish with <b>✅ Slots</b> on the pinned message.",
+            ]
+        else:
+            intro = [
+                "☝️ This board updates itself. To pick your slots, "
+                "DM me <code>/plan</code>.",
+            ]
+        await bot.send_message(
+            GROUP_CHAT_ID, "\n".join(intro), parse_mode=constants.ParseMode.HTML
+        )
 
     schedule_week_jobs(context.application, week_id)
     await update.message.reply_text("Posted to the group ✅")
