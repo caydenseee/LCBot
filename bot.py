@@ -175,6 +175,7 @@ CREATE TABLE IF NOT EXISTS agents (
     active   INTEGER NOT NULL DEFAULT 1,
     role     TEXT NOT NULL DEFAULT 'agent',
     status   TEXT NOT NULL DEFAULT 'active',
+    display_name TEXT,
     requested_at TEXT,
     decided_by   INTEGER,
     decided_at   TEXT
@@ -201,6 +202,7 @@ if "role" not in _cols:
     )
 for _col, _ddl in [
     ("status", "TEXT NOT NULL DEFAULT 'active'"),
+    ("display_name", "TEXT"),
     ("requested_at", "TEXT"),
     ("decided_by", "INTEGER"),
     ("decided_at", "TEXT"),
@@ -299,6 +301,18 @@ def is_admin(user_id: int) -> bool:
     return bool(row and row["role"] == "admin")
 
 
+def display_name_of(user_id: int, fallback: str = "") -> str:
+    """The roster name if one is set, otherwise whatever Telegram says."""
+    row = q1(
+        "SELECT display_name, name FROM agents WHERE user_id=?", (user_id,)
+    )
+    if row and row["display_name"]:
+        return row["display_name"]
+    if row and row["name"]:
+        return row["name"]
+    return fallback
+
+
 def agent_status(user_id: int) -> str | None:
     """'active', 'pending', 'declined', or None if never seen."""
     if is_owner(user_id):
@@ -342,7 +356,8 @@ def touch_agent(user, dm_ok: int | None = None) -> None:
     existing = q1("SELECT * FROM agents WHERE user_id=?", (user.id,))
     if existing:
         run(
-            "UPDATE agents SET name=?, username=?, dm_ok=COALESCE(?, dm_ok) WHERE user_id=?",
+            "UPDATE agents SET name=?, username=?, dm_ok=COALESCE(?, dm_ok) "
+            "WHERE user_id=?",
             (user.full_name, user.username, dm_ok, user.id),
         )
     else:
@@ -957,7 +972,8 @@ async def on_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         else:
             run(
                 "INSERT INTO signups (slot_id, user_id, name, ts) VALUES (?,?,?,?)",
-                (slot_id, user.id, user.full_name, now().isoformat()),
+                (slot_id, user.id, display_name_of(user.id, user.full_name),
+                 now().isoformat()),
             )
             note = f"✅ {row['day_name']} {row['label']}"
 
@@ -1204,7 +1220,8 @@ async def on_plan_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         else:
             run(
                 "INSERT INTO signups (slot_id, user_id, name, ts) VALUES (?,?,?,?)",
-                (slot_id, user.id, user.full_name, now().isoformat()),
+                (slot_id, user.id, display_name_of(user.id, user.full_name),
+                 now().isoformat()),
             )
             note = f"✅ {row['day_name']} {row['label']}"
 
@@ -1301,7 +1318,8 @@ async def on_plan_quick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                     continue
                 cur = run(
                     "INSERT OR IGNORE INTO signups (slot_id, user_id, name, ts) VALUES (?,?,?,?)",
-                    (target["id"], user.id, user.full_name, now().isoformat()),
+                    (target["id"], user.id,
+                     display_name_of(user.id, user.full_name), now().isoformat()),
                 )
                 copied += cur.rowcount
             note = f"Copied {copied} slot(s) from {prev['label']}."
@@ -1438,10 +1456,13 @@ async def cmd_savepreset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 # --------------------------------------------------------------------------
 
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+ASK_NAME = 100
+
+
+async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     user = update.effective_user
     if update.effective_chat.type != constants.ChatType.PRIVATE:
-        return
+        return ConversationHandler.END
 
     status = agent_status(user.id)
 
@@ -1453,42 +1474,66 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "/myshifts — what you're signed up for\n"
             "/help — everything I can do"
         )
-        return
+        return ConversationHandler.END
 
     if status == "pending":
         await update.message.reply_text(
             "Your request is still waiting for approval. "
             "I'll message you the moment it's approved 👍"
         )
-        return
+        return ConversationHandler.END
 
     if status == "declined":
         await update.message.reply_text(
             "Your access request wasn't approved. "
             "Please speak to your manager if you think that's a mistake."
         )
-        return
+        return ConversationHandler.END
 
-    # Brand new — create the request
+    await update.message.reply_text(
+        "👋 Hello! Before I can let you in, what's your full name?\n\n"
+        "<i>Use the name your manager knows you by — it's what shows on the "
+        "schedule, so everyone can tell who's on which shift.</i>",
+        parse_mode=constants.ParseMode.HTML,
+    )
+    return ASK_NAME
+
+
+async def got_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    given = " ".join(update.message.text.split()).strip()
+
+    if len(given) < 2 or len(given) > 40:
+        await update.message.reply_text(
+            "That doesn't look like a name — try again with 2 to 40 characters."
+        )
+        return ASK_NAME
+
     async with write_lock:
         run(
             "INSERT OR REPLACE INTO agents "
-            "(user_id, name, username, dm_ok, active, role, status, requested_at) "
-            "VALUES (?,?,?,1,1,'agent','pending',?)",
-            (user.id, user.full_name, user.username, now().isoformat()),
+            "(user_id, name, username, dm_ok, active, role, status, "
+            " display_name, requested_at) "
+            "VALUES (?,?,?,1,1,'agent','pending',?,?)",
+            (user.id, user.full_name, user.username, given, now().isoformat()),
         )
 
     await update.message.reply_text(
-        "👋 Thanks! I've sent your request to the team admins.\n\n"
-        "You'll get a message here once you're approved."
+        f"Thanks {esc(given)}! I've sent your request to the team admins.\n\n"
+        "You'll get a message here once you're approved.",
+        parse_mode=constants.ParseMode.HTML,
     )
 
     handle = f"@{user.username}" if user.username else "no username"
+    mismatch = ""
+    if given.lower() != (user.full_name or "").lower():
+        mismatch = f"\nTelegram name: <i>{esc(user.full_name)}</i>"
     text = (
         "🔔 <b>Access request</b>\n\n"
-        f"<b>{esc(user.full_name)}</b>\n"
+        f"Says they are: <b>{esc(given)}</b>{mismatch}\n"
         f"{handle} · <code>{user.id}</code>\n\n"
-        "Approve only if you recognise this person."
+        "Approve only if you recognise this person.\n"
+        f"<i>Wrong name? Fix it with /rename {user.id} Correct Name</i>"
     )
     kb = InlineKeyboardMarkup(
         [
@@ -1498,17 +1543,52 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             ]
         ]
     )
-    sent = 0
     for aid in admin_ids():
         try:
             await context.bot.send_message(
                 aid, text, reply_markup=kb, parse_mode=constants.ParseMode.HTML
             )
-            sent += 1
         except Exception as e:
             log.info("Couldn't notify admin %s: %s", aid, e)
-    if not sent:
-        log.warning("Access request from %s but no admin could be reached.", user.id)
+    return ConversationHandler.END
+
+
+async def cmd_rename(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Set the name that appears on the schedule."""
+    if not is_admin(update.effective_user.id):
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Usage: /rename @handle Jia En\n"
+            "or:    /rename 123456789 Jia En"
+        )
+        return
+
+    target, new_name = context.args[0], " ".join(context.args[1:]).strip()
+    row = None
+    if target.startswith("@"):
+        row = q1("SELECT * FROM agents WHERE lower(username)=lower(?)", (target[1:],))
+    elif target.isdigit():
+        row = q1("SELECT * FROM agents WHERE user_id=?", (int(target),))
+    if not row:
+        await update.message.reply_text("No one matches that. Check /roster.")
+        return
+
+    async with write_lock:
+        run(
+            "UPDATE agents SET display_name=? WHERE user_id=?",
+            (new_name, row["user_id"]),
+        )
+        # keep the schedule in step with the new name
+        run("UPDATE signups SET name=? WHERE user_id=?", (new_name, row["user_id"]))
+
+    await update.message.reply_text(
+        f"Renamed to <b>{esc(new_name)}</b> on the schedule.",
+        parse_mode=constants.ParseMode.HTML,
+    )
+    w = open_week()
+    if w:
+        await refresh_group(context, w["id"])
 
 
 async def on_access_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1539,11 +1619,12 @@ async def on_access_decision(update: Update, context: ContextTypes.DEFAULT_TYPE)
             (new_status, decider.id, now().isoformat(), target_id),
         )
 
+    shown = row["display_name"] or row["name"]
     verdict = "approved ✅" if approve else "declined 🚫"
-    await query.answer(f"{row['name']} {verdict}")
+    await query.answer(f"{shown} {verdict}")
     try:
         await query.edit_message_text(
-            f"🔔 <b>Access request</b>\n\n<b>{esc(row['name'])}</b>\n\n"
+            f"🔔 <b>Access request</b>\n\n<b>{esc(shown)}</b>\n\n"
             f"{verdict} by {esc(decider.full_name)}",
             parse_mode=constants.ParseMode.HTML,
         )
@@ -1618,7 +1699,8 @@ async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             ]
         )
         await update.message.reply_text(
-            f"<b>{esc(r['name'])}</b>\n{handle} · <code>{r['user_id']}</code>",
+            f"<b>{esc(r['display_name'] or r['name'])}</b>\n"
+            f"{handle} · <code>{r['user_id']}</code>",
             reply_markup=kb,
             parse_mode=constants.ParseMode.HTML,
         )
@@ -1776,7 +1858,7 @@ async def cmd_roster(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )
         return
     lines = [f"<b>Roster ({len(rows)})</b>"] + [
-        f"{'🔔' if r['dm_ok'] else '🔕'} {esc(r['name'])}"
+        f"{'🔔' if r['dm_ok'] else '🔕'} {esc(r['display_name'] or r['name'])}"
         + (f" @{r['username']}" if r["username"] else "")
         + f" · <code>{r['user_id']}</code>"
         for r in rows
@@ -2259,10 +2341,21 @@ def main() -> None:
             fallbacks=[CommandHandler("cancel", cancel)],
         )
     )
-    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(
+        ConversationHandler(
+            entry_points=[CommandHandler("start", cmd_start)],
+            states={
+                ASK_NAME: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, got_name)
+                ]
+            },
+            fallbacks=[CommandHandler("cancel", cancel)],
+        )
+    )
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("chatid", cmd_chatid))
     app.add_handler(CommandHandler("pending", cmd_pending))
+    app.add_handler(CommandHandler("rename", cmd_rename))
     app.add_handler(CommandHandler("shiftcall", cmd_shiftcall))
     app.add_handler(CommandHandler("myshifts", cmd_myshifts))
     app.add_handler(CommandHandler("plan", cmd_plan))
