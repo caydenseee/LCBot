@@ -88,6 +88,10 @@ DM_REMINDERS = os.environ.get("DM_REMINDERS", "").strip().lower() in {"1", "true
 # Your team numbers weeks one behind ISO: the Monday of 10 Aug 2026 is ISO week
 # 33, but you label it W32. Set to 0 if you ever switch to plain ISO numbering.
 WEEK_NUM_OFFSET = env_int("WEEK_NUM_OFFSET", -1)
+# Fallback hourly rate in cents, used until you set one with /setrate.
+DEFAULT_RATE_CENTS = env_int("DEFAULT_RATE_CENTS", 0)
+# How long after a shift ends before an open clock-in is auto-closed.
+AUTO_CLOSE_GRACE_MIN = env_int("AUTO_CLOSE_GRACE_MIN", 120)
 
 # "single" = one pinned message holding the whole week (neater).
 # "daily"  = one message per day (buttons sit closer to their day).
@@ -183,6 +187,34 @@ CREATE TABLE IF NOT EXISTS agents (
 CREATE TABLE IF NOT EXISTS presets (
     name   TEXT PRIMARY KEY,
     config TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS pay_rates (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id       INTEGER,
+    cents          INTEGER NOT NULL,
+    effective_from TEXT NOT NULL,
+    created_by     INTEGER,
+    created_at     TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS time_entries (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id   INTEGER NOT NULL,
+    slot_id    INTEGER,
+    the_date   TEXT NOT NULL,
+    clock_in   TEXT NOT NULL,
+    clock_out  TEXT,
+    status     TEXT NOT NULL DEFAULT 'open',
+    source     TEXT NOT NULL DEFAULT 'agent',
+    note       TEXT
+);
+CREATE TABLE IF NOT EXISTS time_edits (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    entry_id   INTEGER NOT NULL,
+    changed_by INTEGER NOT NULL,
+    before     TEXT,
+    after      TEXT,
+    reason     TEXT,
+    changed_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS confirmations (
     week_id INTEGER NOT NULL REFERENCES weeks(id) ON DELETE CASCADE,
@@ -299,6 +331,71 @@ def is_admin(user_id: int) -> bool:
         "SELECT role FROM agents WHERE user_id=? AND active=1", (user_id,)
     )
     return bool(row and row["role"] == "admin")
+
+
+def rate_for(agent_id: int, on: date) -> int:
+    """Hourly rate in cents that applied on a given day."""
+    row = q1(
+        "SELECT cents FROM pay_rates WHERE agent_id=? AND effective_from<=? "
+        "ORDER BY effective_from DESC, id DESC LIMIT 1",
+        (agent_id, on.isoformat()),
+    )
+    if row:
+        return row["cents"]
+    row = q1(
+        "SELECT cents FROM pay_rates WHERE agent_id IS NULL AND effective_from<=? "
+        "ORDER BY effective_from DESC, id DESC LIMIT 1",
+        (on.isoformat(),),
+    )
+    return row["cents"] if row else DEFAULT_RATE_CENTS
+
+
+def money(cents: int) -> str:
+    return f"${cents // 100}.{cents % 100:02d}"
+
+
+def entry_minutes(row) -> int:
+    if not row["clock_out"]:
+        return 0
+    a = datetime.fromisoformat(row["clock_in"])
+    b = datetime.fromisoformat(row["clock_out"])
+    return max(0, int((b - a).total_seconds() // 60))
+
+
+def month_bounds(d: date) -> tuple[date, date]:
+    first = d.replace(day=1)
+    nxt = (first + timedelta(days=32)).replace(day=1)
+    return first, nxt - timedelta(days=1)
+
+
+def timesheet(agent_id: int, first: date, last: date) -> dict:
+    rows = q(
+        "SELECT * FROM time_entries WHERE agent_id=? AND the_date BETWEEN ? AND ? "
+        "ORDER BY the_date, clock_in",
+        (agent_id, first.isoformat(), last.isoformat()),
+    )
+    shifts, minutes, cents, open_count = [], 0, 0, 0
+    for r in rows:
+        if not r["clock_out"]:
+            open_count += 1
+            continue
+        m = entry_minutes(r)
+        day = date.fromisoformat(r["the_date"])
+        pay = round(m / 60 * rate_for(agent_id, day))
+        minutes += m
+        cents += pay
+        shifts.append({"row": r, "date": day, "minutes": m, "cents": pay})
+    return {
+        "shifts": shifts,
+        "minutes": minutes,
+        "cents": cents,
+        "open": open_count,
+        "days": len({s["date"] for s in shifts}),
+    }
+
+
+def hhmm(minutes: int) -> str:
+    return f"{minutes // 60}h {minutes % 60:02d}m"
 
 
 def display_name_of(user_id: int, fallback: str = "") -> str:
@@ -1678,6 +1775,157 @@ async def gate_cb(query) -> bool:
     return False
 
 
+def current_slot_for(agent_id: int, when: datetime):
+    """The rostered slot this clock-in most likely belongs to."""
+    today = when.date()
+    mins = when.hour * 60 + when.minute
+    rows = q(
+        """SELECT s.id, s.label, s.start_min, d.name AS day_name, d.the_date
+           FROM signups su JOIN slots s ON s.id = su.slot_id
+           JOIN days d ON d.id = s.day_id
+           WHERE su.user_id=? AND d.the_date=? ORDER BY s.start_min""",
+        (agent_id, today.isoformat()),
+    )
+    if not rows:
+        return None
+    # closest slot start within a couple of hours either side
+    best, gap = None, 10**9
+    for r in rows:
+        delta = abs(r["start_min"] - mins)
+        if delta < gap:
+            best, gap = r, delta
+    return best if gap <= 150 else None
+
+
+async def cmd_clockin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat.type != constants.ChatType.PRIVATE:
+        await update.message.reply_text("Message me directly to clock in 🙂")
+        return
+    if not await gate(update):
+        return
+    user = update.effective_user
+    when = now()
+
+    open_row = q1(
+        "SELECT * FROM time_entries WHERE agent_id=? AND clock_out IS NULL "
+        "ORDER BY id DESC LIMIT 1",
+        (user.id,),
+    )
+    if open_row:
+        started = datetime.fromisoformat(open_row["clock_in"])
+        await update.message.reply_text(
+            f"You're already clocked in since {started.strftime('%-d %b, %H:%M')}.\n"
+            "Send /clockout when you finish."
+        )
+        return
+
+    slot = current_slot_for(user.id, when)
+    async with write_lock:
+        run(
+            "INSERT INTO time_entries (agent_id, slot_id, the_date, clock_in, status) "
+            "VALUES (?,?,?,?,'open')",
+            (user.id, slot["id"] if slot else None,
+             when.date().isoformat(), when.isoformat()),
+        )
+
+    if slot:
+        await update.message.reply_text(
+            f"⏱ Clocked in at <b>{when.strftime('%H:%M')}</b>\n"
+            f"Shift: {slot['day_name']} {slot['label']}\n\n"
+            "Send /clockout when you finish.",
+            parse_mode=constants.ParseMode.HTML,
+        )
+    else:
+        await update.message.reply_text(
+            f"⏱ Clocked in at <b>{when.strftime('%H:%M')}</b>\n\n"
+            "⚠️ You're not rostered for a shift around now, so I've logged this "
+            "as unrostered. Your manager will see it flagged.\n\n"
+            "Send /clockout when you finish.",
+            parse_mode=constants.ParseMode.HTML,
+        )
+
+
+async def cmd_clockout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat.type != constants.ChatType.PRIVATE:
+        await update.message.reply_text("Message me directly to clock out 🙂")
+        return
+    if not await gate(update):
+        return
+    user = update.effective_user
+    when = now()
+
+    open_row = q1(
+        "SELECT * FROM time_entries WHERE agent_id=? AND clock_out IS NULL "
+        "ORDER BY id DESC LIMIT 1",
+        (user.id,),
+    )
+    if not open_row:
+        await update.message.reply_text(
+            "You're not clocked in. Send /clockin when you start a shift."
+        )
+        return
+
+    async with write_lock:
+        run(
+            "UPDATE time_entries SET clock_out=?, status='closed' WHERE id=?",
+            (when.isoformat(), open_row["id"]),
+        )
+    fresh = q1("SELECT * FROM time_entries WHERE id=?", (open_row["id"],))
+    mins = entry_minutes(fresh)
+    day = date.fromisoformat(fresh["the_date"])
+    pay = round(mins / 60 * rate_for(user.id, day))
+
+    msg = [
+        f"✅ Clocked out at <b>{when.strftime('%H:%M')}</b>",
+        f"Worked: <b>{hhmm(mins)}</b>",
+    ]
+    if pay:
+        msg.append(f"Approx: {money(pay)}")
+    msg.append("\n/mytime — your hours this month")
+    await update.message.reply_text(
+        "\n".join(msg), parse_mode=constants.ParseMode.HTML
+    )
+
+
+async def cmd_mytime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat.type != constants.ChatType.PRIVATE:
+        return
+    if not await gate(update):
+        return
+    user = update.effective_user
+    first, last = month_bounds(now().date())
+    t = timesheet(user.id, first, last)
+
+    lines = [f"🕐 <b>Your hours — {first.strftime('%B %Y')}</b>", ""]
+    if not t["shifts"] and not t["open"]:
+        lines.append("Nothing logged yet this month.")
+    for sh in t["shifts"]:
+        r = sh["row"]
+        a = datetime.fromisoformat(r["clock_in"]).strftime("%H:%M")
+        b = datetime.fromisoformat(r["clock_out"]).strftime("%H:%M")
+        flag = " ⚠️" if r["status"] == "auto" else ""
+        lines.append(
+            f"{sh['date'].strftime('%a %-d %b')}  {a}–{b}  "
+            f"{hhmm(sh['minutes'])}{flag}  <code>#{r['id']}</code>"
+        )
+    if t["shifts"]:
+        lines += [
+            "",
+            f"<b>{t['days']} day(s) · {hhmm(t['minutes'])}</b>",
+        ]
+        if t["cents"]:
+            lines.append(f"<b>Estimated: {money(t['cents'])}</b>")
+            lines.append(
+                "<i>An estimate to help you plan. Your actual pay comes from HR "
+                "and may differ.</i>"
+            )
+    if t["open"]:
+        lines.append("\n⏱ You have a shift still clocked in.")
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode=constants.ParseMode.HTML
+    )
+
+
 async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(update.effective_user.id):
         return
@@ -1980,6 +2228,364 @@ async def cmd_removeagent(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await refresh_group(context, w["id"])
 
 
+def parse_month(args) -> date:
+    if args:
+        try:
+            return datetime.strptime(args[0], "%Y-%m").date()
+        except ValueError:
+            pass
+    return now().date().replace(day=1)
+
+
+async def cmd_setrate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/setrate 14.50  (team)  ·  /setrate 16 @handle  (one person)"""
+    if not is_admin(update.effective_user.id):
+        return
+    if not context.args:
+        team = rate_for(-1, now().date())
+        await update.message.reply_text(
+            f"Current team rate: <b>{money(team)}</b>/hour\n\n"
+            "Change it with <code>/setrate 14.50</code>\n"
+            "One person: <code>/setrate 16 @handle</code>",
+            parse_mode=constants.ParseMode.HTML,
+        )
+        return
+    try:
+        cents = round(float(context.args[0].lstrip("$")) * 100)
+        if cents < 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Give an amount like 14.50")
+        return
+
+    agent_id, who = None, "the whole team"
+    if len(context.args) > 1:
+        target = context.args[1]
+        row = None
+        if target.startswith("@"):
+            row = q1("SELECT * FROM agents WHERE lower(username)=lower(?)", (target[1:],))
+        elif target.isdigit():
+            row = q1("SELECT * FROM agents WHERE user_id=?", (int(target),))
+        if not row:
+            await update.message.reply_text("No one matches that. Check /roster.")
+            return
+        agent_id = row["user_id"]
+        who = row["display_name"] or row["name"]
+
+    today = now().date()
+    async with write_lock:
+        run(
+            "INSERT INTO pay_rates (agent_id, cents, effective_from, created_by, created_at) "
+            "VALUES (?,?,?,?,?)",
+            (agent_id, cents, today.isoformat(),
+             update.effective_user.id, now().isoformat()),
+        )
+    await update.message.reply_text(
+        f"Rate for <b>{esc(who)}</b> set to <b>{money(cents)}</b>/hour, "
+        f"from {today.strftime('%-d %b %Y')}.\n\n"
+        "<i>Earlier months keep the rate that applied then.</i>",
+        parse_mode=constants.ParseMode.HTML,
+    )
+
+
+async def cmd_timesheet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Everyone's hours for a month."""
+    if not is_admin(update.effective_user.id):
+        return
+    first = parse_month(context.args)
+    _, last = month_bounds(first)
+
+    lines = [f"🕐 <b>Team hours — {first.strftime('%B %Y')}</b>", ""]
+    total_min = total_cents = 0
+    any_rows = False
+    for a in q("SELECT * FROM agents WHERE status='active' ORDER BY name"):
+        t = timesheet(a["user_id"], first, last)
+        if not t["shifts"] and not t["open"]:
+            continue
+        any_rows = True
+        nm = a["display_name"] or a["name"]
+        row = f"{esc(nm)} — {t['days']}d · {hhmm(t['minutes'])}"
+        if t["cents"]:
+            row += f" · {money(t['cents'])}"
+        if t["open"]:
+            row += " ⏱"
+        lines.append(row)
+        total_min += t["minutes"]
+        total_cents += t["cents"]
+    if not any_rows:
+        lines.append("Nothing logged this month.")
+    else:
+        lines += ["", f"<b>Total: {hhmm(total_min)}</b>"]
+        if total_cents:
+            lines.append(f"<b>Estimated cost: {money(total_cents)}</b>")
+        lines.append("\n<i>Estimates only — not payroll figures.</i>")
+    lines.append("\n/payroll for a CSV of every shift.")
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode=constants.ParseMode.HTML
+    )
+
+
+async def cmd_payroll(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """CSV: one row per shift — date, hours, rate, pay."""
+    if not is_admin(update.effective_user.id):
+        return
+    first = parse_month(context.args)
+    _, last = month_bounds(first)
+
+    buf = io.StringIO()
+    wr = csv.writer(buf)
+    wr.writerow([
+        "entry", "agent", "telegram_id", "date", "day", "slot",
+        "clock_in", "clock_out", "hours", "rate", "pay", "status",
+    ])
+    rows_written = 0
+    for a in q("SELECT * FROM agents ORDER BY name"):
+        t = timesheet(a["user_id"], first, last)
+        for sh in t["shifts"]:
+            r = sh["row"]
+            slot = q1(
+                "SELECT s.label, d.name FROM slots s JOIN days d ON d.id=s.day_id "
+                "WHERE s.id=?",
+                (r["slot_id"],),
+            ) if r["slot_id"] else None
+            wr.writerow([
+                r["id"],
+                a["display_name"] or a["name"],
+                a["user_id"],
+                sh["date"].isoformat(),
+                sh["date"].strftime("%a"),
+                slot["label"] if slot else "unrostered",
+                datetime.fromisoformat(r["clock_in"]).strftime("%H:%M"),
+                datetime.fromisoformat(r["clock_out"]).strftime("%H:%M"),
+                f"{sh['minutes'] / 60:.2f}",
+                f"{rate_for(a['user_id'], sh['date']) / 100:.2f}",
+                f"{sh['cents'] / 100:.2f}",
+                r["status"],
+            ])
+            rows_written += 1
+
+    if not rows_written:
+        await update.message.reply_text(
+            f"No shifts logged in {first.strftime('%B %Y')}."
+        )
+        return
+    data = io.BytesIO(buf.getvalue().encode())
+    data.name = f"payroll_{first.strftime('%Y_%m')}.csv"
+    await update.message.reply_document(
+        data, filename=data.name,
+        caption=f"{rows_written} shift(s) — {first.strftime('%B %Y')}. Estimates, not payroll.",
+    )
+
+
+def log_edit(entry_id: int, by: int, before: dict, after: dict, reason: str) -> None:
+    run(
+        "INSERT INTO time_edits (entry_id, changed_by, before, after, reason, changed_at) "
+        "VALUES (?,?,?,?,?,?)",
+        (entry_id, by, json.dumps(before), json.dumps(after), reason,
+         now().isoformat()),
+    )
+
+
+def find_agent(target: str):
+    if target.startswith("@"):
+        return q1("SELECT * FROM agents WHERE lower(username)=lower(?)", (target[1:],))
+    if target.isdigit():
+        return q1("SELECT * FROM agents WHERE user_id=?", (int(target),))
+    return q1("SELECT * FROM agents WHERE lower(display_name)=lower(?) "
+              "OR lower(name)=lower(?)", (target, target))
+
+
+def at_time_on(the_date: str, hhmm_text: str) -> datetime | None:
+    try:
+        mins = parse_time_token(hhmm_text)
+    except ValueError:
+        return None
+    d = date.fromisoformat(the_date)
+    return datetime.combine(d, time(mins // 60, mins % 60), TZ)
+
+
+async def cmd_openshifts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Who is clocked in right now."""
+    if not is_admin(update.effective_user.id):
+        return
+    rows = q(
+        "SELECT * FROM time_entries WHERE clock_out IS NULL ORDER BY clock_in"
+    )
+    if not rows:
+        await update.message.reply_text("Nobody is clocked in right now.")
+        return
+    lines = [f"⏱ <b>{len(rows)} shift(s) still open</b>", ""]
+    for r in rows:
+        nm = display_name_of(r["agent_id"], str(r["agent_id"]))
+        started = datetime.fromisoformat(r["clock_in"])
+        mins = int((now() - started).total_seconds() // 60)
+        lines.append(
+            f"<b>{esc(nm)}</b> — since {started.strftime('%-d %b %H:%M')} "
+            f"({hhmm(mins)} ago)\n"
+            f"   <code>/clockoutfor {r['agent_id']} 18:00</code>"
+        )
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode=constants.ParseMode.HTML
+    )
+
+
+async def cmd_clockoutfor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/clockoutfor @handle 18:00 — close someone's forgotten shift."""
+    if not is_admin(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: <code>/clockoutfor @handle 18:00</code>\n"
+            "Leave the time out to use now. See /openshifts.",
+            parse_mode=constants.ParseMode.HTML,
+        )
+        return
+
+    row = find_agent(context.args[0])
+    if not row:
+        await update.message.reply_text("No one matches that. Check /roster.")
+        return
+
+    entry = q1(
+        "SELECT * FROM time_entries WHERE agent_id=? AND clock_out IS NULL "
+        "ORDER BY id DESC LIMIT 1",
+        (row["user_id"],),
+    )
+    if not entry:
+        await update.message.reply_text(
+            f"{esc(row['display_name'] or row['name'])} isn't clocked in.",
+            parse_mode=constants.ParseMode.HTML,
+        )
+        return
+
+    if len(context.args) > 1:
+        out = at_time_on(entry["the_date"], context.args[1])
+        if not out:
+            await update.message.reply_text("Give a time like 18:00 or 6pm.")
+            return
+    else:
+        out = now()
+
+    started = datetime.fromisoformat(entry["clock_in"])
+    if out <= started:
+        out += timedelta(days=1)
+    if out <= started:
+        await update.message.reply_text("That's before they clocked in.")
+        return
+
+    async with write_lock:
+        log_edit(
+            entry["id"], update.effective_user.id,
+            {"clock_out": None, "status": entry["status"]},
+            {"clock_out": out.isoformat(), "status": "edited"},
+            "admin clocked out on their behalf",
+        )
+        run(
+            "UPDATE time_entries SET clock_out=?, status='edited', source='admin' "
+            "WHERE id=?",
+            (out.isoformat(), entry["id"]),
+        )
+
+    fresh = q1("SELECT * FROM time_entries WHERE id=?", (entry["id"],))
+    mins = entry_minutes(fresh)
+    nm = row["display_name"] or row["name"]
+    await update.message.reply_text(
+        f"✅ Clocked out <b>{esc(nm)}</b> at {out.strftime('%-d %b %H:%M')}\n"
+        f"Shift logged: <b>{hhmm(mins)}</b>\n\n"
+        f"<i>Entry #{entry['id']} · change recorded</i>",
+        parse_mode=constants.ParseMode.HTML,
+    )
+    try:
+        await context.bot.send_message(
+            row["user_id"],
+            f"Your manager clocked you out at {out.strftime('%H:%M')} "
+            f"({hhmm(mins)} logged).\n\nCheck /mytime — tell them if it's wrong.",
+        )
+    except Exception:
+        pass
+
+
+async def cmd_fixtime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/fixtime 42 10:00 18:00 — correct an entry. /fixtime 42 delete removes it."""
+    if not is_admin(update.effective_user.id):
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Usage:\n"
+            "<code>/fixtime 42 10:00 18:00</code> — set both times\n"
+            "<code>/fixtime 42 delete</code> — remove the entry\n\n"
+            "Entry numbers show in /mytime and /payroll.",
+            parse_mode=constants.ParseMode.HTML,
+        )
+        return
+    if not context.args[0].isdigit():
+        await update.message.reply_text("First give the entry number, e.g. /fixtime 42 ...")
+        return
+
+    entry = q1("SELECT * FROM time_entries WHERE id=?", (int(context.args[0]),))
+    if not entry:
+        await update.message.reply_text("No entry with that number.")
+        return
+    nm = display_name_of(entry["agent_id"], str(entry["agent_id"]))
+
+    if context.args[1].lower() == "delete":
+        async with write_lock:
+            log_edit(
+                entry["id"], update.effective_user.id,
+                {"clock_in": entry["clock_in"], "clock_out": entry["clock_out"]},
+                {"deleted": True}, "admin deleted the entry",
+            )
+            run("DELETE FROM time_entries WHERE id=?", (entry["id"],))
+        await update.message.reply_text(
+            f"Deleted entry #{entry['id']} for <b>{esc(nm)}</b>.",
+            parse_mode=constants.ParseMode.HTML,
+        )
+        return
+
+    if len(context.args) < 3:
+        await update.message.reply_text("Give both times: /fixtime 42 10:00 18:00")
+        return
+    a = at_time_on(entry["the_date"], context.args[1])
+    b = at_time_on(entry["the_date"], context.args[2])
+    if not a or not b:
+        await update.message.reply_text("Give times like 10:00 and 18:00.")
+        return
+    if b <= a:
+        b += timedelta(days=1)
+
+    async with write_lock:
+        log_edit(
+            entry["id"], update.effective_user.id,
+            {"clock_in": entry["clock_in"], "clock_out": entry["clock_out"]},
+            {"clock_in": a.isoformat(), "clock_out": b.isoformat()},
+            "admin corrected the times",
+        )
+        run(
+            "UPDATE time_entries SET clock_in=?, clock_out=?, status='edited', "
+            "source='admin' WHERE id=?",
+            (a.isoformat(), b.isoformat(), entry["id"]),
+        )
+
+    fresh = q1("SELECT * FROM time_entries WHERE id=?", (entry["id"],))
+    mins = entry_minutes(fresh)
+    await update.message.reply_text(
+        f"✅ Entry #{entry['id']} for <b>{esc(nm)}</b> is now "
+        f"{a.strftime('%H:%M')}–{b.strftime('%H:%M')} (<b>{hhmm(mins)}</b>).\n\n"
+        "<i>Change recorded.</i>",
+        parse_mode=constants.ParseMode.HTML,
+    )
+    try:
+        await context.bot.send_message(
+            entry["agent_id"],
+            f"Your manager corrected your shift on "
+            f"{date.fromisoformat(entry['the_date']).strftime('%-d %b')} to "
+            f"{a.strftime('%H:%M')}–{b.strftime('%H:%M')} ({hhmm(mins)}).\n\n"
+            "Check /mytime — tell them if it's wrong.",
+        )
+    except Exception:
+        pass
+
+
 async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(update.effective_user.id):
         return
@@ -2123,6 +2729,47 @@ def mention(user_id: int, name: str) -> str:
     return f'<a href="tg://user?id={user_id}">{esc(name)}</a>'
 
 
+async def job_auto_close(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Close forgotten clock-ins at the shift's end time, flagged for review."""
+    cutoff = now() - timedelta(minutes=AUTO_CLOSE_GRACE_MIN)
+    rows = q("SELECT * FROM time_entries WHERE clock_out IS NULL")
+    for r in rows:
+        started = datetime.fromisoformat(r["clock_in"])
+        if started > cutoff:
+            continue
+        end = None
+        if r["slot_id"]:
+            sl = q1("SELECT label FROM slots WHERE id=?", (r["slot_id"],))
+            if sl and "-" in sl["label"]:
+                try:
+                    mins = parse_time_token(sl["label"].split("-")[1])
+                    end = started.replace(
+                        hour=mins // 60, minute=mins % 60, second=0, microsecond=0
+                    )
+                    if end <= started:
+                        end += timedelta(days=1)
+                except ValueError:
+                    end = None
+        if end is None or end > now():
+            end = started + timedelta(hours=2)
+        async with write_lock:
+            run(
+                "UPDATE time_entries SET clock_out=?, status='auto', "
+                "note='auto-closed, agent did not clock out' WHERE id=?",
+                (end.isoformat(), r["id"]),
+            )
+        try:
+            await context.bot.send_message(
+                r["agent_id"],
+                f"⚠️ You didn't clock out, so I've closed your shift at "
+                f"{end.strftime('%H:%M')} based on your roster.\n\n"
+                "If that's wrong, tell your manager and they can correct it.",
+            )
+        except Exception:
+            pass
+        log.info("Auto-closed entry %s for %s", r["id"], r["agent_id"])
+
+
 async def job_shift_call(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Evening-before group post tagging tomorrow's agents."""
     text, reason = build_shift_call()
@@ -2228,6 +2875,9 @@ def schedule_week_jobs(app: Application, week_id: int) -> None:
 
 AGENT_COMMANDS = [
     ("plan", "Fill in my week"),
+    ("clockin", "Start my shift"),
+    ("clockout", "End my shift"),
+    ("mytime", "My hours this month"),
     ("myshifts", "What I'm signed up for"),
     ("summary", "Show the current board"),
     ("help", "List commands"),
@@ -2250,6 +2900,12 @@ ADMIN_COMMANDS = AGENT_COMMANDS + [
     ("export", "Download this week as CSV"),
     ("presets", "Saved timing patterns"),
     ("closeweek", "Close submissions early"),
+    ("timesheet", "Team hours this month"),
+    ("payroll", "Export shifts as CSV"),
+    ("setrate", "Set the hourly rate"),
+    ("openshifts", "Who's clocked in now"),
+    ("clockoutfor", "Clock someone out"),
+    ("fixtime", "Correct a time entry"),
 ]
 
 
@@ -2313,6 +2969,10 @@ async def post_init(app: Application) -> None:
         name="shift-call",
     )
     log.info("Group shift call scheduled for %s daily", SHIFT_CALL_TIME)
+    app.job_queue.run_repeating(
+        job_auto_close, interval=timedelta(minutes=30),
+        first=timedelta(minutes=5), name="auto-close",
+    )
     if DM_REMINDERS:
         app.job_queue.run_daily(
             job_shift_reminders,
@@ -2366,6 +3026,15 @@ def main() -> None:
     app.add_handler(CommandHandler("closeweek", cmd_close))
     app.add_handler(CommandHandler("roster", cmd_roster))
     app.add_handler(CommandHandler("export", cmd_export))
+    app.add_handler(CommandHandler("clockin", cmd_clockin))
+    app.add_handler(CommandHandler("clockout", cmd_clockout))
+    app.add_handler(CommandHandler("mytime", cmd_mytime))
+    app.add_handler(CommandHandler("setrate", cmd_setrate))
+    app.add_handler(CommandHandler("timesheet", cmd_timesheet))
+    app.add_handler(CommandHandler("payroll", cmd_payroll))
+    app.add_handler(CommandHandler("openshifts", cmd_openshifts))
+    app.add_handler(CommandHandler("clockoutfor", cmd_clockoutfor))
+    app.add_handler(CommandHandler("fixtime", cmd_fixtime))
     app.add_handler(CommandHandler("removeagent", cmd_removeagent))
     app.add_handler(CommandHandler("makeadmin", cmd_makeadmin))
     app.add_handler(CommandHandler("removeadmin", cmd_removeadmin))
