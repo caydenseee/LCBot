@@ -2662,6 +2662,64 @@ async def job_backup(context: ContextTypes.DEFAULT_TYPE) -> None:
     log.info("Backup sent to %d owner(s).", len(targets))
 
 
+async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Clear test schedules and time entries. Keeps people and rates."""
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("Only an owner can reset the data.")
+        return
+
+    counts = {
+        "weeks": q1("SELECT COUNT(*) c FROM weeks")["c"],
+        "signups": q1("SELECT COUNT(*) c FROM signups")["c"],
+        "shifts": q1("SELECT COUNT(*) c FROM time_entries")["c"],
+        "agents": q1("SELECT COUNT(*) c FROM agents WHERE status='active'")["c"],
+    }
+
+    if not context.args or context.args[0] != "CONFIRM":
+        await update.message.reply_text(
+            "⚠️ <b>This will permanently delete:</b>\n"
+            f"  · {counts['weeks']} week(s) and every slot in them\n"
+            f"  · {counts['signups']} slot claim(s)\n"
+            f"  · {counts['shifts']} clock-in record(s)\n\n"
+            "<b>It will keep:</b>\n"
+            f"  · your {counts['agents']} approved agent(s)\n"
+            "  · pay rates and timing presets\n\n"
+            "I'll send you a backup first.\n\n"
+            "To go ahead, send <code>/reset CONFIRM</code>",
+            parse_mode=constants.ParseMode.HTML,
+        )
+        return
+
+    try:
+        data, c = snapshot_db()
+        await update.message.reply_document(
+            data, filename=data.name,
+            caption="🗄 Backup taken before reset. Keep this.",
+        )
+    except Exception as e:
+        await update.message.reply_text(
+            f"Couldn't take a backup ({e}) — stopping rather than deleting blind."
+        )
+        return
+
+    async with write_lock:
+        for t in ("time_edits", "time_entries", "confirmations",
+                  "signups", "slots", "days", "weeks"):
+            run(f"DELETE FROM {t}")
+        db.execute("DELETE FROM sqlite_sequence WHERE name IN "
+                   "('weeks','days','slots','time_entries','time_edits')")
+        db.commit()
+
+    await update.message.reply_text(
+        "✅ <b>Cleared.</b>\n\n"
+        f"{counts['agents']} agent(s) kept — they don't need to re-register.\n"
+        "Pay rates kept.\n\n"
+        "Post your first real week with /newweek.",
+        parse_mode=constants.ParseMode.HTML,
+    )
+    log.info("Data reset by owner %s", update.effective_user.id)
+
+
 async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(update.effective_user.id):
         return
@@ -2983,6 +3041,7 @@ ADMIN_COMMANDS = AGENT_COMMANDS + [
     ("clockoutfor", "Clock someone out"),
     ("fixtime", "Correct a time entry"),
     ("backup", "Download a copy of the data"),
+    ("reset", "Clear test data before launch"),
 ]
 
 
@@ -3122,6 +3181,7 @@ def main() -> None:
     app.add_handler(CommandHandler("clockoutfor", cmd_clockoutfor))
     app.add_handler(CommandHandler("fixtime", cmd_fixtime))
     app.add_handler(CommandHandler("backup", cmd_backup))
+    app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("removeagent", cmd_removeagent))
     app.add_handler(CommandHandler("makeadmin", cmd_makeadmin))
     app.add_handler(CommandHandler("removeadmin", cmd_removeadmin))
