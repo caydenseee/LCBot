@@ -92,6 +92,9 @@ WEEK_NUM_OFFSET = env_int("WEEK_NUM_OFFSET", -1)
 DEFAULT_RATE_CENTS = env_int("DEFAULT_RATE_CENTS", 0)
 # How long after a shift ends before an open clock-in is auto-closed.
 AUTO_CLOSE_GRACE_MIN = env_int("AUTO_CLOSE_GRACE_MIN", 120)
+# Automatic database backup, DM'd to owners. 0-6 = Mon-Sun.
+BACKUP_DAY = env_int("BACKUP_DAY", 0)
+BACKUP_TIME = os.environ.get("BACKUP_TIME", "").strip() or "09:00"
 
 # "single" = one pinned message holding the whole week (neater).
 # "daily"  = one message per day (buttons sit closer to their day).
@@ -2586,6 +2589,79 @@ async def cmd_fixtime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         pass
 
 
+def snapshot_db() -> tuple[io.BytesIO, dict]:
+    """A consistent copy of the database, safe to take while the bot is running."""
+    import tempfile
+
+    counts = {}
+    for t in ("agents", "weeks", "signups", "time_entries", "pay_rates"):
+        try:
+            counts[t] = q1(f"SELECT COUNT(*) c FROM {t}")["c"]
+        except Exception:
+            counts[t] = 0
+
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.close()
+    dest = sqlite3.connect(tmp.name)
+    with dest:
+        db.backup(dest)
+    dest.close()
+
+    with open(tmp.name, "rb") as fh:
+        data = io.BytesIO(fh.read())
+    os.unlink(tmp.name)
+    data.name = f"avails_{now().strftime('%Y-%m-%d_%H%M')}.db"
+    return data, counts
+
+
+def backup_caption(counts: dict) -> str:
+    return (
+        f"🗄 Backup — {now().strftime('%-d %b %Y, %H:%M')}\n"
+        f"{counts['agents']} agents · {counts['weeks']} weeks · "
+        f"{counts['signups']} signups · {counts['time_entries']} shifts\n\n"
+        "Keep this somewhere safe. It's the only copy outside the server."
+    )
+
+
+async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        return
+    try:
+        data, counts = snapshot_db()
+    except Exception as e:
+        await update.message.reply_text(f"Backup failed: {e}")
+        log.warning("Manual backup failed: %s", e)
+        return
+    await update.message.reply_document(
+        data, filename=data.name, caption=backup_caption(counts)
+    )
+
+
+async def job_backup(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Weekly database copy, DM'd to owners."""
+    if now().weekday() != BACKUP_DAY:
+        return
+    targets = list(ADMIN_IDS) or admin_ids()
+    if not targets:
+        log.warning("Backup due but no owner to send it to.")
+        return
+    try:
+        data, counts = snapshot_db()
+    except Exception as e:
+        log.warning("Scheduled backup failed: %s", e)
+        return
+    body = data.getvalue()
+    for uid in targets:
+        try:
+            await context.bot.send_document(
+                uid, io.BytesIO(body), filename=data.name,
+                caption=backup_caption(counts),
+            )
+        except Exception as e:
+            log.info("Couldn't send backup to %s: %s", uid, e)
+    log.info("Backup sent to %d owner(s).", len(targets))
+
+
 async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(update.effective_user.id):
         return
@@ -2906,6 +2982,7 @@ ADMIN_COMMANDS = AGENT_COMMANDS + [
     ("openshifts", "Who's clocked in now"),
     ("clockoutfor", "Clock someone out"),
     ("fixtime", "Correct a time entry"),
+    ("backup", "Download a copy of the data"),
 ]
 
 
@@ -2973,6 +3050,15 @@ async def post_init(app: Application) -> None:
         job_auto_close, interval=timedelta(minutes=30),
         first=timedelta(minutes=5), name="auto-close",
     )
+    bmins = parse_time_token(BACKUP_TIME)
+    app.job_queue.run_daily(
+        job_backup, time(bmins // 60, bmins % 60, tzinfo=TZ), name="backup",
+    )
+    log.info(
+        "Weekly backup scheduled for %s at %s",
+        ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][BACKUP_DAY % 7],
+        BACKUP_TIME,
+    )
     if DM_REMINDERS:
         app.job_queue.run_daily(
             job_shift_reminders,
@@ -3035,6 +3121,7 @@ def main() -> None:
     app.add_handler(CommandHandler("openshifts", cmd_openshifts))
     app.add_handler(CommandHandler("clockoutfor", cmd_clockoutfor))
     app.add_handler(CommandHandler("fixtime", cmd_fixtime))
+    app.add_handler(CommandHandler("backup", cmd_backup))
     app.add_handler(CommandHandler("removeagent", cmd_removeagent))
     app.add_handler(CommandHandler("makeadmin", cmd_makeadmin))
     app.add_handler(CommandHandler("removeadmin", cmd_removeadmin))
