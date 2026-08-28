@@ -2974,33 +2974,92 @@ load();
 
 
 def miniapp_payload(user_id: int) -> dict:
-    first, last = month_bounds(now().date())
-    t = timesheet(user_id, first, last)
-    rate = rate_for(user_id, now().date())
-    shifts = []
-    for sh in t["shifts"]:
-        r = sh["row"]
-        shifts.append({
-            "date": sh["date"].strftime("%a %-d %b"),
-            "times": (
-                f"{datetime.fromisoformat(r['clock_in']).strftime('%H:%M')}"
-                f"–{datetime.fromisoformat(r['clock_out']).strftime('%H:%M')}"
-            ),
-            "hours": hhmm(sh["minutes"]),
-            "flagged": r["status"] == "auto",
-        })
+    """Built on a connection of its own — this runs on the web thread, not the
+    bot's, and sharing one SQLite connection across threads is unsafe."""
+    conn = sqlite3.connect(DB_PATH, timeout=5)
+    conn.row_factory = sqlite3.Row
+    try:
+        agent = conn.execute(
+            "SELECT display_name, name FROM agents WHERE user_id=?", (user_id,)
+        ).fetchone()
+        name = (agent["display_name"] or agent["name"] or "You") if agent else "You"
+
+        today = now().date()
+        first = today.replace(day=1)
+        last = (first + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+
+        def rate_on(d: date) -> int:
+            row = conn.execute(
+                "SELECT cents FROM pay_rates WHERE agent_id=? AND effective_from<=? "
+                "ORDER BY effective_from DESC, id DESC LIMIT 1",
+                (user_id, d.isoformat()),
+            ).fetchone()
+            if row:
+                return row["cents"]
+            row = conn.execute(
+                "SELECT cents FROM pay_rates WHERE agent_id IS NULL AND effective_from<=? "
+                "ORDER BY effective_from DESC, id DESC LIMIT 1",
+                (d.isoformat(),),
+            ).fetchone()
+            return row["cents"] if row else DEFAULT_RATE_CENTS
+
+        rows = conn.execute(
+            "SELECT * FROM time_entries WHERE agent_id=? AND the_date BETWEEN ? AND ? "
+            "ORDER BY the_date, clock_in",
+            (user_id, first.isoformat(), last.isoformat()),
+        ).fetchall()
+
+        shifts, total_min, total_cents, open_count = [], 0, 0, 0
+        seen_days = set()
+        for r in rows:
+            if not r["clock_out"]:
+                open_count += 1
+                continue
+            a = datetime.fromisoformat(r["clock_in"])
+            b = datetime.fromisoformat(r["clock_out"])
+            mins = max(0, int((b - a).total_seconds() // 60))
+            day = date.fromisoformat(r["the_date"])
+            total_min += mins
+            total_cents += round(mins / 60 * rate_on(day)) if mins else 0
+            seen_days.add(day)
+            shifts.append({
+                "date": day.strftime("%a %-d %b"),
+                "times": f"{a.strftime('%H:%M')}\u2013{b.strftime('%H:%M')}",
+                "hours": hhmm(mins),
+                "flagged": r["status"] == "auto",
+            })
+        rate = rate_on(today)
+    finally:
+        conn.close()
+
     shifts.reverse()
     return {
-        "name": display_name_of(user_id, "You"),
+        "name": name,
         "month": first.strftime("%B %Y"),
-        "hours": hhmm(t["minutes"]),
-        "days": t["days"],
+        "hours": hhmm(total_min),
+        "days": len(seen_days),
         "showPay": bool(rate),
         "rate": money(rate),
-        "estimate": money(t["cents"]),
-        "openShift": bool(t["open"]),
+        "estimate": money(total_cents),
+        "openShift": bool(open_count),
         "shifts": shifts,
     }
+
+
+def web_has_access(user_id: int) -> bool:
+    """Access check on the web thread's own connection."""
+    if user_id in ADMIN_IDS:
+        return True
+    conn = sqlite3.connect(DB_PATH, timeout=5)
+    try:
+        row = conn.execute(
+            "SELECT status FROM agents WHERE user_id=?", (user_id,)
+        ).fetchone()
+    finally:
+        conn.close()
+    if row:
+        return row[0] == "active"
+    return not ADMIN_IDS
 
 
 class MiniAppHandler(BaseHTTPRequestHandler):
@@ -3015,6 +3074,16 @@ class MiniAppHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        try:
+            self._route()
+        except Exception as e:
+            log.warning("Mini App handler error: %s", e, exc_info=True)
+            try:
+                self._send(500, b'{"error":"server"}')
+            except Exception:
+                pass
+
+    def _route(self):
         path = urllib.parse.urlparse(self.path).path
         if path in ("/", "/index.html"):
             self._send(200, MINIAPP_HTML.encode(), "text/html; charset=utf-8")
@@ -3023,22 +3092,24 @@ class MiniAppHandler(BaseHTTPRequestHandler):
             self._send(200, b'{"ok":true}')
             return
         if path == "/api/me":
-            raw = self.headers.get("X-Init-Data", "")
-            user = verify_init_data(raw)
-            if not user or "id" not in user:
-                self._send(401, b'{"error":"unverified"}')
-                return
-            uid = int(user["id"])
-            if not has_access(uid):
-                self._send(403, b'{"error":"no access"}')
-                return
             try:
+                raw = self.headers.get("X-Init-Data", "")
+                user = verify_init_data(raw)
+                if not user or "id" not in user:
+                    self._send(401, b'{"error":"unverified"}')
+                    return
+                uid = int(user["id"])
+                if not web_has_access(uid):
+                    self._send(403, b'{"error":"no access"}')
+                    return
                 body = json.dumps(miniapp_payload(uid)).encode()
+                self._send(200, body)
             except Exception as e:
-                log.warning("Mini App payload failed for %s: %s", uid, e)
-                self._send(500, b'{"error":"server"}')
-                return
-            self._send(200, body)
+                log.warning("Mini App request failed: %s", e, exc_info=True)
+                try:
+                    self._send(500, b'{"error":"server"}')
+                except Exception:
+                    pass
             return
         self._send(404, b'{"error":"not found"}')
 
