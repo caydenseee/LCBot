@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import asyncio
 import csv
+import hashlib
+import hmac
 import html
 import io
 import json
@@ -20,12 +22,17 @@ import logging
 import os
 import re
 import sqlite3
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import urllib.parse
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from zoneinfo import ZoneInfo
 
 from telegram import (
     BotCommand,
+    MenuButtonWebApp,
+    WebAppInfo,
     BotCommandScopeAllGroupChats,
     BotCommandScopeAllPrivateChats,
     BotCommandScopeChat,
@@ -95,6 +102,14 @@ AUTO_CLOSE_GRACE_MIN = env_int("AUTO_CLOSE_GRACE_MIN", 120)
 # Automatic database backup, DM'd to owners. 0-6 = Mon-Sun.
 BACKUP_DAY = env_int("BACKUP_DAY", 0)
 BACKUP_TIME = os.environ.get("BACKUP_TIME", "").strip() or "09:00"
+# Forum topics. Leave blank for a normal group. Get the number by sending
+# /chatid inside the topic you want.
+GROUP_THREAD_ID = env_int("GROUP_THREAD_ID") or None
+# Mini App. PUBLIC_URL comes from Railway once you generate a domain.
+PUBLIC_URL = os.environ.get("PUBLIC_URL", "").strip().rstrip("/")
+WEB_PORT = env_int("PORT", 8080)
+# Optional second topic for the daily on-duty tags. Falls back to the board topic.
+SHIFTCALL_THREAD_ID = env_int("SHIFTCALL_THREAD_ID") or GROUP_THREAD_ID
 
 # "single" = one pinned message holding the whole week (neater).
 # "daily"  = one message per day (buttons sit closer to their day).
@@ -274,6 +289,51 @@ def run(sql: str, args: tuple = ()) -> sqlite3.Cursor:
 def esc(text: str) -> str:
     """Names go into HTML messages, so & < > must be escaped."""
     return html.escape(text or "", quote=False)
+
+
+def verify_init_data(raw: str) -> dict | None:
+    """Prove a Mini App request really came from Telegram.
+
+    Telegram signs the launch data with a key derived from the bot token. We
+    recompute that signature; if it matches, the user id can be trusted. Without
+    this check anyone could edit the id in their browser and read a colleague's pay.
+    """
+    if not raw:
+        return None
+    try:
+        pairs = urllib.parse.parse_qsl(raw, keep_blank_values=True)
+    except Exception:
+        return None
+    data = dict(pairs)
+    got = data.pop("hash", None)
+    if not got:
+        return None
+
+    check = "\n".join(f"{k}={v}" for k, v in sorted(data.items()))
+    secret = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+    want = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
+    if not hmac.compare_digest(want, got):
+        return None
+
+    # Reject anything older than a day, so a copied link can't be replayed.
+    try:
+        if int(data.get("auth_date", 0)) < int(now().timestamp()) - 86400:
+            return None
+    except ValueError:
+        return None
+
+    try:
+        return json.loads(data.get("user", "{}"))
+    except json.JSONDecodeError:
+        return None
+
+
+async def send_group(bot, text: str, thread: int | None = -1, **kw):
+    """Post to the group, into the right forum topic if one is configured."""
+    tid = GROUP_THREAD_ID if thread == -1 else thread
+    if tid:
+        kw["message_thread_id"] = tid
+    return await bot.send_message(GROUP_CHAT_ID, text, **kw)
 
 
 def now() -> datetime:
@@ -968,8 +1028,8 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         text, kb = render_board(week_id)
     else:
         text, kb = render_header(week_id)
-    header = await bot.send_message(
-        GROUP_CHAT_ID, text, reply_markup=kb, parse_mode=constants.ParseMode.HTML
+    header = await send_group(
+        bot, text, reply_markup=kb, parse_mode=constants.ParseMode.HTML
     )
     run("UPDATE weeks SET header_msg_id=? WHERE id=?", (header.message_id, week_id))
     try:
@@ -980,8 +1040,8 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if BOARD_MODE != "single":
         for d in q("SELECT * FROM days WHERE week_id=? ORDER BY idx", (week_id,)):
             day_text, day_kb = render_day(d["id"])
-            msg = await bot.send_message(
-                GROUP_CHAT_ID, day_text, reply_markup=day_kb,
+            msg = await send_group(
+                bot, day_text, reply_markup=day_kb,
                 parse_mode=constants.ParseMode.HTML,
             )
             run("UPDATE days SET msg_id=? WHERE id=?", (msg.message_id, d["id"]))
@@ -999,8 +1059,8 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 "☝️ This board updates itself. To pick your slots, "
                 "DM me <code>/plan</code>.",
             ]
-        await bot.send_message(
-            GROUP_CHAT_ID, "\n".join(intro), parse_mode=constants.ParseMode.HTML
+        await send_group(
+            bot, "\n".join(intro), parse_mode=constants.ParseMode.HTML
         )
 
     schedule_week_jobs(context.application, week_id)
@@ -1472,8 +1532,9 @@ async def cmd_shiftcall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not text:
         await update.message.reply_text(f"Nothing to post — {reason}")
         return
-    await context.bot.send_message(
-        GROUP_CHAT_ID, text, parse_mode=constants.ParseMode.HTML
+    await send_group(
+        context.bot, text, thread=SHIFTCALL_THREAD_ID,
+        parse_mode=constants.ParseMode.HTML,
     )
     await update.message.reply_text("Posted to the group ✅")
 
@@ -1491,8 +1552,16 @@ async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"You ({user.full_name}):",
         f"<code>{user.id}</code>",
     ]
+    thread = getattr(update.message, "message_thread_id", None)
     if chat.type in (constants.ChatType.GROUP, constants.ChatType.SUPERGROUP):
         lines += ["", f"→ <code>GROUP_CHAT_ID={chat.id}</code>"]
+        if thread:
+            lines += [
+                f"→ <code>GROUP_THREAD_ID={thread}</code>",
+                "<i>(this topic — set that to post here)</i>",
+            ]
+        else:
+            lines.append("<i>Not in a topic — posts go to General.</i>")
         if GROUP_CHAT_ID and chat.id != GROUP_CHAT_ID:
             lines.append("⚠️ This differs from the GROUP_CHAT_ID currently configured.")
         elif not GROUP_CHAT_ID:
@@ -1569,10 +1638,16 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if status == "active":
         touch_agent(user, dm_ok=1)
         await update.message.reply_text(
-            "You're all set ✅\n\n"
-            "Send /plan when a week is open to pick your slots.\n"
+            "👋 <b>You're in!</b>\n\n"
+            "/plan — pick your slots for the week\n"
+            "/clockin — start your shift\n"
+            "/clockout — end your shift\n"
             "/myshifts — what you're signed up for\n"
-            "/help — everything I can do"
+            "/mytime — your hours this month\n"
+            "/help — this list again\n\n"
+            "<i>Slots are one person, first come first served.\n"
+            "The group schedule updates itself — no need to post avails there.</i>",
+            parse_mode=constants.ParseMode.HTML,
         )
         return ConversationHandler.END
 
@@ -1735,9 +1810,16 @@ async def on_access_decision(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if approve:
             await context.bot.send_message(
                 target_id,
-                "✅ You've been approved!\n\n"
-                "Send /plan when a week is open to pick your slots.\n"
-                "/help — everything I can do",
+                "👋 <b>You're in!</b>\n\n"
+            "/plan — pick your slots for the week\n"
+            "/clockin — start your shift\n"
+            "/clockout — end your shift\n"
+            "/myshifts — what you're signed up for\n"
+            "/mytime — your hours this month\n"
+            "/help — this list again\n\n"
+            "<i>Slots are one person, first come first served.\n"
+            "The group schedule updates itself — no need to post avails there.</i>",
+                parse_mode=constants.ParseMode.HTML,
             )
             await refresh_menu_for(context.bot, target_id)
         else:
@@ -2029,8 +2111,8 @@ async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         text, kb = render_board(w["id"])
     else:
         text, kb = render_header(w["id"])
-    msg = await bot.send_message(
-        GROUP_CHAT_ID, text, reply_markup=kb, parse_mode=constants.ParseMode.HTML
+    msg = await send_group(
+        bot, text, reply_markup=kb, parse_mode=constants.ParseMode.HTML
     )
     run("UPDATE weeks SET header_msg_id=? WHERE id=?", (msg.message_id, w["id"]))
 
@@ -2785,6 +2867,216 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+
+# --------------------------------------------------------------------------
+# Mini App
+# --------------------------------------------------------------------------
+
+MINIAPP_HTML = """<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>My hours</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root { color-scheme: light dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px 16px 40px;
+    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: var(--tg-theme-bg-color, #fff);
+    color: var(--tg-theme-text-color, #111);
+  }
+  h1 { font-size: 20px; margin: 0 0 2px; }
+  .sub { color: var(--tg-theme-hint-color, #777); font-size: 13px; margin-bottom: 18px; }
+  .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 22px; }
+  .card {
+    background: var(--tg-theme-secondary-bg-color, #f4f4f5);
+    border-radius: 14px; padding: 14px;
+  }
+  .card .n { font-size: 22px; font-weight: 650; letter-spacing: -0.02em; }
+  .card .l { font-size: 12px; color: var(--tg-theme-hint-color, #777); margin-top: 2px; }
+  .card.wide { grid-column: 1 / -1; }
+  .card.pay .n { color: var(--tg-theme-link-color, #2a7); }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em;
+       color: var(--tg-theme-hint-color, #777); margin: 0 0 8px; font-weight: 600; }
+  .row { display: flex; justify-content: space-between; align-items: baseline;
+         padding: 11px 0; border-bottom: 1px solid var(--tg-theme-secondary-bg-color, #eee); }
+  .row:last-child { border-bottom: 0; }
+  .d { font-weight: 550; }
+  .t { font-size: 12px; color: var(--tg-theme-hint-color, #777); margin-top: 1px; }
+  .h { font-variant-numeric: tabular-nums; }
+  .flag { font-size: 11px; color: #c60; }
+  .empty { text-align: center; padding: 40px 20px; color: var(--tg-theme-hint-color, #777); }
+  .note { margin-top: 22px; font-size: 12px; color: var(--tg-theme-hint-color, #777);
+          line-height: 1.5; }
+  .err { background: #fee; color: #900; padding: 14px; border-radius: 12px; }
+</style>
+</head><body>
+<div id="app"><div class="empty">Loading…</div></div>
+<script>
+const tg = window.Telegram?.WebApp;
+if (tg) { tg.ready(); tg.expand(); }
+const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+
+async function load() {
+  const app = document.getElementById('app');
+  try {
+    const r = await fetch('/api/me', {
+      headers: { 'X-Init-Data': tg?.initData || '' }
+    });
+    if (r.status === 401) {
+      app.innerHTML = '<div class="err">Couldn\'t verify who you are. Open this from the bot rather than a browser.</div>';
+      return;
+    }
+    if (r.status === 403) {
+      app.innerHTML = '<div class="err">You don\'t have access yet. Send /start to the bot.</div>';
+      return;
+    }
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+
+    let h = `<h1>${esc(d.name)}</h1><div class="sub">${esc(d.month)}</div>`;
+    h += '<div class="cards">';
+    h += `<div class="card"><div class="n">${esc(d.hours)}</div><div class="l">Hours worked</div></div>`;
+    h += `<div class="card"><div class="n">${d.days}</div><div class="l">Days worked</div></div>`;
+    if (d.showPay) {
+      h += `<div class="card pay wide"><div class="n">${esc(d.estimate)}</div>`;
+      h += `<div class="l">Estimated · ${esc(d.rate)}/hour</div></div>`;
+    }
+    h += '</div>';
+
+    if (d.shifts.length) {
+      h += '<h2>Shifts</h2>';
+      for (const s of d.shifts) {
+        h += '<div class="row"><div>';
+        h += `<div class="d">${esc(s.date)}</div>`;
+        h += `<div class="t">${esc(s.times)}${s.flagged ? ' <span class="flag">· auto-closed</span>' : ''}</div>`;
+        h += `</div><div class="h">${esc(s.hours)}</div></div>`;
+      }
+    } else {
+      h += '<div class="empty">No shifts logged this month yet.<br>Use /clockin when you start.</div>';
+    }
+    if (d.openShift) {
+      h += '<div class="note">⏱ You are clocked in right now — this shift is not counted yet.</div>';
+    }
+    if (d.showPay) {
+      h += '<div class="note">This is an estimate to help you plan. Your actual pay comes from HR and may differ.</div>';
+    }
+    app.innerHTML = h;
+  } catch (e) {
+    app.innerHTML = '<div class="err">Could not load your hours. Try again shortly.</div>';
+  }
+}
+load();
+</script>
+</body></html>"""
+
+
+def miniapp_payload(user_id: int) -> dict:
+    first, last = month_bounds(now().date())
+    t = timesheet(user_id, first, last)
+    rate = rate_for(user_id, now().date())
+    shifts = []
+    for sh in t["shifts"]:
+        r = sh["row"]
+        shifts.append({
+            "date": sh["date"].strftime("%a %-d %b"),
+            "times": (
+                f"{datetime.fromisoformat(r['clock_in']).strftime('%H:%M')}"
+                f"–{datetime.fromisoformat(r['clock_out']).strftime('%H:%M')}"
+            ),
+            "hours": hhmm(sh["minutes"]),
+            "flagged": r["status"] == "auto",
+        })
+    shifts.reverse()
+    return {
+        "name": display_name_of(user_id, "You"),
+        "month": first.strftime("%B %Y"),
+        "hours": hhmm(t["minutes"]),
+        "days": t["days"],
+        "showPay": bool(rate),
+        "rate": money(rate),
+        "estimate": money(t["cents"]),
+        "openShift": bool(t["open"]),
+        "shifts": shifts,
+    }
+
+
+class MiniAppHandler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def _send(self, code, body: bytes, ctype="application/json"):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        path = urllib.parse.urlparse(self.path).path
+        if path in ("/", "/index.html"):
+            self._send(200, MINIAPP_HTML.encode(), "text/html; charset=utf-8")
+            return
+        if path == "/health":
+            self._send(200, b'{"ok":true}')
+            return
+        if path == "/api/me":
+            raw = self.headers.get("X-Init-Data", "")
+            user = verify_init_data(raw)
+            if not user or "id" not in user:
+                self._send(401, b'{"error":"unverified"}')
+                return
+            uid = int(user["id"])
+            if not has_access(uid):
+                self._send(403, b'{"error":"no access"}')
+                return
+            try:
+                body = json.dumps(miniapp_payload(uid)).encode()
+            except Exception as e:
+                log.warning("Mini App payload failed for %s: %s", uid, e)
+                self._send(500, b'{"error":"server"}')
+                return
+            self._send(200, body)
+            return
+        self._send(404, b'{"error":"not found"}')
+
+    def log_message(self, *a):
+        pass
+
+
+def start_web_server() -> None:
+    try:
+        srv = ThreadingHTTPServer(("0.0.0.0", WEB_PORT), MiniAppHandler)
+    except Exception as e:
+        log.warning("Mini App server could not start: %s", e)
+        return
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    log.info("Mini App server listening on port %s", WEB_PORT)
+
+
+async def cmd_payslip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Open the hours summary."""
+    if update.effective_chat.type != constants.ChatType.PRIVATE:
+        return
+    if not await gate(update):
+        return
+    if not PUBLIC_URL:
+        await update.message.reply_text(
+            "The app isn't set up yet. Use /mytime for now."
+        )
+        return
+    kb = InlineKeyboardMarkup(
+        [[InlineKeyboardButton(
+            "📊 Open my hours", web_app=WebAppInfo(url=PUBLIC_URL)
+        )]]
+    )
+    await update.message.reply_text(
+        "Your hours and estimated pay for this month:", reply_markup=kb
+    )
+
+
 # --------------------------------------------------------------------------
 # Scheduled jobs
 # --------------------------------------------------------------------------
@@ -2815,8 +3107,8 @@ async def nudge(context: ContextTypes.DEFAULT_TYPE, week_id: int, prefix: str) -
     if not st["missing"] and not st["gaps"]:
         return
 
-    await context.bot.send_message(
-        GROUP_CHAT_ID, "\n".join(parts), parse_mode=constants.ParseMode.HTML
+    await send_group(
+        context.bot, "\n".join(parts), parse_mode=constants.ParseMode.HTML
     )
 
 
@@ -2846,8 +3138,8 @@ async def close_week(context: ContextTypes.DEFAULT_TYPE, week_id: int) -> None:
         ]
     else:
         msg.append("\n🎉 Fully covered. Nice work.")
-    await context.bot.send_message(
-        GROUP_CHAT_ID, "\n".join(msg), parse_mode=constants.ParseMode.HTML
+    await send_group(
+        context.bot, "\n".join(msg), parse_mode=constants.ParseMode.HTML
     )
 
 
@@ -2911,8 +3203,9 @@ async def job_shift_call(context: ContextTypes.DEFAULT_TYPE) -> None:
         log.info("Shift call skipped: %s", reason)
         return
     try:
-        await context.bot.send_message(
-            GROUP_CHAT_ID, text, parse_mode=constants.ParseMode.HTML
+        await send_group(
+            context.bot, text, thread=SHIFTCALL_THREAD_ID,
+            parse_mode=constants.ParseMode.HTML,
         )
     except Exception as e:
         log.warning("Shift call failed: %s", e)
@@ -3012,6 +3305,7 @@ AGENT_COMMANDS = [
     ("clockin", "Start my shift"),
     ("clockout", "End my shift"),
     ("mytime", "My hours this month"),
+    ("payslip", "My hours and estimated pay"),
     ("myshifts", "What I'm signed up for"),
     ("summary", "Show the current board"),
     ("help", "List commands"),
@@ -3093,6 +3387,17 @@ async def publish_command_menus(app: Application) -> None:
 
 async def post_init(app: Application) -> None:
     """Re-arm jobs after a restart."""
+    start_web_server()
+    if PUBLIC_URL:
+        try:
+            await app.bot.set_chat_menu_button(
+                menu_button=MenuButtonWebApp(
+                    text="My hours", web_app=WebAppInfo(url=PUBLIC_URL)
+                )
+            )
+            log.info("Mini App button set to %s", PUBLIC_URL)
+        except Exception as e:
+            log.info("Couldn't set the menu button: %s", e)
     await publish_command_menus(app)
     w = open_week()
     if w:
@@ -3174,6 +3479,7 @@ def main() -> None:
     app.add_handler(CommandHandler("clockin", cmd_clockin))
     app.add_handler(CommandHandler("clockout", cmd_clockout))
     app.add_handler(CommandHandler("mytime", cmd_mytime))
+    app.add_handler(CommandHandler("payslip", cmd_payslip))
     app.add_handler(CommandHandler("setrate", cmd_setrate))
     app.add_handler(CommandHandler("timesheet", cmd_timesheet))
     app.add_handler(CommandHandler("payroll", cmd_payroll))
