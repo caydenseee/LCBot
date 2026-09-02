@@ -268,6 +268,7 @@ for _col, _ddl in [
     ("status", "TEXT NOT NULL DEFAULT 'active'"),
     ("display_name", "TEXT"),
     ("support_name", "TEXT"),
+    ("on_avails", "INTEGER NOT NULL DEFAULT 1"),
     ("requested_at", "TEXT"),
     ("decided_by", "INTEGER"),
     ("decided_at", "TEXT"),
@@ -700,7 +701,7 @@ def render_day(day_id: int) -> tuple[str, InlineKeyboardMarkup]:
 
 
 def week_stats(week_id: int) -> dict:
-    roster = q("SELECT * FROM agents WHERE status='active'")
+    roster = q("SELECT * FROM agents WHERE status='active' AND on_avails=1")
     confirmed = {
         r["user_id"] for r in q("SELECT user_id FROM confirmations WHERE week_id=?", (week_id,))
     }
@@ -2516,6 +2517,62 @@ async def cmd_removeadmin(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await _set_role(update, context, "agent")
 
 
+async def cmd_avails(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Take someone off the weekly avails roster without removing their access.
+
+    Full-timers and anyone who doesn't pick slots shouldn't be tagged on the
+    board or chased about confirming.
+    """
+    if not is_admin(update.effective_user.id):
+        return
+    if not context.args:
+        on = q("SELECT * FROM agents WHERE status='active' AND on_avails=1 ORDER BY name")
+        off = q("SELECT * FROM agents WHERE status='active' AND on_avails=0 ORDER BY name")
+        lines = [f"<b>On the avails roster ({len(on)})</b>"]
+        lines += [f"  {esc(a['display_name'] or a['name'])}" for a in on] or ["  nobody"]
+        lines += ["", f"<b>Not tagged or chased ({len(off)})</b>"]
+        lines += [f"  {esc(a['display_name'] or a['name'])}" for a in off] or ["  nobody"]
+        lines += [
+            "",
+            "<code>/avails off @handle</code> — stop tagging them",
+            "<code>/avails on @handle</code> — put them back",
+        ]
+        await update.message.reply_text(
+            "\n".join(lines), parse_mode=constants.ParseMode.HTML
+        )
+        return
+
+    mode = context.args[0].lower()
+    if mode not in ("on", "off") or len(context.args) < 2:
+        await update.message.reply_text(
+            "Usage: <code>/avails off @handle</code> or <code>/avails on @handle</code>",
+            parse_mode=constants.ParseMode.HTML,
+        )
+        return
+
+    row = find_agent(context.args[1])
+    if not row:
+        await update.message.reply_text("No one matches that. Check /roster.")
+        return
+
+    want = 1 if mode == "on" else 0
+    async with write_lock:
+        run("UPDATE agents SET on_avails=? WHERE user_id=?", (want, row["user_id"]))
+    nm = row["display_name"] or row["name"]
+    if want:
+        msg = (f"<b>{esc(nm)}</b> is back on the avails roster — "
+               "they'll be tagged and chased again.")
+    else:
+        msg = (f"<b>{esc(nm)}</b> is off the avails roster.\n"
+               "They won't be tagged on the board or chased about confirming, "
+               "but they keep full access and can still pick slots.")
+    await update.message.reply_text(msg, parse_mode=constants.ParseMode.HTML)
+
+    w = open_week()
+    if w:
+        await refresh_group(context, w["id"])
+
+
 async def cmd_removeagent(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Take someone off the roster and free any slots they were holding."""
     if not is_admin(update.effective_user.id):
@@ -3672,6 +3729,7 @@ ADMIN_COMMANDS = AGENT_COMMANDS + [
     ("shiftcall", "Post tomorrow's on-duty tags"),
     ("roster", "Who's on the list"),
     ("removeagent", "Remove someone"),
+    ("avails", "Who gets tagged for avails"),
     ("export", "Download this week as CSV"),
     ("presets", "Saved timing patterns"),
     ("closeweek", "Close submissions early"),
@@ -3838,6 +3896,7 @@ def main() -> None:
     app.add_handler(CommandHandler("backup", cmd_backup))
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("removeagent", cmd_removeagent))
+    app.add_handler(CommandHandler("avails", cmd_avails))
     app.add_handler(CommandHandler("makeadmin", cmd_makeadmin))
     app.add_handler(CommandHandler("removeadmin", cmd_removeadmin))
     app.add_handler(CommandHandler("presets", cmd_presets))
