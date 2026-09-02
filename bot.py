@@ -1119,7 +1119,7 @@ def shape_summary(cfg: dict) -> str:
 def week_shape_keyboard(has_slots: bool = False) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("📋 Standard week", callback_data="ws:standard")],
-        [InlineKeyboardButton("🌙 Campaign — late shifts", callback_data="ws:campaign")],
+        [InlineKeyboardButton("🌙 Campaign", callback_data="ws:campaign")],
         [InlineKeyboardButton("🎌 Public holiday", callback_data="ws:ph")],
     ]
     saved = [
@@ -1147,7 +1147,7 @@ def day_picker_keyboard(chosen: set, mode: str) -> InlineKeyboardMarkup:
         InlineKeyboardButton("All days", callback_data="wd:ALL"),
         InlineKeyboardButton("Clear", callback_data="wd:NONE"),
     ])
-    label = "Add late shifts" if mode == "campaign" else "Mark holiday"
+    label = "Apply campaign" if mode == "campaign" else "Mark holiday"
     rows.append([InlineKeyboardButton(f"✓ {label} & continue", callback_data="wd:DONE")])
     return InlineKeyboardMarkup(rows)
 
@@ -1280,16 +1280,16 @@ async def on_week_days(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         name = draft.get("shape_label", "")
         days = ", ".join(d for d in DAY_NAMES if d in chosen)
         note = {
-            "campaign": f"🌙 {name} — late shifts: {days}",
-            "ph_sg": f"🎌 {name} (SG) — shifts end 6pm: {days}",
-            "ph_other": f"🎌 {name} — normal hours: {days}",
+            "campaign": f"🌙 {name}: {days}",
+            "ph_sg": f"🎌 {name} (SG): {days}",
+            "ph_other": f"🎌 {name}: {days}",
         }[mode]
         existing = draft.get("events") or ""
         draft["events"] = (existing + "\n" + note).strip() if existing else note
 
         await query.answer()
         headline = {
-            "campaign": f"✓ {name}: late shifts on {days}",
+            "campaign": f"✓ {name}: {days}",
             "ph_sg": f"✓ {name}: {days} now end at 6pm",
             "ph_other": f"✓ {name} noted on {days} — hours unchanged",
         }[mode]
