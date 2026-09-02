@@ -2099,6 +2099,17 @@ async def cmd_opening(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     user = update.effective_user
     name = display_name_of(user.id, user.full_name)
 
+    # An explicit slot wins, for cover shifts or anything off-roster.
+    if context.args:
+        slot_label = " ".join(context.args).strip()
+        await update.message.reply_text(
+            opening_block(user.id, name, slot_label), parse_mode=None
+        )
+        await update.message.reply_text(
+            "Tap the message above to copy it.",
+        )
+        return
+
     entry = q1(
         "SELECT * FROM time_entries WHERE agent_id=? AND clock_out IS NULL "
         "ORDER BY id DESC LIMIT 1",
@@ -2117,11 +2128,14 @@ async def cmd_opening(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text(
         opening_block(user.id, name, slot_label), parse_mode=None
     )
-    await update.message.reply_text(
-        "Tap the message above to copy it.\n"
-        "Change who's listed as support with <code>/support Name</code>",
-        parse_mode=constants.ParseMode.HTML,
-    )
+    hint = "Tap the message above to copy it.\n"
+    if slot_label == "—":
+        hint += (
+            "I couldn't find a shift for you around now — set the time yourself "
+            "with <code>/opening 6pm-8pm</code>\n"
+        )
+    hint += "Change who's listed as support with <code>/support Name</code>"
+    await update.message.reply_text(hint, parse_mode=constants.ParseMode.HTML)
 
 
 async def cmd_support(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
