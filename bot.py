@@ -2922,15 +2922,19 @@ const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'
 async function load() {
   const app = document.getElementById('app');
   try {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 15000);
     const r = await fetch('/api/me', {
-      headers: { 'X-Init-Data': tg?.initData || '' }
+      headers: { 'X-Init-Data': tg?.initData || '' },
+      signal: ctrl.signal
     });
+    clearTimeout(timer);
     if (r.status === 401) {
-      app.innerHTML = '<div class="err">Couldn\'t verify who you are. Open this from the bot rather than a browser.</div>';
+      app.innerHTML = '<div class="err">Could not verify who you are. Open this from the bot rather than a browser.</div>';
       return;
     }
     if (r.status === 403) {
-      app.innerHTML = '<div class="err">You don\'t have access yet. Send /start to the bot.</div>';
+      app.innerHTML = '<div class="err">You do not have access yet. Send /start to the bot.</div>';
       return;
     }
     if (!r.ok) throw new Error('HTTP ' + r.status);
@@ -2965,7 +2969,8 @@ async function load() {
     }
     app.innerHTML = h;
   } catch (e) {
-    app.innerHTML = '<div class="err">Could not load your hours. Try again shortly.</div>';
+    const why = e.name === 'AbortError' ? 'The server did not answer in time.' : esc(e.message || e);
+    app.innerHTML = '<div class="err">Could not load your hours.<br><br>' + why + '</div>';
   }
 }
 load();
