@@ -211,6 +211,10 @@ CREATE TABLE IF NOT EXISTS presets (
     name   TEXT PRIMARY KEY,
     config TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
 CREATE TABLE IF NOT EXISTS pay_rates (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     agent_id       INTEGER,
@@ -258,6 +262,7 @@ if "role" not in _cols:
 for _col, _ddl in [
     ("status", "TEXT NOT NULL DEFAULT 'active'"),
     ("display_name", "TEXT"),
+    ("support_name", "TEXT"),
     ("requested_at", "TEXT"),
     ("decided_by", "INTEGER"),
     ("decided_at", "TEXT"),
@@ -534,6 +539,35 @@ def timesheet(agent_id: int, first: date, last: date) -> dict:
 
 def hhmm(minutes: int) -> str:
     return f"{minutes // 60}h {minutes % 60:02d}m"
+
+
+def setting(key: str, default: str = "") -> str:
+    row = q1("SELECT value FROM settings WHERE key=?", (key,))
+    return row["value"] if row and row["value"] else default
+
+
+def set_setting(key: str, value: str) -> None:
+    run(
+        "INSERT INTO settings (key, value) VALUES (?,?) "
+        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        (key, value),
+    )
+
+
+def support_for(user_id: int, fallback: str = "") -> str:
+    """Who to list as Support: their own override, else the team default."""
+    row = q1("SELECT support_name FROM agents WHERE user_id=?", (user_id,))
+    if row and row["support_name"]:
+        return row["support_name"]
+    return setting("support_name", "") or fallback
+
+
+def opening_block(user_id: int, name: str, slot_label: str) -> str:
+    return (
+        "[OPENING]\n"
+        f"{name} on Livechat : {slot_label}\n"
+        f"Support: {support_for(user_id, name)}"
+    )
 
 
 def display_name_of(user_id: int, fallback: str = "") -> str:
@@ -1988,6 +2022,12 @@ async def cmd_clockin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
              when.date().isoformat(), when.isoformat()),
         )
 
+    nice_name = display_name_of(user.id, user.full_name)
+    slot_text = slot["label"] if slot else "—"
+    await update.message.reply_text(
+        opening_block(user.id, nice_name, slot_text),
+        parse_mode=None,
+    )
     if slot:
         await update.message.reply_text(
             f"⏱ Clocked in at <b>{when.strftime('%H:%M')}</b>\n"
@@ -2047,6 +2087,103 @@ async def cmd_clockout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     msg.append("\n/mytime — your hours this month")
     await update.message.reply_text(
         "\n".join(msg), parse_mode=constants.ParseMode.HTML
+    )
+
+
+async def cmd_opening(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """The [OPENING] block, ready to copy into the ops chat."""
+    if update.effective_chat.type != constants.ChatType.PRIVATE:
+        return
+    if not await gate(update):
+        return
+    user = update.effective_user
+    name = display_name_of(user.id, user.full_name)
+
+    entry = q1(
+        "SELECT * FROM time_entries WHERE agent_id=? AND clock_out IS NULL "
+        "ORDER BY id DESC LIMIT 1",
+        (user.id,),
+    )
+    slot_label = "—"
+    if entry and entry["slot_id"]:
+        row = q1("SELECT label FROM slots WHERE id=?", (entry["slot_id"],))
+        if row:
+            slot_label = row["label"]
+    elif not entry:
+        nxt = current_slot_for(user.id, now())
+        if nxt:
+            slot_label = nxt["label"]
+
+    await update.message.reply_text(
+        opening_block(user.id, name, slot_label), parse_mode=None
+    )
+    await update.message.reply_text(
+        "Tap the message above to copy it.\n"
+        "Change who's listed as support with <code>/support Name</code>",
+        parse_mode=constants.ParseMode.HTML,
+    )
+
+
+async def cmd_support(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/support           — show who you list as support
+       /support Zoe       — set it for yourself
+       /support team Zoe  — admins: set the default for everyone"""
+    if update.effective_chat.type != constants.ChatType.PRIVATE:
+        return
+    if not await gate(update):
+        return
+    user = update.effective_user
+    args = context.args
+
+    if args and args[0].lower() == "team":
+        if not is_admin(user.id):
+            await update.message.reply_text("Only admins can set the team default.")
+            return
+        if len(args) < 2:
+            await update.message.reply_text("Usage: /support team Zoe")
+            return
+        value = " ".join(args[1:]).strip()
+        async with write_lock:
+            set_setting("support_name", value)
+        await update.message.reply_text(
+            f"Team default support is now <b>{esc(value)}</b>.\n"
+            "<i>Anyone who's set their own keeps theirs.</i>",
+            parse_mode=constants.ParseMode.HTML,
+        )
+        return
+
+    if not args:
+        mine = q1("SELECT support_name FROM agents WHERE user_id=?", (user.id,))
+        own = mine["support_name"] if mine else None
+        team = setting("support_name", "")
+        lines = [
+            f"Your openings list: <b>{esc(support_for(user.id, display_name_of(user.id, user.full_name)))}</b>"
+        ]
+        lines.append(
+            "<i>(your own setting)</i>" if own
+            else ("<i>(team default)</i>" if team else "<i>(defaults to your own name)</i>")
+        )
+        lines.append("\nChange it with <code>/support Zoe</code>")
+        if is_admin(user.id):
+            lines.append("Set it for everyone with <code>/support team Zoe</code>")
+        lines.append("Clear yours with <code>/support reset</code>")
+        await update.message.reply_text(
+            "\n".join(lines), parse_mode=constants.ParseMode.HTML
+        )
+        return
+
+    if args[0].lower() == "reset":
+        async with write_lock:
+            run("UPDATE agents SET support_name=NULL WHERE user_id=?", (user.id,))
+        await update.message.reply_text("Cleared — you'll use the team default.")
+        return
+
+    value = " ".join(args).strip()
+    async with write_lock:
+        run("UPDATE agents SET support_name=? WHERE user_id=?", (value, user.id))
+    await update.message.reply_text(
+        f"Your openings will list <b>{esc(value)}</b> as support.",
+        parse_mode=constants.ParseMode.HTML,
     )
 
 
@@ -3471,6 +3608,8 @@ AGENT_COMMANDS = [
     ("clockin", "Start my shift"),
     ("clockout", "End my shift"),
     ("mytime", "My hours this month"),
+    ("opening", "Get my [OPENING] message"),
+    ("support", "Who I list as support"),
     ("payslip", "My hours and estimated pay"),
     ("myshifts", "What I'm signed up for"),
     ("summary", "Show the current board"),
@@ -3645,6 +3784,8 @@ def main() -> None:
     app.add_handler(CommandHandler("clockin", cmd_clockin))
     app.add_handler(CommandHandler("clockout", cmd_clockout))
     app.add_handler(CommandHandler("mytime", cmd_mytime))
+    app.add_handler(CommandHandler("opening", cmd_opening))
+    app.add_handler(CommandHandler("support", cmd_support))
     app.add_handler(CommandHandler("payslip", cmd_payslip))
     app.add_handler(CommandHandler("setrate", cmd_setrate))
     app.add_handler(CommandHandler("timesheet", cmd_timesheet))
