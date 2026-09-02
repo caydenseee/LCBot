@@ -220,6 +220,12 @@ CREATE TABLE IF NOT EXISTS settings (
     key   TEXT PRIMARY KEY,
     value TEXT
 );
+CREATE TABLE IF NOT EXISTS fixed_slots (
+    user_id  INTEGER NOT NULL,
+    day_name TEXT NOT NULL,
+    label    TEXT NOT NULL,
+    PRIMARY KEY (user_id, day_name, label)
+);
 CREATE TABLE IF NOT EXISTS pay_rates (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     agent_id       INTEGER,
@@ -698,6 +704,34 @@ def render_day(day_id: int) -> tuple[str, InlineKeyboardMarkup]:
 
     rows = [buttons[i : i + 3] for i in range(0, len(buttons), 3)]
     return "\n".join(lines), InlineKeyboardMarkup([] if closed else rows)
+
+
+def apply_fixed_slots(week_id: int) -> int:
+    """Put people with a fixed weekly pattern straight onto the new board."""
+    filled = 0
+    rows = q(
+        """SELECT f.user_id, f.day_name, f.label, a.display_name, a.name
+           FROM fixed_slots f JOIN agents a ON a.user_id = f.user_id
+           WHERE a.status='active'"""
+    )
+    for r in rows:
+        slot = q1(
+            """SELECT s.id FROM slots s JOIN days d ON d.id = s.day_id
+               WHERE d.week_id=? AND d.name=? AND lower(s.label)=lower(?)""",
+            (week_id, r["day_name"], r["label"]),
+        )
+        if not slot:
+            continue
+        taken = q1("SELECT 1 FROM signups WHERE slot_id=?", (slot["id"],))
+        if taken:
+            continue
+        cur = run(
+            "INSERT OR IGNORE INTO signups (slot_id, user_id, name, ts) VALUES (?,?,?,?)",
+            (slot["id"], r["user_id"],
+             r["display_name"] or r["name"], now().isoformat()),
+        )
+        filled += cur.rowcount
+    return filled
 
 
 def week_stats(week_id: int) -> dict:
@@ -1383,6 +1417,8 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                     (day_id, j, lbl, slot_start_minutes(lbl)),
                 )
 
+        fixed_filled = apply_fixed_slots(week_id)
+
     bot = context.bot
     if BOARD_MODE == "single":
         text, kb = render_board(week_id)
@@ -1424,7 +1460,10 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         )
 
     schedule_week_jobs(context.application, week_id)
-    await update.message.reply_text("Posted to the group ✅")
+    msg = "Posted to the group ✅"
+    if fixed_filled:
+        msg += f"\n{fixed_filled} slot(s) filled from fixed rosters."
+    await update.message.reply_text(msg)
     context.user_data.pop("draft", None)
     return ConversationHandler.END
 
@@ -2718,6 +2757,135 @@ async def cmd_removeadmin(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await _set_role(update, context, "agent")
 
 
+async def cmd_fixed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Slots someone always works, filled in automatically each week.
+
+    Meant for full-timers whose hours don't change.
+    """
+    if not is_admin(update.effective_user.id):
+        return
+
+    if not context.args:
+        rows = q(
+            """SELECT f.user_id, a.display_name, a.name, COUNT(*) AS n
+               FROM fixed_slots f JOIN agents a ON a.user_id = f.user_id
+               GROUP BY f.user_id ORDER BY a.name"""
+        )
+        lines = ["<b>Fixed weekly rosters</b>", ""]
+        if not rows:
+            lines.append("Nobody has one yet.")
+        for r in rows:
+            slots = q(
+                "SELECT day_name, label FROM fixed_slots WHERE user_id=?",
+                (r["user_id"],),
+            )
+            by_day = {}
+            for sl in slots:
+                by_day.setdefault(sl["day_name"], []).append(sl["label"])
+            detail = "; ".join(
+                f"{d} {', '.join(sorted(by_day[d], key=slot_start_minutes))}"
+                for d in DAY_NAMES if d in by_day
+            )
+            lines.append(f"<b>{esc(r['display_name'] or r['name'])}</b> — {detail}")
+        lines += [
+            "",
+            "<code>/fixed @handle MON 10am-12pm</code> — add or remove a slot",
+            "<code>/fixed @handle clear</code> — wipe theirs",
+            "",
+            "<i>These fill in automatically when a week is posted.</i>",
+        ]
+        await update.message.reply_text(
+            "\n".join(lines), parse_mode=constants.ParseMode.HTML
+        )
+        return
+
+    row = find_agent(context.args[0])
+    if not row:
+        await update.message.reply_text("No one matches that. Check /roster.")
+        return
+    nm = row["display_name"] or row["name"]
+
+    if len(context.args) == 1:
+        slots = q(
+            "SELECT day_name, label FROM fixed_slots WHERE user_id=?", (row["user_id"],)
+        )
+        if not slots:
+            await update.message.reply_text(
+                f"<b>{esc(nm)}</b> has no fixed slots.\n\n"
+                f"Add one: <code>/fixed {context.args[0]} MON 10am-12pm</code>",
+                parse_mode=constants.ParseMode.HTML,
+            )
+            return
+        by_day = {}
+        for sl in slots:
+            by_day.setdefault(sl["day_name"], []).append(sl["label"])
+        lines = [f"<b>{esc(nm)}</b> works these every week:", ""]
+        for d in DAY_NAMES:
+            if d in by_day:
+                lines.append(
+                    f"{d}: {', '.join(sorted(by_day[d], key=slot_start_minutes))}"
+                )
+        await update.message.reply_text(
+            "\n".join(lines), parse_mode=constants.ParseMode.HTML
+        )
+        return
+
+    if context.args[1].lower() == "clear":
+        async with write_lock:
+            run("DELETE FROM fixed_slots WHERE user_id=?", (row["user_id"],))
+        await update.message.reply_text(
+            f"Cleared the fixed roster for <b>{esc(nm)}</b>.",
+            parse_mode=constants.ParseMode.HTML,
+        )
+        return
+
+    if len(context.args) < 3:
+        await update.message.reply_text(
+            "Usage: <code>/fixed @handle MON 10am-12pm</code>",
+            parse_mode=constants.ParseMode.HTML,
+        )
+        return
+
+    day = context.args[1].strip().upper()
+    if day not in DAY_NAMES:
+        await update.message.reply_text(f"Use one of: {', '.join(DAY_NAMES)}")
+        return
+    label = " ".join(context.args[2:]).strip()
+    try:
+        slot_start_minutes(label)
+    except ValueError:
+        await update.message.reply_text("Give a slot like 10am-12pm.")
+        return
+
+    async with write_lock:
+        existing = q1(
+            "SELECT 1 FROM fixed_slots WHERE user_id=? AND day_name=? AND lower(label)=lower(?)",
+            (row["user_id"], day, label),
+        )
+        if existing:
+            run(
+                "DELETE FROM fixed_slots WHERE user_id=? AND day_name=? AND lower(label)=lower(?)",
+                (row["user_id"], day, label),
+            )
+            verb = "Removed"
+        else:
+            run(
+                "INSERT INTO fixed_slots (user_id, day_name, label) VALUES (?,?,?)",
+                (row["user_id"], day, label),
+            )
+            verb = "Added"
+
+    total = q1(
+        "SELECT COUNT(*) c FROM fixed_slots WHERE user_id=?", (row["user_id"],)
+    )["c"]
+    await update.message.reply_text(
+        f"{verb} <b>{day} {esc(label)}</b> for <b>{esc(nm)}</b>. "
+        f"They now have {total} fixed slot(s).\n\n"
+        "<i>Applies to the next week you post.</i>",
+        parse_mode=constants.ParseMode.HTML,
+    )
+
+
 async def cmd_avails(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Take someone off the weekly avails roster without removing their access.
 
@@ -3933,6 +4101,7 @@ ADMIN_COMMANDS = AGENT_COMMANDS + [
     ("roster", "Who's on the list"),
     ("removeagent", "Remove someone"),
     ("avails", "Who gets tagged for avails"),
+    ("fixed", "Slots someone always works"),
     ("export", "Download this week as CSV"),
     ("presets", "Saved timing patterns"),
     ("closeweek", "Close submissions early"),
@@ -4106,6 +4275,7 @@ def main() -> None:
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("removeagent", cmd_removeagent))
     app.add_handler(CommandHandler("avails", cmd_avails))
+    app.add_handler(CommandHandler("fixed", cmd_fixed))
     app.add_handler(CommandHandler("makeadmin", cmd_makeadmin))
     app.add_handler(CommandHandler("removeadmin", cmd_removeadmin))
     app.add_handler(CommandHandler("presets", cmd_presets))
