@@ -937,7 +937,7 @@ async def refresh_header(context: ContextTypes.DEFAULT_TYPE, week_id: int) -> No
 # /newweek conversation (runs in DM with an admin)
 # --------------------------------------------------------------------------
 
-ASK_DATE, ASK_LABEL, ASK_EVENTS, ASK_SLOTS, ASK_DEADLINE, CONFIRM = range(6)
+ASK_DATE, ASK_LABEL, ASK_EVENTS, ASK_SLOTS, ASK_DAYS, ASK_DEADLINE, CONFIRM = range(7)
 
 
 async def newweek(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1010,16 +1010,10 @@ async def got_events(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     draft = context.user_data["draft"]
     txt = update.message.text.strip()
     draft["events"] = None if txt == "-" else txt
-    names = [r["name"] for r in q("SELECT name FROM presets ORDER BY name")]
     await update.message.reply_text(
-        "<b>4/5 — Timings.</b>\n"
-        "Send <code>-</code> for your standard pattern, or a preset name.\n\n"
-        f"<b>Presets:</b> <code>{'</code>, <code>'.join(names)}</code>\n"
-        "<i>campaign</i> = every day 10am through 12am, for 11.11 / 12.12 weeks.\n\n"
-        "Or send custom lines, leaving out any day with no shifts:\n"
-        "<code>MON: 10am-12pm, 12pm-2pm, 2pm-4pm\n"
-        "SAT: 10am-12pm, 8pm-10pm, 10pm-12am</code>",
+        "<b>4/5 — What kind of week is it?</b>",
         parse_mode=constants.ParseMode.HTML,
+        reply_markup=week_shape_keyboard(),
     )
     return ASK_SLOTS
 
@@ -1040,48 +1034,203 @@ async def got_slots(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             return ASK_SLOTS
         draft["slots"] = json.loads(q1("SELECT config FROM presets WHERE name=?", (match,))["config"])
     else:
-        parsed: dict[str, list[str]] = {}
+        # A line starting with + adds to the standard pattern for that day.
+        # Anything else replaces that day outright.
+        additions: dict[str, list[str]] = {}
+        replacements: dict[str, list[str]] = {}
         for raw in txt.splitlines():
-            if not raw.strip():
+            line = raw.strip()
+            if not line:
                 continue
-            if ":" not in raw:
+            is_add = line.startswith("+")
+            line = line.lstrip("+").strip()
+            if ":" not in line:
                 await update.message.reply_text(
                     f"Couldn't read this line:\n<code>{raw}</code>\n"
-                    "It needs to look like <code>MON: 10am-12pm, 12pm-2pm</code>",
+                    "It needs to look like <code>MON: 10am-12pm, 12pm-2pm</code>\n"
+                    "or <code>+FRI: 10pm-12am</code> to add to the standard day.",
                     parse_mode=constants.ParseMode.HTML,
                 )
                 return ASK_SLOTS
-            day, rest = raw.split(":", 1)
+            day, rest = line.split(":", 1)
             day = day.strip().upper()
             if day not in DAY_NAMES:
                 await update.message.reply_text(
                     f"Unknown day {day!r}. Use: {', '.join(DAY_NAMES)}"
                 )
                 return ASK_SLOTS
-            labels = [s.strip() for s in rest.split(",") if s.strip()]
+            labels = [x.strip() for x in rest.split(",") if x.strip()]
             try:
                 for lbl in labels:
                     slot_start_minutes(lbl)
             except ValueError as e:
                 await update.message.reply_text(f"{e}\nTry again for that day.")
                 return ASK_SLOTS
-            parsed[day] = labels
-        if not parsed:
+            (additions if is_add else replacements)[day] = labels
+
+        if not additions and not replacements:
             await update.message.reply_text("No days found — try again.")
             return ASK_SLOTS
-        draft["slots"] = parsed
 
+        if additions:
+            cfg = {d: list(v) for d, v in DEFAULT_SLOTS.items()}
+            cfg.update(replacements)
+            for day, labels in additions.items():
+                base = cfg.get(day, [])
+                merged = base + [l for l in labels if l not in base]
+                cfg[day] = sorted(merged, key=slot_start_minutes)
+            draft["slots"] = cfg
+        else:
+            draft["slots"] = replacements
+
+    return await ask_deadline(update.message.reply_text, draft)
+
+
+async def ask_deadline(send, draft) -> int:
+    """Step 5, reached either by typing timings or tapping them."""
     default_deadline = datetime.combine(
         draft["monday"] - timedelta(days=1), time(23, 59), TZ
     )
     draft["default_deadline"] = default_deadline
-    await update.message.reply_text(
+    total = sum(len(v) for v in draft["slots"].values())
+    await send(
+        f"That's <b>{total} slots</b> across {len(draft['slots'])} days.\n\n"
         f"<b>5/5 — Submission deadline?</b>\nSend <code>-</code> for "
         f"<code>{default_deadline.strftime('%Y-%m-%d %H:%M')}</code> "
         f"({default_deadline.strftime('%a')}), or give your own in the same format.",
         parse_mode=constants.ParseMode.HTML,
     )
     return ASK_DEADLINE
+
+
+def week_shape_keyboard() -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("📋 Standard week", callback_data="ws:standard")],
+        [InlineKeyboardButton("🌙 Campaign — late shifts", callback_data="ws:campaign")],
+        [InlineKeyboardButton("🎌 Public holiday — ends 6pm", callback_data="ws:ph")],
+    ]
+    saved = [
+        r["name"] for r in q("SELECT name FROM presets ORDER BY name")
+        if r["name"] not in ("standard", "campaign")
+    ]
+    for nm in saved[:4]:
+        rows.append([InlineKeyboardButton(f"⭐ {nm}", callback_data=f"ws:preset:{nm}")])
+    rows.append([InlineKeyboardButton("✏️ Type it myself", callback_data="ws:custom")])
+    return InlineKeyboardMarkup(rows)
+
+
+def day_picker_keyboard(chosen: set, mode: str) -> InlineKeyboardMarkup:
+    rows, row = [], []
+    for d in DAY_NAMES:
+        mark = "✅" if d in chosen else "▫️"
+        row.append(InlineKeyboardButton(f"{mark} {d}", callback_data=f"wd:{d}"))
+        if len(row) == 4:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    rows.append([
+        InlineKeyboardButton("All days", callback_data="wd:ALL"),
+        InlineKeyboardButton("Clear", callback_data="wd:NONE"),
+    ])
+    label = "Add late shifts" if mode == "campaign" else "Set as holiday"
+    rows.append([InlineKeyboardButton(f"✓ {label} & continue", callback_data="wd:DONE")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def on_week_shape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    draft = context.user_data.get("draft")
+    if not draft:
+        await query.answer("That setup has expired — send /newweek again.", show_alert=True)
+        return ConversationHandler.END
+    choice = query.data.split(":", 1)[1]
+    await query.answer()
+
+    if choice == "standard":
+        draft["slots"] = {d: list(v) for d, v in DEFAULT_SLOTS.items()}
+        await query.edit_message_text("📋 Standard week.", parse_mode=None)
+        return await ask_deadline(query.message.reply_text, draft)
+
+    if choice.startswith("preset:"):
+        name = choice.split(":", 1)[1]
+        row = q1("SELECT config FROM presets WHERE name=?", (name,))
+        if not row:
+            await query.edit_message_text(f"Preset {name} no longer exists.")
+            return ASK_SLOTS
+        draft["slots"] = json.loads(row["config"])
+        await query.edit_message_text(f"⭐ Using preset: {name}", parse_mode=None)
+        return await ask_deadline(query.message.reply_text, draft)
+
+    if choice == "custom":
+        await query.edit_message_text(
+            "Type the days you want to change:\n\n"
+            "<code>+FRI: 8pm-10pm, 10pm-12am</code> adds to a standard day\n"
+            "<code>MON: 12pm-2pm</code> replaces that day outright",
+            parse_mode=constants.ParseMode.HTML,
+        )
+        return ASK_SLOTS
+
+    draft["shape_mode"] = choice
+    draft["chosen_days"] = set()
+    what = (
+        "Which days get the late shifts? (8pm-10pm and 10pm-12am)"
+        if choice == "campaign"
+        else "Which days are the holiday? (those days will end at 6pm)"
+    )
+    await query.edit_message_text(
+        f"<b>4/5 — {what}</b>", parse_mode=constants.ParseMode.HTML,
+        reply_markup=day_picker_keyboard(set(), choice),
+    )
+    return ASK_DAYS
+
+
+async def on_week_days(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    draft = context.user_data.get("draft")
+    if not draft:
+        await query.answer("That setup has expired — send /newweek again.", show_alert=True)
+        return ConversationHandler.END
+    pick = query.data.split(":", 1)[1]
+    mode = draft.get("shape_mode", "campaign")
+    chosen = draft.setdefault("chosen_days", set())
+
+    if pick == "ALL":
+        chosen = set(DAY_NAMES)
+    elif pick == "NONE":
+        chosen = set()
+    elif pick == "DONE":
+        if not chosen:
+            await query.answer("Pick at least one day.", show_alert=True)
+            return ASK_DAYS
+        cfg = {d: list(v) for d, v in DEFAULT_SLOTS.items()}
+        for d in chosen:
+            if mode == "campaign":
+                for extra in ("8pm-10pm", "10pm-12am"):
+                    if extra not in cfg[d]:
+                        cfg[d].append(extra)
+                cfg[d] = sorted(cfg[d], key=slot_start_minutes)
+            else:
+                cfg[d] = [l for l in cfg[d] if slot_start_minutes(l) < 18 * 60]
+        draft["slots"] = cfg
+        await query.answer()
+        word = "late shifts on" if mode == "campaign" else "holiday hours on"
+        await query.edit_message_text(
+            f"✓ {word} {', '.join(d for d in DAY_NAMES if d in chosen)}",
+            parse_mode=None,
+        )
+        return await ask_deadline(query.message.reply_text, draft)
+    else:
+        chosen = chosen ^ {pick}
+
+    draft["chosen_days"] = chosen
+    await query.answer()
+    try:
+        await query.edit_message_reply_markup(
+            reply_markup=day_picker_keyboard(chosen, mode)
+        )
+    except BadRequest:
+        pass
+    return ASK_DAYS
 
 
 async def got_deadline(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -3827,7 +3976,11 @@ def main() -> None:
                 ASK_DATE: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_date)],
                 ASK_LABEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_label)],
                 ASK_EVENTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_events)],
-                ASK_SLOTS: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_slots)],
+                ASK_SLOTS: [
+                    CallbackQueryHandler(on_week_shape, pattern=r"^ws:"),
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, got_slots),
+                ],
+                ASK_DAYS: [CallbackQueryHandler(on_week_days, pattern=r"^wd:")],
                 ASK_DEADLINE: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_deadline)],
                 CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, confirm)],
             },
