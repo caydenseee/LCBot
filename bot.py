@@ -2456,25 +2456,21 @@ async def cmd_mytime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         a = datetime.fromisoformat(r["clock_in"]).strftime("%H:%M")
         b = datetime.fromisoformat(r["clock_out"]).strftime("%H:%M")
         flag = " ⚠️" if r["status"] == "auto" else ""
+        pay = f"  {money(sh['cents'])}" if sh["cents"] else ""
         lines.append(
             f"{sh['date'].strftime('%a %-d %b')}  {a}–{b}  "
-            f"<b>{hhmm(sh['minutes'])}</b>{flag}  <code>#{r['id']}</code>"
+            f"<b>{hhmm(sh['minutes'])}</b>{pay}{flag}  <code>#{r['id']}</code>"
         )
     if t["shifts"]:
         lines += [
             "",
-            f"<b>{t['days']} day(s) · {hhmm(t['minutes'])}</b>",
+            f"<b>{len(t['shifts'])} shift(s) · {hhmm(t['minutes'])}</b>",
         ]
         if t["cents"]:
-            lines.append(f"<b>Estimated: {money(t['cents'])}</b>")
-            if PAY_MODE == "slot":
-                lines.append(
-                    "<i>Paid by rostered shift, so a full block counts even if "
-                    "you clocked in a minute late.</i>"
-                )
+            lines.append(f"<b>{money(t['cents'])}</b> at {money(rate_for(user.id, now().date()))}/hour")
             lines.append(
-                "<i>An estimate to help you plan. Your actual pay comes from HR "
-                "and may differ.</i>"
+                "<i>Each shift counts as its full rostered block. This is before "
+                "CPF and any adjustments — HR handles the final figure.</i>"
             )
     if t["open"]:
         lines.append("\n⏱ You have a shift still clocked in.")
@@ -3435,7 +3431,7 @@ MINIAPP_HTML = """<!DOCTYPE html>
   .row:last-child { border-bottom: 0; }
   .d { font-weight: 550; }
   .t { font-size: 12px; color: var(--tg-theme-hint-color, #777); margin-top: 1px; }
-  .h { font-variant-numeric: tabular-nums; }
+  .h { font-variant-numeric: tabular-nums; text-align: right; }
   .flag { font-size: 11px; color: #c60; }
   .empty { text-align: center; padding: 40px 20px; color: var(--tg-theme-hint-color, #777); }
   .note { margin-top: 22px; font-size: 12px; color: var(--tg-theme-hint-color, #777);
@@ -3472,11 +3468,11 @@ async function load() {
 
     let h = `<h1>${esc(d.name)}</h1><div class="sub">${esc(d.month)}</div>`;
     h += '<div class="cards">';
-    h += `<div class="card"><div class="n">${esc(d.hours)}</div><div class="l">Hours worked</div></div>`;
-    h += `<div class="card"><div class="n">${d.days}</div><div class="l">Days worked</div></div>`;
+    h += `<div class="card"><div class="n">${d.count}</div><div class="l">Shifts</div></div>`;
+    h += `<div class="card"><div class="n">${esc(d.hours)}</div><div class="l">Hours</div></div>`;
     if (d.showPay) {
-      h += `<div class="card pay wide"><div class="n">${esc(d.estimate)}</div>`;
-      h += `<div class="l">Estimated · ${esc(d.rate)}/hour</div></div>`;
+      h += `<div class="card pay wide"><div class="n">${esc(d.total)}</div>`;
+      h += `<div class="l">at ${esc(d.rate)}/hour · before deductions</div></div>`;
     }
     h += '</div>';
 
@@ -3486,7 +3482,9 @@ async function load() {
         h += '<div class="row"><div>';
         h += `<div class="d">${esc(s.date)}</div>`;
         h += `<div class="t">${esc(s.times)}${s.flagged ? ' <span class="flag">· auto-closed</span>' : ''}</div>`;
-        h += `</div><div class="h">${esc(s.hours)}</div></div>`;
+        h += `</div><div class="h"><div>${esc(s.hours)}</div>`;
+        h += s.pay ? `<div class="t">${esc(s.pay)}</div>` : '';
+        h += `</div></div>`;
       }
     } else {
       h += '<div class="empty">No shifts logged this month yet.<br>Use /clockin when you start.</div>';
@@ -3495,7 +3493,7 @@ async function load() {
       h += '<div class="note">⏱ You are clocked in right now — this shift is not counted yet.</div>';
     }
     if (d.showPay) {
-      h += '<div class="note">This is an estimate to help you plan. Your actual pay comes from HR and may differ.</div>';
+      h += '<div class="note">Each shift counts as its full rostered block. This is your pay before CPF and any adjustments — HR handles the final figure.</div>';
     }
     app.innerHTML = h;
   } catch (e) {
@@ -3562,6 +3560,7 @@ def miniapp_payload(user_id: int) -> dict:
                 "date": day.strftime("%a %-d %b"),
                 "times": f"{a.strftime('%H:%M')}\u2013{b.strftime('%H:%M')}",
                 "hours": hhmm(mins),
+                "pay": money(round(mins / 60 * rate_on(day))) if mins else "",
                 "flagged": r["status"] == "auto",
             })
         rate = rate_on(today)
@@ -3574,9 +3573,10 @@ def miniapp_payload(user_id: int) -> dict:
         "month": first.strftime("%B %Y"),
         "hours": hhmm(total_min),
         "days": len(seen_days),
+        "count": len(shifts),
         "showPay": bool(rate),
         "rate": money(rate),
-        "estimate": money(total_cents),
+        "total": money(total_cents),
         "openShift": bool(open_count),
         "shifts": shifts,
     }
