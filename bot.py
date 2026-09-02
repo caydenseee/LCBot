@@ -102,6 +102,11 @@ AUTO_CLOSE_GRACE_MIN = env_int("AUTO_CLOSE_GRACE_MIN", 120)
 # Automatic database backup, DM'd to owners. 0-6 = Mon-Sun.
 BACKUP_DAY = env_int("BACKUP_DAY", 0)
 BACKUP_TIME = os.environ.get("BACKUP_TIME", "").strip() or "09:00"
+# "slot"   = pay the full rostered block, however long they were actually on
+# "actual" = pay the exact clocked time
+PAY_MODE = (os.environ.get("PAY_MODE", "").strip().lower() or "slot")
+# Allowed early finish, in minutes, before a slot stops counting as worked.
+SLOT_GRACE_MIN = env_int("SLOT_GRACE_MIN", 15)
 # Forum topics. Leave blank for a normal group. Get the number by sending
 # /chatid inside the topic you want.
 GROUP_THREAD_ID = env_int("GROUP_THREAD_ID") or None
@@ -417,6 +422,72 @@ def money(cents: int) -> str:
     return f"${cents // 100}.{cents % 100:02d}"
 
 
+def slot_minutes(label: str) -> int:
+    """How long a slot lasts, e.g. '10am-12pm' -> 120. Handles crossing midnight."""
+    parts = label.split("-")
+    if len(parts) != 2:
+        return 0
+    try:
+        a, b = parse_time_token(parts[0]), parse_time_token(parts[1])
+    except ValueError:
+        return 0
+    if b <= a:
+        b += 24 * 60
+    return b - a
+
+
+def slot_run_from(slot_id: int):
+    """A slot plus any back-to-back slots the same agent holds after it.
+
+    Someone rostered 10-12 and 12-2 clocks in once, so the entry has to cover
+    both blocks rather than stopping at the end of the first.
+    """
+    first = q1(
+        """SELECT s.id, s.label, s.start_min, s.day_id, d.the_date
+           FROM slots s JOIN days d ON d.id = s.day_id WHERE s.id=?""",
+        (slot_id,),
+    )
+    if not first:
+        return []
+    holder = q1("SELECT user_id FROM signups WHERE slot_id=?", (slot_id,))
+    if not holder:
+        return [first]
+    same_day = q(
+        """SELECT s.id, s.label, s.start_min FROM slots s
+           JOIN signups su ON su.slot_id = s.id
+           WHERE s.day_id=? AND su.user_id=? ORDER BY s.start_min""",
+        (first["day_id"], holder["user_id"]),
+    )
+    run_ = [first]
+    cursor = first["start_min"] + slot_minutes(first["label"])
+    for cand in same_day:
+        if cand["id"] == first["id"]:
+            continue
+        if cand["start_min"] == cursor:
+            run_.append(cand)
+            cursor += slot_minutes(cand["label"])
+    return run_
+
+
+def entry_paid_minutes(row) -> int:
+    """Minutes an entry is paid for."""
+    if not row["clock_out"]:
+        return 0
+    actual = entry_minutes(row)
+    if PAY_MODE != "slot" or not row["slot_id"]:
+        return actual
+    out = datetime.fromisoformat(row["clock_out"])
+    day = date.fromisoformat(row["the_date"])
+    total = 0
+    for sl in slot_run_from(row["slot_id"]):
+        start = sl["start_min"]
+        end_min = start + slot_minutes(sl["label"])
+        slot_end = datetime.combine(day, time(0, 0), TZ) + timedelta(minutes=end_min)
+        if out >= slot_end - timedelta(minutes=SLOT_GRACE_MIN):
+            total += slot_minutes(sl["label"])
+    return total or actual
+
+
 def entry_minutes(row) -> int:
     if not row["clock_out"]:
         return 0
@@ -442,12 +513,16 @@ def timesheet(agent_id: int, first: date, last: date) -> dict:
         if not r["clock_out"]:
             open_count += 1
             continue
-        m = entry_minutes(r)
+        m = entry_paid_minutes(r)
+        actual = entry_minutes(r)
         day = date.fromisoformat(r["the_date"])
         pay = round(m / 60 * rate_for(agent_id, day))
         minutes += m
         cents += pay
-        shifts.append({"row": r, "date": day, "minutes": m, "cents": pay})
+        shifts.append({
+            "row": r, "date": day, "minutes": m,
+            "actual": actual, "cents": pay,
+        })
     return {
         "shifts": shifts,
         "minutes": minutes,
@@ -1956,14 +2031,17 @@ async def cmd_clockout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             (when.isoformat(), open_row["id"]),
         )
     fresh = q1("SELECT * FROM time_entries WHERE id=?", (open_row["id"],))
-    mins = entry_minutes(fresh)
+    mins = entry_paid_minutes(fresh)
+    actual = entry_minutes(fresh)
     day = date.fromisoformat(fresh["the_date"])
     pay = round(mins / 60 * rate_for(user.id, day))
 
-    msg = [
-        f"✅ Clocked out at <b>{when.strftime('%H:%M')}</b>",
-        f"Worked: <b>{hhmm(mins)}</b>",
-    ]
+    msg = [f"✅ Clocked out at <b>{when.strftime('%H:%M')}</b>"]
+    if PAY_MODE == "slot" and fresh["slot_id"] and mins != actual:
+        msg.append(f"On duty: {hhmm(actual)}")
+        msg.append(f"Credited: <b>{hhmm(mins)}</b> (full shift)")
+    else:
+        msg.append(f"Worked: <b>{hhmm(mins)}</b>")
     if pay:
         msg.append(f"Approx: {money(pay)}")
     msg.append("\n/mytime — your hours this month")
@@ -1991,7 +2069,7 @@ async def cmd_mytime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         flag = " ⚠️" if r["status"] == "auto" else ""
         lines.append(
             f"{sh['date'].strftime('%a %-d %b')}  {a}–{b}  "
-            f"{hhmm(sh['minutes'])}{flag}  <code>#{r['id']}</code>"
+            f"<b>{hhmm(sh['minutes'])}</b>{flag}  <code>#{r['id']}</code>"
         )
     if t["shifts"]:
         lines += [
@@ -2000,6 +2078,11 @@ async def cmd_mytime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         ]
         if t["cents"]:
             lines.append(f"<b>Estimated: {money(t['cents'])}</b>")
+            if PAY_MODE == "slot":
+                lines.append(
+                    "<i>Paid by rostered shift, so a full block counts even if "
+                    "you clocked in a minute late.</i>"
+                )
             lines.append(
                 "<i>An estimate to help you plan. Your actual pay comes from HR "
                 "and may differ.</i>"
@@ -2421,7 +2504,8 @@ async def cmd_payroll(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     wr = csv.writer(buf)
     wr.writerow([
         "entry", "agent", "telegram_id", "date", "day", "slot",
-        "clock_in", "clock_out", "hours", "rate", "pay", "status",
+        "clock_in", "clock_out", "actual_hours", "paid_hours",
+        "rate", "pay", "status",
     ])
     rows_written = 0
     for a in q("SELECT * FROM agents ORDER BY name"):
@@ -2442,6 +2526,7 @@ async def cmd_payroll(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 slot["label"] if slot else "unrostered",
                 datetime.fromisoformat(r["clock_in"]).strftime("%H:%M"),
                 datetime.fromisoformat(r["clock_out"]).strftime("%H:%M"),
+                f"{sh['actual'] / 60:.2f}",
                 f"{sh['minutes'] / 60:.2f}",
                 f"{rate_for(a['user_id'], sh['date']) / 100:.2f}",
                 f"{sh['cents'] / 100:.2f}",
@@ -3022,7 +3107,8 @@ def miniapp_payload(user_id: int) -> dict:
                 continue
             a = datetime.fromisoformat(r["clock_in"])
             b = datetime.fromisoformat(r["clock_out"])
-            mins = max(0, int((b - a).total_seconds() // 60))
+            actual = max(0, int((b - a).total_seconds() // 60))
+            mins = entry_paid_minutes(r)
             day = date.fromisoformat(r["the_date"])
             total_min += mins
             total_cents += round(mins / 60 * rate_on(day)) if mins else 0
@@ -3232,39 +3318,43 @@ def mention(user_id: int, name: str) -> str:
 
 
 async def job_auto_close(context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Close forgotten clock-ins at the shift's end time, flagged for review."""
+    """Close forgotten clock-ins, but only once the agent's whole run of
+    back-to-back shifts has finished."""
     cutoff = now() - timedelta(minutes=AUTO_CLOSE_GRACE_MIN)
-    rows = q("SELECT * FROM time_entries WHERE clock_out IS NULL")
-    for r in rows:
+    for r in q("SELECT * FROM time_entries WHERE clock_out IS NULL"):
         started = datetime.fromisoformat(r["clock_in"])
         if started > cutoff:
             continue
+
         end = None
         if r["slot_id"]:
-            sl = q1("SELECT label FROM slots WHERE id=?", (r["slot_id"],))
-            if sl and "-" in sl["label"]:
-                try:
-                    mins = parse_time_token(sl["label"].split("-")[1])
-                    end = started.replace(
-                        hour=mins // 60, minute=mins % 60, second=0, microsecond=0
-                    )
-                    if end <= started:
-                        end += timedelta(days=1)
-                except ValueError:
-                    end = None
-        if end is None or end > now():
+            run_ = slot_run_from(r["slot_id"])
+            if run_:
+                last = run_[-1]
+                finish_min = last["start_min"] + slot_minutes(last["label"])
+                day = date.fromisoformat(r["the_date"])
+                end = datetime.combine(day, time(0, 0), TZ) + timedelta(minutes=finish_min)
+
+        # Still mid-run — leave them clocked in.
+        if end and end > now() - timedelta(minutes=AUTO_CLOSE_GRACE_MIN):
+            continue
+        if end is None or end <= started:
             end = started + timedelta(hours=2)
+
         async with write_lock:
             run(
                 "UPDATE time_entries SET clock_out=?, status='auto', "
                 "note='auto-closed, agent did not clock out' WHERE id=?",
                 (end.isoformat(), r["id"]),
             )
+        fresh = q1("SELECT * FROM time_entries WHERE id=?", (r["id"],))
+        paid = entry_paid_minutes(fresh)
         try:
             await context.bot.send_message(
                 r["agent_id"],
                 f"⚠️ You didn't clock out, so I've closed your shift at "
-                f"{end.strftime('%H:%M')} based on your roster.\n\n"
+                f"{end.strftime('%H:%M')} based on your roster "
+                f"({hhmm(paid)} credited).\n\n"
                 "If that's wrong, tell your manager and they can correct it.",
             )
         except Exception:
