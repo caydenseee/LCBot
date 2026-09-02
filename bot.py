@@ -110,6 +110,11 @@ SLOT_GRACE_MIN = env_int("SLOT_GRACE_MIN", 15)
 # Forum topics. Leave blank for a normal group. Get the number by sending
 # /chatid inside the topic you want.
 GROUP_THREAD_ID = env_int("GROUP_THREAD_ID") or None
+# The operations group that gets [OPENING] posts on clock-in, e.g. "TC Online".
+# Separate from the avails group. Leave blank and the bot just hands the agent
+# the text to copy instead.
+OPS_CHAT_ID = env_int("OPS_CHAT_ID")
+OPS_THREAD_ID = env_int("OPS_THREAD_ID") or None
 # Mini App. PUBLIC_URL comes from Railway once you generate a domain.
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "").strip().rstrip("/")
 WEB_PORT = env_int("PORT", 8080)
@@ -336,6 +341,21 @@ def verify_init_data(raw: str) -> dict | None:
         return json.loads(data.get("user", "{}"))
     except json.JSONDecodeError:
         return None
+
+
+async def post_ops(bot, text: str) -> bool:
+    """Post to the operations group. Returns False if it couldn't."""
+    if not OPS_CHAT_ID:
+        return False
+    kw = {}
+    if OPS_THREAD_ID:
+        kw["message_thread_id"] = OPS_THREAD_ID
+    try:
+        await bot.send_message(OPS_CHAT_ID, text, **kw)
+        return True
+    except Exception as e:
+        log.warning("Couldn't post to the ops group: %s", e)
+        return False
 
 
 async def send_group(bot, text: str, thread: int | None = -1, **kw):
@@ -2024,17 +2044,25 @@ async def cmd_clockin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     nice_name = display_name_of(user.id, user.full_name)
     slot_text = slot["label"] if slot else "—"
-    await update.message.reply_text(
-        opening_block(user.id, nice_name, slot_text),
-        parse_mode=None,
-    )
+    block = opening_block(user.id, nice_name, slot_text)
+
+    posted = await post_ops(context.bot, block)
+    if not posted:
+        # No ops group configured, so give them the text to paste themselves.
+        await update.message.reply_text(block, parse_mode=None)
+
     if slot:
-        await update.message.reply_text(
+        note = (
             f"⏱ Clocked in at <b>{when.strftime('%H:%M')}</b>\n"
-            f"Shift: {slot['day_name']} {slot['label']}\n\n"
-            "Send /clockout when you finish.",
-            parse_mode=constants.ParseMode.HTML,
+            f"Shift: {slot['day_name']} {slot['label']}\n"
+            f"Support: {esc(support_for(user.id, nice_name))}\n\n"
         )
+        note += (
+            "Your [OPENING] has been posted ✅\n"
+            if posted else "Tap the message above to copy it.\n"
+        )
+        note += "Send /clockout when you finish."
+        await update.message.reply_text(note, parse_mode=constants.ParseMode.HTML)
     else:
         await update.message.reply_text(
             f"⏱ Clocked in at <b>{when.strftime('%H:%M')}</b>\n\n"
