@@ -2034,7 +2034,20 @@ async def cmd_clockin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    slot = current_slot_for(user.id, when)
+    override = " ".join(context.args).strip() if context.args else ""
+    if override:
+        # Covering a shift, or clocking in for a block they aren't rostered on.
+        slot = q1(
+            """SELECT s.id, s.label, s.start_min, d.name AS day_name
+               FROM slots s JOIN days d ON d.id = s.day_id
+               WHERE d.the_date=? AND lower(s.label)=lower(?)""",
+            (when.date().isoformat(), override),
+        )
+        slot_text = slot["label"] if slot else override
+    else:
+        slot = current_slot_for(user.id, when)
+        slot_text = slot["label"] if slot else "—"
+
     async with write_lock:
         run(
             "INSERT INTO time_entries (agent_id, slot_id, the_date, clock_in, status) "
@@ -2044,7 +2057,6 @@ async def cmd_clockin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
 
     nice_name = display_name_of(user.id, user.full_name)
-    slot_text = slot["label"] if slot else "—"
     block = opening_block(user.id, nice_name, slot_text)
 
     posted = await post_ops(context.bot, block)
@@ -2064,11 +2076,26 @@ async def cmd_clockin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         note += "Send /clockout when you finish."
         await update.message.reply_text(note, parse_mode=constants.ParseMode.HTML)
+    elif override:
+        note = (
+            f"⏱ Clocked in at <b>{when.strftime('%H:%M')}</b>\n"
+            f"Shift: {esc(override)}\n"
+            f"Support: {esc(support_for(user.id, nice_name))}\n\n"
+            "⚠️ That block isn't on today's roster, so it's logged as unrostered "
+            "and your manager will see it flagged.\n\n"
+        )
+        note += (
+            "Your [OPENING] has been posted ✅\n"
+            if posted else "Tap the message above to copy it.\n"
+        )
+        note += "Send /clockout when you finish."
+        await update.message.reply_text(note, parse_mode=constants.ParseMode.HTML)
     else:
         await update.message.reply_text(
             f"⏱ Clocked in at <b>{when.strftime('%H:%M')}</b>\n\n"
-            "⚠️ You're not rostered for a shift around now, so I've logged this "
-            "as unrostered. Your manager will see it flagged.\n\n"
+            "⚠️ I couldn't find a shift for you around now, so this is logged as "
+            "unrostered. If you're covering a specific block, clock out and use "
+            "<code>/clockin 6pm-8pm</code>.\n\n"
             "Send /clockout when you finish.",
             parse_mode=constants.ParseMode.HTML,
         )
@@ -2117,54 +2144,6 @@ async def cmd_clockout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.message.reply_text(
         "\n".join(msg), parse_mode=constants.ParseMode.HTML
     )
-
-
-async def cmd_opening(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """The [OPENING] block, ready to copy into the ops chat."""
-    if update.effective_chat.type != constants.ChatType.PRIVATE:
-        return
-    if not await gate(update):
-        return
-    user = update.effective_user
-    name = display_name_of(user.id, user.full_name)
-
-    # An explicit slot wins, for cover shifts or anything off-roster.
-    if context.args:
-        slot_label = " ".join(context.args).strip()
-        await update.message.reply_text(
-            opening_block(user.id, name, slot_label), parse_mode=None
-        )
-        await update.message.reply_text(
-            "Tap the message above to copy it.",
-        )
-        return
-
-    entry = q1(
-        "SELECT * FROM time_entries WHERE agent_id=? AND clock_out IS NULL "
-        "ORDER BY id DESC LIMIT 1",
-        (user.id,),
-    )
-    slot_label = "—"
-    if entry and entry["slot_id"]:
-        row = q1("SELECT label FROM slots WHERE id=?", (entry["slot_id"],))
-        if row:
-            slot_label = row["label"]
-    elif not entry:
-        nxt = current_slot_for(user.id, now())
-        if nxt:
-            slot_label = nxt["label"]
-
-    await update.message.reply_text(
-        opening_block(user.id, name, slot_label), parse_mode=None
-    )
-    hint = "Tap the message above to copy it.\n"
-    if slot_label == "—":
-        hint += (
-            "I couldn't find a shift for you around now — set the time yourself "
-            "with <code>/opening 6pm-8pm</code>\n"
-        )
-    hint += "Change who's listed as support with <code>/support Name</code>"
-    await update.message.reply_text(hint, parse_mode=constants.ParseMode.HTML)
 
 
 async def cmd_support(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -3707,7 +3686,6 @@ AGENT_COMMANDS = [
     ("clockin", "Start my shift"),
     ("clockout", "End my shift"),
     ("mytime", "My hours this month"),
-    ("opening", "Get my [OPENING] message"),
     ("support", "Who I list as support"),
     ("payslip", "My hours and estimated pay"),
     ("myshifts", "What I'm signed up for"),
@@ -3884,7 +3862,6 @@ def main() -> None:
     app.add_handler(CommandHandler("clockin", cmd_clockin))
     app.add_handler(CommandHandler("clockout", cmd_clockout))
     app.add_handler(CommandHandler("mytime", cmd_mytime))
-    app.add_handler(CommandHandler("opening", cmd_opening))
     app.add_handler(CommandHandler("support", cmd_support))
     app.add_handler(CommandHandler("payslip", cmd_payslip))
     app.add_handler(CommandHandler("setrate", cmd_setrate))
