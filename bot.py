@@ -937,7 +937,7 @@ async def refresh_header(context: ContextTypes.DEFAULT_TYPE, week_id: int) -> No
 # /newweek conversation (runs in DM with an admin)
 # --------------------------------------------------------------------------
 
-ASK_DATE, ASK_LABEL, ASK_EVENTS, ASK_SLOTS, ASK_DAYS, ASK_DEADLINE, CONFIRM = range(7)
+ASK_DATE, ASK_LABEL, ASK_EVENTS, ASK_SLOTS, ASK_SHAPE_LABEL, ASK_DAYS, ASK_DEADLINE, CONFIRM = range(8)
 
 
 async def newweek(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1120,7 +1120,7 @@ def week_shape_keyboard(has_slots: bool = False) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("📋 Standard week", callback_data="ws:standard")],
         [InlineKeyboardButton("🌙 Campaign — late shifts", callback_data="ws:campaign")],
-        [InlineKeyboardButton("🎌 Public holiday — ends 6pm", callback_data="ws:ph")],
+        [InlineKeyboardButton("🎌 Public holiday", callback_data="ws:ph")],
     ]
     saved = [
         r["name"] for r in q("SELECT name FROM presets ORDER BY name")
@@ -1147,7 +1147,7 @@ def day_picker_keyboard(chosen: set, mode: str) -> InlineKeyboardMarkup:
         InlineKeyboardButton("All days", callback_data="wd:ALL"),
         InlineKeyboardButton("Clear", callback_data="wd:NONE"),
     ])
-    label = "Add late shifts" if mode == "campaign" else "Set as holiday"
+    label = "Add late shifts" if mode == "campaign" else "Mark holiday"
     rows.append([InlineKeyboardButton(f"✓ {label} & continue", callback_data="wd:DONE")])
     return InlineKeyboardMarkup(rows)
 
@@ -1194,16 +1194,50 @@ async def on_week_shape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         )
         return ASK_SLOTS
 
+    if choice == "ph":
+        await query.edit_message_text(
+            "<b>Which country's holiday?</b>\n\n"
+            "Singapore shortens the day. Elsewhere it's business as usual — "
+            "we just note it on the board.",
+            parse_mode=constants.ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🇸🇬 Singapore — ends 6pm", callback_data="ws:ph_sg")],
+                [InlineKeyboardButton("🌏 MY / TH / HK — normal hours",
+                                      callback_data="ws:ph_other")],
+            ]),
+        )
+        return ASK_SLOTS
+
     draft["shape_mode"] = choice
     draft["chosen_days"] = set()
-    what = (
-        "Which days get the late shifts? (8pm-10pm and 10pm-12am)"
-        if choice == "campaign"
-        else "Which days are the holiday? (those days will end at 6pm)"
-    )
+    prompt = {
+        "campaign": "What's this campaign called?\n<i>e.g. 9.9, 11.11, Black Friday</i>",
+        "ph_sg": "Which holiday is it?\n<i>e.g. National Day, Deepavali</i>",
+        "ph_other": "Which holiday is it?\n<i>e.g. Hari Raya (MY), Songkran (TH)</i>",
+    }[choice]
     await query.edit_message_text(
+        f"<b>4/5 — {prompt}</b>", parse_mode=constants.ParseMode.HTML
+    )
+    return ASK_SHAPE_LABEL
+
+
+async def got_shape_label(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    draft = context.user_data["draft"]
+    label = " ".join(update.message.text.split()).strip()
+    if len(label) < 2 or len(label) > 40:
+        await update.message.reply_text("Give it a short name, 2 to 40 characters.")
+        return ASK_SHAPE_LABEL
+    draft["shape_label"] = label
+    mode = draft.get("shape_mode", "campaign")
+    what = {
+        "campaign": f"Which days does <b>{esc(label)}</b> run late? "
+                    "(adds 8pm-10pm and 10pm-12am)",
+        "ph_sg": f"Which days is <b>{esc(label)}</b>? (those days will end at 6pm)",
+        "ph_other": f"Which days is <b>{esc(label)}</b>? (hours stay normal)",
+    }[mode]
+    await update.message.reply_text(
         f"<b>4/5 — {what}</b>", parse_mode=constants.ParseMode.HTML,
-        reply_markup=day_picker_keyboard(set(), choice),
+        reply_markup=day_picker_keyboard(set(), mode),
     )
     return ASK_DAYS
 
@@ -1236,15 +1270,31 @@ async def on_week_days(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
                     if extra not in base:
                         base.append(extra)
                 cfg[d] = sorted(base, key=slot_start_minutes)
-            else:
+            elif mode == "ph_sg":
                 cfg[d] = [l for l in base if slot_start_minutes(l) < 18 * 60]
+            else:
+                cfg[d] = base          # business as usual elsewhere
         draft["slots"] = cfg
         draft["chosen_days"] = set()
-        await query.answer()
-        word = "Late shifts added to" if mode == "campaign" else "Holiday hours on"
+
+        name = draft.get("shape_label", "")
         days = ", ".join(d for d in DAY_NAMES if d in chosen)
+        note = {
+            "campaign": f"🌙 {name} — late shifts: {days}",
+            "ph_sg": f"🎌 {name} (SG) — shifts end 6pm: {days}",
+            "ph_other": f"🎌 {name} — normal hours: {days}",
+        }[mode]
+        existing = draft.get("events") or ""
+        draft["events"] = (existing + "\n" + note).strip() if existing else note
+
+        await query.answer()
+        headline = {
+            "campaign": f"✓ {name}: late shifts on {days}",
+            "ph_sg": f"✓ {name}: {days} now end at 6pm",
+            "ph_other": f"✓ {name} noted on {days} — hours unchanged",
+        }[mode]
         await query.edit_message_text(
-            f"✓ {word} {days}\n\n{shape_summary(cfg)}\n\n"
+            f"{esc(headline)}\n\n{shape_summary(cfg)}\n\n"
             "Anything else to change?",
             parse_mode=constants.ParseMode.HTML,
             reply_markup=week_shape_keyboard(has_slots=True),
@@ -4010,6 +4060,9 @@ def main() -> None:
                 ASK_SLOTS: [
                     CallbackQueryHandler(on_week_shape, pattern=r"^ws:"),
                     MessageHandler(filters.TEXT & ~filters.COMMAND, got_slots),
+                ],
+                ASK_SHAPE_LABEL: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, got_shape_label)
                 ],
                 ASK_DAYS: [CallbackQueryHandler(on_week_days, pattern=r"^wd:")],
                 ASK_DEADLINE: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_deadline)],
