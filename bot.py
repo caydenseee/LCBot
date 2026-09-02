@@ -2468,10 +2468,6 @@ async def cmd_mytime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         ]
         if t["cents"]:
             lines.append(f"<b>{money(t['cents'])}</b> at {money(rate_for(user.id, now().date()))}/hour")
-            lines.append(
-                "<i>Each shift counts as its full rostered block. This is before "
-                "CPF and any adjustments — HR handles the final figure.</i>"
-            )
     if t["open"]:
         lines.append("\n⏱ You have a shift still clocked in.")
     await update.message.reply_text(
@@ -3472,7 +3468,7 @@ async function load() {
     h += `<div class="card"><div class="n">${esc(d.hours)}</div><div class="l">Hours</div></div>`;
     if (d.showPay) {
       h += `<div class="card pay wide"><div class="n">${esc(d.total)}</div>`;
-      h += `<div class="l">at ${esc(d.rate)}/hour · before deductions</div></div>`;
+      h += `<div class="l">at ${esc(d.rate)}/hour</div></div>`;
     }
     h += '</div>';
 
@@ -3493,7 +3489,6 @@ async function load() {
       h += '<div class="note">⏱ You are clocked in right now — this shift is not counted yet.</div>';
     }
     if (d.showPay) {
-      h += '<div class="note">Each shift counts as its full rostered block. This is your pay before CPF and any adjustments — HR handles the final figure.</div>';
     }
     app.innerHTML = h;
   } catch (e) {
@@ -3680,7 +3675,7 @@ async def cmd_payslip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )]]
     )
     await update.message.reply_text(
-        "Your hours and estimated pay for this month:", reply_markup=kb
+        "Your hours and pay for this month:", reply_markup=kb
     )
 
 
@@ -3917,7 +3912,7 @@ AGENT_COMMANDS = [
     ("clockout", "End my shift"),
     ("mytime", "My hours this month"),
     ("support", "Who I list as support"),
-    ("payslip", "My hours and estimated pay"),
+    ("payslip", "My hours and pay"),
     ("myshifts", "What I'm signed up for"),
     ("summary", "Show the current board"),
     ("help", "List commands"),
