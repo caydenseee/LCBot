@@ -1103,7 +1103,20 @@ async def ask_deadline(send, draft) -> int:
     return ASK_DEADLINE
 
 
-def week_shape_keyboard() -> InlineKeyboardMarkup:
+def shape_summary(cfg: dict) -> str:
+    lines = []
+    for d in DAY_NAMES:
+        if d not in cfg or not cfg[d]:
+            lines.append(f"{d}: —")
+            continue
+        last = max(cfg[d], key=slot_start_minutes)
+        end = last.split("-")[1] if "-" in last else ""
+        lines.append(f"{d}: {len(cfg[d])} slots, ends {end}")
+    total = sum(len(v) for v in cfg.values())
+    return "\n".join(lines) + f"\n\n<b>{total} slots total</b>"
+
+
+def week_shape_keyboard(has_slots: bool = False) -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("📋 Standard week", callback_data="ws:standard")],
         [InlineKeyboardButton("🌙 Campaign — late shifts", callback_data="ws:campaign")],
@@ -1116,6 +1129,8 @@ def week_shape_keyboard() -> InlineKeyboardMarkup:
     for nm in saved[:4]:
         rows.append([InlineKeyboardButton(f"⭐ {nm}", callback_data=f"ws:preset:{nm}")])
     rows.append([InlineKeyboardButton("✏️ Type it myself", callback_data="ws:custom")])
+    if has_slots:
+        rows.append([InlineKeyboardButton("✓ Done — set deadline", callback_data="ws:done")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1145,6 +1160,15 @@ async def on_week_shape(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         return ConversationHandler.END
     choice = query.data.split(":", 1)[1]
     await query.answer()
+
+    if choice == "done":
+        if not draft.get("slots"):
+            draft["slots"] = {d: list(v) for d, v in DEFAULT_SLOTS.items()}
+        await query.edit_message_text(
+            "<b>Week set up:</b>\n\n" + shape_summary(draft["slots"]),
+            parse_mode=constants.ParseMode.HTML,
+        )
+        return await ask_deadline(query.message.reply_text, draft)
 
     if choice == "standard":
         draft["slots"] = {d: list(v) for d, v in DEFAULT_SLOTS.items()}
@@ -1202,23 +1226,30 @@ async def on_week_days(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         if not chosen:
             await query.answer("Pick at least one day.", show_alert=True)
             return ASK_DAYS
-        cfg = {d: list(v) for d, v in DEFAULT_SLOTS.items()}
+        # Build on whatever's already been set, so changes can stack.
+        cfg = draft.get("slots") or {d: list(v) for d, v in DEFAULT_SLOTS.items()}
+        cfg = {d: list(v) for d, v in cfg.items()}
         for d in chosen:
+            base = cfg.get(d, list(DEFAULT_SLOTS.get(d, [])))
             if mode == "campaign":
                 for extra in ("8pm-10pm", "10pm-12am"):
-                    if extra not in cfg[d]:
-                        cfg[d].append(extra)
-                cfg[d] = sorted(cfg[d], key=slot_start_minutes)
+                    if extra not in base:
+                        base.append(extra)
+                cfg[d] = sorted(base, key=slot_start_minutes)
             else:
-                cfg[d] = [l for l in cfg[d] if slot_start_minutes(l) < 18 * 60]
+                cfg[d] = [l for l in base if slot_start_minutes(l) < 18 * 60]
         draft["slots"] = cfg
+        draft["chosen_days"] = set()
         await query.answer()
-        word = "late shifts on" if mode == "campaign" else "holiday hours on"
+        word = "Late shifts added to" if mode == "campaign" else "Holiday hours on"
+        days = ", ".join(d for d in DAY_NAMES if d in chosen)
         await query.edit_message_text(
-            f"✓ {word} {', '.join(d for d in DAY_NAMES if d in chosen)}",
-            parse_mode=None,
+            f"✓ {word} {days}\n\n{shape_summary(cfg)}\n\n"
+            "Anything else to change?",
+            parse_mode=constants.ParseMode.HTML,
+            reply_markup=week_shape_keyboard(has_slots=True),
         )
-        return await ask_deadline(query.message.reply_text, draft)
+        return ASK_SLOTS
     else:
         chosen = chosen ^ {pick}
 
