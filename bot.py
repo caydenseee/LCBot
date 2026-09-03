@@ -2920,6 +2920,30 @@ async def cmd_whohas(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
+async def cmd_applyfixed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Fill fixed rosters into the week that's already posted."""
+    if not is_admin(update.effective_user.id):
+        return
+    w = open_week()
+    if not w:
+        await update.message.reply_text("No week is open.")
+        return
+    async with write_lock:
+        filled = apply_fixed_slots(w["id"])
+    if filled:
+        await update.message.reply_text(
+            f"Filled <b>{filled}</b> slot(s) into {w['label']} from fixed rosters.",
+            parse_mode=constants.ParseMode.HTML,
+        )
+        await refresh_group(context, w["id"])
+    else:
+        await update.message.reply_text(
+            "Nothing to fill. Either they're already on the board, "
+            "someone else holds those slots, or the slot doesn't exist "
+            "this week.\n\nCheck with /fixed and /whohas.",
+        )
+
+
 async def cmd_capacity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/capacity 10am-12pm 2 — how many agents a slot takes this week."""
     if not is_admin(update.effective_user.id):
@@ -3126,7 +3150,8 @@ async def cmd_fixed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         f"{verb} <b>{day} {esc(label)}</b> for <b>{esc(nm)}</b>. "
         f"They now have {total} fixed slot(s).\n\n"
-        "<i>Applies to the next week you post.</i>",
+        "<i>Applies automatically to the next week you post. "
+        "For the week already up, send /applyfixed.</i>",
         parse_mode=constants.ParseMode.HTML,
     )
 
@@ -4347,6 +4372,7 @@ ADMIN_COMMANDS = AGENT_COMMANDS + [
     ("removeagent", "Remove someone"),
     ("avails", "Who gets tagged for avails"),
     ("fixed", "Slots someone always works"),
+    ("applyfixed", "Apply fixed rosters to this week"),
     ("capacity", "Agents needed per slot"),
     ("dropslot", "Free one slot from someone"),
     ("whohas", "Who is on a slot"),
@@ -4527,6 +4553,7 @@ def main() -> None:
     app.add_handler(CommandHandler("capacity", cmd_capacity))
     app.add_handler(CommandHandler("dropslot", cmd_dropslot))
     app.add_handler(CommandHandler("whohas", cmd_whohas))
+    app.add_handler(CommandHandler("applyfixed", cmd_applyfixed))
     app.add_handler(CommandHandler("makeadmin", cmd_makeadmin))
     app.add_handler(CommandHandler("removeadmin", cmd_removeadmin))
     app.add_handler(CommandHandler("presets", cmd_presets))
