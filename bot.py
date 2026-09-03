@@ -190,7 +190,8 @@ CREATE TABLE IF NOT EXISTS slots (
     day_id     INTEGER NOT NULL REFERENCES days(id) ON DELETE CASCADE,
     idx        INTEGER NOT NULL,
     label      TEXT NOT NULL,
-    start_min  INTEGER NOT NULL
+    start_min  INTEGER NOT NULL,
+    capacity   INTEGER
 );
 CREATE TABLE IF NOT EXISTS signups (
     slot_id  INTEGER NOT NULL REFERENCES slots(id) ON DELETE CASCADE,
@@ -265,6 +266,9 @@ CREATE TABLE IF NOT EXISTS confirmations (
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
 db.row_factory = sqlite3.Row
 db.executescript(SCHEMA)
+_slot_cols = {r[1] for r in db.execute("PRAGMA table_info(slots)")}
+if "capacity" not in _slot_cols:
+    db.execute("ALTER TABLE slots ADD COLUMN capacity INTEGER")
 _cols = {r[1] for r in db.execute("PRAGMA table_info(agents)")}
 if "role" not in _cols:
     db.execute(
@@ -685,14 +689,19 @@ def render_day(day_id: int) -> tuple[str, InlineKeyboardMarkup]:
                 "SELECT name FROM signups WHERE slot_id=? ORDER BY ts", (s["id"],)
             )
         ]
+        cap = s["capacity"] or SLOT_CAPACITY
         filled = ", ".join(names)
+        if cap > 1 and names:
+            filled += f"  ({len(names)}/{cap})"
+        elif cap > 1:
+            filled = f"(0/{cap})"
         lines.append(f"{s['label']}: {esc(filled)}")
-        if len(names) >= SLOT_CAPACITY:
+        if len(names) >= cap:
             tag = " ✓"
         elif names:
-            tag = f" ({len(names)})"
+            tag = f" ({len(names)}/{cap})" if cap > 1 else f" ({len(names)})"
         else:
-            tag = ""
+            tag = f" (0/{cap})" if cap > 1 else ""
         buttons.append(
             InlineKeyboardButton(
                 short_label(s["label"]) + tag, callback_data=f"t:{s['id']}"
@@ -740,7 +749,7 @@ def week_stats(week_id: int) -> dict:
         r["user_id"] for r in q("SELECT user_id FROM confirmations WHERE week_id=?", (week_id,))
     }
     gaps = q(
-        """SELECT d.name, d.the_date, s.label,
+        """SELECT d.name, d.the_date, s.label, s.capacity,
                   (SELECT COUNT(*) FROM signups WHERE slot_id = s.id) AS n
            FROM slots s JOIN days d ON d.id = s.day_id
            WHERE d.week_id = ?
@@ -751,7 +760,10 @@ def week_stats(week_id: int) -> dict:
         "roster": roster,
         "confirmed": confirmed,
         "missing": [a for a in roster if a["user_id"] not in confirmed],
-        "gaps": [g for g in gaps if g["n"] < MIN_PER_SLOT],
+        "gaps": [
+            g for g in gaps
+            if g["n"] < (g["capacity"] or MIN_PER_SLOT)
+        ],
         "total_slots": len(gaps),
     }
 
@@ -762,12 +774,20 @@ def slot_holders(slot_id: int) -> list[sqlite3.Row]:
     )
 
 
+def slot_capacity(slot_id: int) -> int:
+    """How many agents this particular slot takes."""
+    row = q1("SELECT capacity FROM slots WHERE id=?", (slot_id,))
+    if row and row["capacity"]:
+        return row["capacity"]
+    return SLOT_CAPACITY
+
+
 def slot_taken_by(slot_id: int, user_id: int) -> str | None:
-    """Returns the blocking holder's name, or None if the user may claim it."""
+    """Returns the blocking holders' names, or None if the user may claim it."""
     holders = slot_holders(slot_id)
     if any(h["user_id"] == user_id for h in holders):
         return None
-    if len(holders) < SLOT_CAPACITY:
+    if len(holders) < slot_capacity(slot_id):
         return None
     return ", ".join(h["name"] for h in holders)
 
@@ -814,19 +834,22 @@ def render_board(week_id: int, compact: bool = False) -> tuple[str, InlineKeyboa
                     "SELECT name FROM signups WHERE slot_id=? ORDER BY ts", (s["id"],)
                 )
             ]
+            cap = s["capacity"] or SLOT_CAPACITY
             if not names:
-                shown = ""
+                shown = "" if cap == 1 else f"(0/{cap})"
             elif compact and len(names) > 3:
                 shown = ", ".join(names[:3]) + f" +{len(names) - 3}"
             else:
                 shown = ", ".join(names)
+                if cap > 1:
+                    shown += f"  ({len(names)}/{cap})"
             lines.append(f"{s['label']}: {esc(shown)}")
-            if len(names) >= SLOT_CAPACITY:
+            if len(names) >= cap:
                 tag = " ✓"
             elif names:
-                tag = f" ({len(names)})"
+                tag = f" ({len(names)}/{cap})" if cap > 1 else f" ({len(names)})"
             else:
-                tag = ""
+                tag = f" (0/{cap})" if cap > 1 else ""
             slot_buttons.append(
                 InlineKeyboardButton(
                     short_label(s["label"]) + tag, callback_data=f"t:{s['id']}"
@@ -1640,7 +1663,8 @@ def render_plan(user_id: int, week_id: int) -> tuple[str, InlineKeyboardMarkup]:
         picked = [s["label"] for s in slots if s["id"] in mine]
         free = sum(
             1 for s in slots
-            if s["id"] not in mine and len(slot_holders(s["id"])) < SLOT_CAPACITY
+            if s["id"] not in mine
+            and len(slot_holders(s["id"])) < (s["capacity"] or SLOT_CAPACITY)
         )
         lines.append(
             f"<b>{d['name']}</b>: {', '.join(picked) if picked else '—'}"
@@ -1680,11 +1704,17 @@ def render_plan_day(user_id: int, day_id: int) -> tuple[str, InlineKeyboardMarku
     rows = []
     for s in q("SELECT * FROM slots WHERE day_id=? ORDER BY idx", (day_id,)):
         holders = slot_holders(s["id"])
+        cap = s["capacity"] or SLOT_CAPACITY
         if s["id"] in mine:
-            state, mark, btn = "claimed by you", "✅", "✅ {} — yours"
-        elif len(holders) >= SLOT_CAPACITY:
+            others = [h for h in holders if h["user_id"] != user_id]
+            extra = f", with {esc(others[0]['name'])}" if others else ""
+            state, mark, btn = f"claimed by you{extra}", "✅", "✅ {} — yours"
+        elif len(holders) >= cap:
             state = "taken by " + esc(", ".join(h["name"] for h in holders))
             mark, btn = "🔒", "🔒 {} — taken"
+        elif holders:
+            state = f"{len(holders)}/{cap} — " + esc(holders[0]["name"]) + ", room for you"
+            mark, btn = "▫️", "▫️ {} — space left"
         else:
             state, mark, btn = "available", "▫️", "▫️ {} — available"
         lines.append(f"{mark} {s['label']} — {state}")
@@ -2755,6 +2785,88 @@ async def cmd_makeadmin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def cmd_removeadmin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await _set_role(update, context, "agent")
+
+
+async def cmd_capacity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/capacity 10am-12pm 2 — how many agents a slot takes this week."""
+    if not is_admin(update.effective_user.id):
+        return
+    w = open_week()
+    if not w:
+        await update.message.reply_text("No week is open.")
+        return
+
+    if not context.args:
+        rows = q(
+            """SELECT d.name AS day, s.label, s.capacity,
+                      (SELECT COUNT(*) FROM signups WHERE slot_id=s.id) AS n
+               FROM slots s JOIN days d ON d.id = s.day_id
+               WHERE d.week_id=? AND s.capacity IS NOT NULL AND s.capacity <> ?
+               ORDER BY d.idx, s.idx""",
+            (w["id"], SLOT_CAPACITY),
+        )
+        lines = [f"<b>Slots taking more than {SLOT_CAPACITY} — {w['label']}</b>", ""]
+        if not rows:
+            lines.append(f"None. Every slot takes {SLOT_CAPACITY}.")
+        for r in rows:
+            lines.append(f"{r['day']} {r['label']} — {r['n']}/{r['capacity']}")
+        lines += [
+            "",
+            "<code>/capacity 10am-12pm 2</code> — every 10am-12pm this week",
+            "<code>/capacity MON 10am-12pm 2</code> — just that day",
+            "<code>/capacity 10am-12pm 1</code> — back to one",
+        ]
+        await update.message.reply_text(
+            "\n".join(lines), parse_mode=constants.ParseMode.HTML
+        )
+        return
+
+    args = list(context.args)
+    day = None
+    if args[0].strip().upper() in DAY_NAMES:
+        day = args.pop(0).strip().upper()
+    if len(args) < 2 or not args[-1].isdigit():
+        await update.message.reply_text(
+            "Usage: <code>/capacity 10am-12pm 2</code>",
+            parse_mode=constants.ParseMode.HTML,
+        )
+        return
+    n = int(args.pop())
+    if not 1 <= n <= 10:
+        await update.message.reply_text("Pick a number between 1 and 10.")
+        return
+    label = " ".join(args).strip()
+
+    if day:
+        target = q(
+            """SELECT s.id FROM slots s JOIN days d ON d.id = s.day_id
+               WHERE d.week_id=? AND d.name=? AND lower(s.label)=lower(?)""",
+            (w["id"], day, label),
+        )
+    else:
+        target = q(
+            """SELECT s.id FROM slots s JOIN days d ON d.id = s.day_id
+               WHERE d.week_id=? AND lower(s.label)=lower(?)""",
+            (w["id"], label),
+        )
+    if not target:
+        await update.message.reply_text(
+            f"No {label!r} slots{' on ' + day if day else ''} this week. "
+            "Check the exact wording on the board."
+        )
+        return
+
+    async with write_lock:
+        for t in target:
+            run("UPDATE slots SET capacity=? WHERE id=?", (n, t["id"]))
+
+    where = f"on {day}" if day else "every day that has it"
+    await update.message.reply_text(
+        f"<b>{esc(label)}</b> now takes <b>{n}</b> agent(s), {where}.\n"
+        f"{len(target)} slot(s) updated.",
+        parse_mode=constants.ParseMode.HTML,
+    )
+    await refresh_group(context, w["id"])
 
 
 async def cmd_fixed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4102,6 +4214,7 @@ ADMIN_COMMANDS = AGENT_COMMANDS + [
     ("removeagent", "Remove someone"),
     ("avails", "Who gets tagged for avails"),
     ("fixed", "Slots someone always works"),
+    ("capacity", "Agents needed per slot"),
     ("export", "Download this week as CSV"),
     ("presets", "Saved timing patterns"),
     ("closeweek", "Close submissions early"),
@@ -4276,6 +4389,7 @@ def main() -> None:
     app.add_handler(CommandHandler("removeagent", cmd_removeagent))
     app.add_handler(CommandHandler("avails", cmd_avails))
     app.add_handler(CommandHandler("fixed", cmd_fixed))
+    app.add_handler(CommandHandler("capacity", cmd_capacity))
     app.add_handler(CommandHandler("makeadmin", cmd_makeadmin))
     app.add_handler(CommandHandler("removeadmin", cmd_removeadmin))
     app.add_handler(CommandHandler("presets", cmd_presets))
