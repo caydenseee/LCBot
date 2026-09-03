@@ -2675,6 +2675,76 @@ async def cmd_mytime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
+async def cmd_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Who approved or declined whom, and when."""
+    if not is_admin(update.effective_user.id):
+        return
+
+    if context.args:
+        row = find_agent(context.args[0])
+        if not row:
+            await update.message.reply_text("No one matches that. Check /roster.")
+            return
+        nm = row["display_name"] or row["name"]
+        lines = [f"<b>{esc(nm)}</b>", ""]
+        lines.append(f"Status: <b>{row['status']}</b>")
+        if row["requested_at"]:
+            lines.append(
+                "Requested: "
+                + datetime.fromisoformat(row["requested_at"]).strftime("%-d %b, %H:%M")
+            )
+        if row["decided_by"]:
+            who = display_name_of(row["decided_by"], str(row["decided_by"]))
+            when = (
+                datetime.fromisoformat(row["decided_at"]).strftime("%-d %b, %H:%M")
+                if row["decided_at"] else "unknown time"
+            )
+            verb = "Approved" if row["status"] == "active" else "Declined"
+            lines.append(f"{verb} by <b>{esc(who)}</b> on {when}")
+        else:
+            lines.append("<i>No decision recorded — joined before approvals existed.</i>")
+        await update.message.reply_text(
+            "\n".join(lines), parse_mode=constants.ParseMode.HTML
+        )
+        return
+
+    rows = q(
+        """SELECT * FROM agents WHERE decided_at IS NOT NULL
+           ORDER BY decided_at DESC LIMIT 25"""
+    )
+    pending = q1("SELECT COUNT(*) c FROM agents WHERE status='pending'")["c"]
+    lines = ["<b>Access decisions</b>", ""]
+    if not rows:
+        lines.append("Nothing recorded yet.")
+    for r in rows:
+        mark = "✅" if r["status"] == "active" else "🚫"
+        who = (
+            display_name_of(r["decided_by"], str(r["decided_by"]))
+            if r["decided_by"] else "?"
+        )
+        when = (
+            datetime.fromisoformat(r["decided_at"]).strftime("%-d %b %H:%M")
+            if r["decided_at"] else ""
+        )
+        lines.append(
+            f"{mark} {esc(r['display_name'] or r['name'])} — "
+            f"by {esc(who)}, {when}"
+        )
+    declined = q("SELECT * FROM agents WHERE status='declined'")
+    if declined:
+        lines += [
+            "",
+            f"<i>{len(declined)} declined. To let one in, they send /start again "
+            "after you clear them with /removeagent.</i>",
+        ]
+    if pending:
+        lines += ["", f"⏳ {pending} waiting now — see /pending"]
+    lines.append("\n<code>/access @handle</code> for one person's history.")
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode=constants.ParseMode.HTML
+    )
+
+
 async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(update.effective_user.id):
         return
@@ -4693,6 +4763,7 @@ def main() -> None:
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("chatid", cmd_chatid))
     app.add_handler(CommandHandler("pending", cmd_pending))
+    app.add_handler(CommandHandler("access", cmd_access))
     app.add_handler(CommandHandler("rename", cmd_rename))
     app.add_handler(CommandHandler("shiftcall", cmd_shiftcall))
     app.add_handler(CommandHandler("myshifts", cmd_myshifts))
