@@ -2787,6 +2787,139 @@ async def cmd_removeadmin(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await _set_role(update, context, "agent")
 
 
+async def cmd_dropslot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/dropslot @handle MON 10am-12pm — free one slot without touching anything else."""
+    if not is_admin(update.effective_user.id):
+        return
+    w = open_week()
+    if not w:
+        await update.message.reply_text("No week is open.")
+        return
+
+    if len(context.args) < 3:
+        await update.message.reply_text(
+            "Usage: <code>/dropslot @handle MON 10am-12pm</code>\n\n"
+            "Frees that one slot so someone else can take it. "
+            "Everything else they've claimed stays.\n"
+            "See what they have with <code>/whohas MON 10am-12pm</code>.",
+            parse_mode=constants.ParseMode.HTML,
+        )
+        return
+
+    row = find_agent(context.args[0])
+    if not row:
+        await update.message.reply_text("No one matches that. Check /roster.")
+        return
+    day = context.args[1].strip().upper()
+    if day not in DAY_NAMES:
+        await update.message.reply_text(f"Use one of: {', '.join(DAY_NAMES)}")
+        return
+    label = " ".join(context.args[2:]).strip()
+
+    slot = q1(
+        """SELECT s.id, s.label, d.id AS day_id FROM slots s
+           JOIN days d ON d.id = s.day_id
+           WHERE d.week_id=? AND d.name=? AND lower(s.label)=lower(?)""",
+        (w["id"], day, label),
+    )
+    if not slot:
+        await update.message.reply_text(
+            f"No {label!r} slot on {day} this week. Check the wording on the board."
+        )
+        return
+
+    nm = row["display_name"] or row["name"]
+    held = q1(
+        "SELECT 1 FROM signups WHERE slot_id=? AND user_id=?",
+        (slot["id"], row["user_id"]),
+    )
+    if not held:
+        holders = slot_holders(slot["id"])
+        who = ", ".join(h["name"] for h in holders) if holders else "nobody"
+        await update.message.reply_text(
+            f"<b>{esc(nm)}</b> doesn't hold {day} {esc(slot['label'])}.\n"
+            f"Currently: {esc(who)}.",
+            parse_mode=constants.ParseMode.HTML,
+        )
+        return
+
+    async with write_lock:
+        run(
+            "DELETE FROM signups WHERE slot_id=? AND user_id=?",
+            (slot["id"], row["user_id"]),
+        )
+
+    left = q1(
+        """SELECT COUNT(*) c FROM signups su JOIN slots s ON s.id=su.slot_id
+           JOIN days d ON d.id=s.day_id WHERE d.week_id=? AND su.user_id=?""",
+        (w["id"], row["user_id"]),
+    )["c"]
+
+    await update.message.reply_text(
+        f"Freed <b>{day} {esc(slot['label'])}</b> from <b>{esc(nm)}</b>.\n"
+        f"They still have {left} slot(s) this week.",
+        parse_mode=constants.ParseMode.HTML,
+    )
+    try:
+        await context.bot.send_message(
+            row["user_id"],
+            f"Your manager has taken you off {day} {slot['label']} this week.\n\n"
+            "Check /myshifts for what you still have.",
+        )
+    except Exception:
+        pass
+
+    await refresh_group(context, w["id"], slot["day_id"])
+
+
+async def cmd_whohas(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/whohas MON 10am-12pm — who is on that slot."""
+    if not is_admin(update.effective_user.id):
+        return
+    w = open_week() or latest_week()
+    if not w:
+        await update.message.reply_text("No week posted yet.")
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Usage: <code>/whohas MON 10am-12pm</code>",
+            parse_mode=constants.ParseMode.HTML,
+        )
+        return
+    day = context.args[0].strip().upper()
+    if day not in DAY_NAMES:
+        await update.message.reply_text(f"Use one of: {', '.join(DAY_NAMES)}")
+        return
+    label = " ".join(context.args[1:]).strip()
+    slot = q1(
+        """SELECT s.id, s.label, s.capacity FROM slots s JOIN days d ON d.id = s.day_id
+           WHERE d.week_id=? AND d.name=? AND lower(s.label)=lower(?)""",
+        (w["id"], day, label),
+    )
+    if not slot:
+        await update.message.reply_text(f"No {label!r} slot on {day}.")
+        return
+    holders = slot_holders(slot["id"])
+    cap = slot["capacity"] or SLOT_CAPACITY
+    if not holders:
+        await update.message.reply_text(
+            f"<b>{day} {esc(slot['label'])}</b> — nobody yet (0/{cap})",
+            parse_mode=constants.ParseMode.HTML,
+        )
+        return
+    lines = [f"<b>{day} {esc(slot['label'])}</b> — {len(holders)}/{cap}", ""]
+    for h in holders:
+        a = q1("SELECT username FROM agents WHERE user_id=?", (h["user_id"],))
+        handle = f" @{a['username']}" if a and a["username"] else ""
+        lines.append(f"{esc(h['name'])}{handle}")
+    lines.append(
+        f"\n<code>/dropslot @handle {day} {slot['label']}</code> to free one"
+    )
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode=constants.ParseMode.HTML
+    )
+
+
 async def cmd_capacity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/capacity 10am-12pm 2 — how many agents a slot takes this week."""
     if not is_admin(update.effective_user.id):
@@ -4215,6 +4348,8 @@ ADMIN_COMMANDS = AGENT_COMMANDS + [
     ("avails", "Who gets tagged for avails"),
     ("fixed", "Slots someone always works"),
     ("capacity", "Agents needed per slot"),
+    ("dropslot", "Free one slot from someone"),
+    ("whohas", "Who is on a slot"),
     ("export", "Download this week as CSV"),
     ("presets", "Saved timing patterns"),
     ("closeweek", "Close submissions early"),
@@ -4390,6 +4525,8 @@ def main() -> None:
     app.add_handler(CommandHandler("avails", cmd_avails))
     app.add_handler(CommandHandler("fixed", cmd_fixed))
     app.add_handler(CommandHandler("capacity", cmd_capacity))
+    app.add_handler(CommandHandler("dropslot", cmd_dropslot))
+    app.add_handler(CommandHandler("whohas", cmd_whohas))
     app.add_handler(CommandHandler("makeadmin", cmd_makeadmin))
     app.add_handler(CommandHandler("removeadmin", cmd_removeadmin))
     app.add_handler(CommandHandler("presets", cmd_presets))
