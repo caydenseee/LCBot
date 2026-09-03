@@ -60,6 +60,20 @@ from telegram.ext import (
 BOT_TOKEN = os.environ["BOT_TOKEN"].strip()
 
 
+DAY_ALIASES = {
+    "THURS": "THU", "THURSDAY": "THU", "THUR": "THU",
+    "MONDAY": "MON", "TUESDAY": "TUE", "TUES": "TUE", "WEDNESDAY": "WED",
+    "WEDS": "WED", "FRIDAY": "FRI", "SATURDAY": "SAT", "SUNDAY": "SUN",
+}
+
+
+def norm_day(text: str) -> str | None:
+    """Accept THU, THURS, Thursday — all mean the same day."""
+    d = text.strip().upper()
+    d = DAY_ALIASES.get(d, d)
+    return d if d in DAY_NAMES else None
+
+
 def env_int(name: str, default: int = 0) -> int:
     """Treat a blank variable the same as an unset one — hosting panels set blanks."""
     raw = os.environ.get(name, "").strip()
@@ -118,8 +132,18 @@ OPS_THREAD_ID = env_int("OPS_THREAD_ID") or None
 # Mini App. PUBLIC_URL comes from Railway once you generate a domain.
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "").strip().rstrip("/")
 WEB_PORT = env_int("PORT", 8080)
-# Optional second topic for the daily on-duty tags. Falls back to the board topic.
-SHIFTCALL_THREAD_ID = env_int("SHIFTCALL_THREAD_ID") or GROUP_THREAD_ID
+# Where the daily on-duty tags go. Defaults to the avails group; set it to the
+# TC Online id to send them there instead. "ops" is shorthand for OPS_CHAT_ID.
+_sc_raw = os.environ.get("SHIFTCALL_CHAT_ID", "").strip().lower()
+if _sc_raw == "ops":
+    SHIFTCALL_CHAT_ID = OPS_CHAT_ID or GROUP_CHAT_ID
+else:
+    SHIFTCALL_CHAT_ID = env_int("SHIFTCALL_CHAT_ID") or GROUP_CHAT_ID
+# Topic within that chat. Only inherits the board's topic if it's the same chat.
+SHIFTCALL_THREAD_ID = env_int("SHIFTCALL_THREAD_ID") or (
+    OPS_THREAD_ID if SHIFTCALL_CHAT_ID == OPS_CHAT_ID and OPS_CHAT_ID
+    else (GROUP_THREAD_ID if SHIFTCALL_CHAT_ID == GROUP_CHAT_ID else None)
+)
 
 # "single" = one pinned message holding the whole week (neater).
 # "daily"  = one message per day (buttons sit closer to their day).
@@ -130,8 +154,8 @@ GROUP_BUTTONS = (os.environ.get("GROUP_BUTTONS", "").strip().lower() or "on") !=
 # Short how-to posted under a new board. Set to "off" once the team knows the drill.
 POST_INTRO = (os.environ.get("POST_INTRO", "").strip().lower() or "on") != "off"
 
-DAY_NAMES = ["MON", "TUE", "WED", "THURS", "FRI", "SAT", "SUN"]
-DAY_ABBR = {"MON": "M", "TUE": "T", "WED": "W", "THURS": "Th",
+DAY_NAMES = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"]
+DAY_ABBR = {"MON": "M", "TUE": "T", "WED": "W", "THU": "Th",
             "FRI": "F", "SAT": "Sa", "SUN": "Su"}
 
 # Your standard pattern: 5 blocks weekdays, 4 on the weekend.
@@ -139,7 +163,7 @@ DEFAULT_SLOTS = {
     "MON": ["10am-12pm", "12pm-2pm", "2pm-4pm", "4pm-6pm", "6pm-8pm"],
     "TUE": ["10am-12pm", "12pm-2pm", "2pm-4pm", "4pm-6pm", "6pm-8pm"],
     "WED": ["10am-12pm", "12pm-2pm", "2pm-4pm", "4pm-6pm", "6pm-8pm"],
-    "THURS": ["10am-12pm", "12pm-2pm", "2pm-4pm", "4pm-6pm", "6pm-8pm"],
+    "THU": ["10am-12pm", "12pm-2pm", "2pm-4pm", "4pm-6pm", "6pm-8pm"],
     "FRI": ["10am-12pm", "12pm-2pm", "2pm-4pm", "4pm-6pm", "6pm-8pm"],
     "SAT": ["10am-12pm", "12pm-2pm", "2pm-4pm", "4pm-6pm"],
     "SUN": ["10am-12pm", "12pm-2pm", "2pm-4pm", "4pm-6pm"],
@@ -266,6 +290,23 @@ CREATE TABLE IF NOT EXISTS confirmations (
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
 db.row_factory = sqlite3.Row
 db.executescript(SCHEMA)
+# Days used to be stored as THURS. Bring old rows in line with the new THU.
+for _tbl, _col in (("days", "name"), ("fixed_slots", "day_name")):
+    try:
+        db.execute(f"UPDATE {_tbl} SET {_col}='THU' WHERE {_col}='THURS'")
+    except sqlite3.OperationalError:
+        pass
+try:
+    for _p in db.execute("SELECT name, config FROM presets").fetchall():
+        if "THURS" in _p[1]:
+            db.execute(
+                "UPDATE presets SET config=? WHERE name=?",
+                (_p[1].replace('"THURS"', '"THU"'), _p[0]),
+            )
+except sqlite3.OperationalError:
+    pass
+db.commit()
+
 _slot_cols = {r[1] for r in db.execute("PRAGMA table_info(slots)")}
 if "capacity" not in _slot_cols:
     db.execute("ALTER TABLE slots ADD COLUMN capacity INTEGER")
@@ -369,12 +410,13 @@ async def post_ops(bot, text: str) -> bool:
         return False
 
 
-async def send_group(bot, text: str, thread: int | None = -1, **kw):
-    """Post to the group, into the right forum topic if one is configured."""
+async def send_group(bot, text: str, thread: int | None = -1,
+                     chat_id: int | None = None, **kw):
+    """Post to a group, into the right forum topic if one is configured."""
     tid = GROUP_THREAD_ID if thread == -1 else thread
     if tid:
         kw["message_thread_id"] = tid
-    return await bot.send_message(GROUP_CHAT_ID, text, **kw)
+    return await bot.send_message(chat_id or GROUP_CHAT_ID, text, **kw)
 
 
 def now() -> datetime:
@@ -1109,11 +1151,11 @@ async def got_slots(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                     parse_mode=constants.ParseMode.HTML,
                 )
                 return ASK_SLOTS
-            day, rest = line.split(":", 1)
-            day = day.strip().upper()
-            if day not in DAY_NAMES:
+            day_raw, rest = line.split(":", 1)
+            day = norm_day(day_raw)
+            if not day:
                 await update.message.reply_text(
-                    f"Unknown day {day!r}. Use: {', '.join(DAY_NAMES)}"
+                    f"Unknown day {day_raw.strip()!r}. Use: {', '.join(DAY_NAMES)}"
                 )
                 return ASK_SLOTS
             labels = [x.strip() for x in rest.split(",") if x.strip()]
@@ -1970,6 +2012,8 @@ async def cmd_shiftcall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Setup helper — reports the IDs you need for the env file."""
+    if not is_admin(update.effective_user.id):
+        return
     chat = update.effective_chat
     user = update.effective_user
     lines = [
@@ -2003,6 +2047,8 @@ async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def cmd_presets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat.type != constants.ChatType.PRIVATE:
+        return
+    if not is_admin(update.effective_user.id):
         return
     rows = q("SELECT * FROM presets ORDER BY name")
     lines = ["<b>Saved timing presets</b>"]
@@ -2676,6 +2722,8 @@ async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 async def cmd_gaps(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat.type != constants.ChatType.PRIVATE:
         return
+    if not is_admin(update.effective_user.id):
+        return
     w = latest_week()
     if not w:
         await update.message.reply_text("No week has been posted yet.")
@@ -2715,6 +2763,8 @@ async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_roster(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat.type != constants.ChatType.PRIVATE:
+        return
+    if not is_admin(update.effective_user.id):
         return
     rows = q("SELECT * FROM agents WHERE status='active' ORDER BY name")
     waiting = q1("SELECT COUNT(*) c FROM agents WHERE status='pending'")["c"]
@@ -2810,8 +2860,8 @@ async def cmd_dropslot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not row:
         await update.message.reply_text("No one matches that. Check /roster.")
         return
-    day = context.args[1].strip().upper()
-    if day not in DAY_NAMES:
+    day = norm_day(context.args[1])
+    if not day:
         await update.message.reply_text(f"Use one of: {', '.join(DAY_NAMES)}")
         return
     label = " ".join(context.args[2:]).strip()
@@ -2886,8 +2936,8 @@ async def cmd_whohas(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             parse_mode=constants.ParseMode.HTML,
         )
         return
-    day = context.args[0].strip().upper()
-    if day not in DAY_NAMES:
+    day = norm_day(context.args[0])
+    if not day:
         await update.message.reply_text(f"Use one of: {', '.join(DAY_NAMES)}")
         return
     label = " ".join(context.args[1:]).strip()
@@ -2980,8 +3030,8 @@ async def cmd_capacity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     args = list(context.args)
     day = None
-    if args[0].strip().upper() in DAY_NAMES:
-        day = args.pop(0).strip().upper()
+    if norm_day(args[0]):
+        day = norm_day(args.pop(0))
     if len(args) < 2 or not args[-1].isdigit():
         await update.message.reply_text(
             "Usage: <code>/capacity 10am-12pm 2</code>",
@@ -3115,8 +3165,8 @@ async def cmd_fixed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
 
-    day = context.args[1].strip().upper()
-    if day not in DAY_NAMES:
+    day = norm_day(context.args[1])
+    if not day:
         await update.message.reply_text(f"Use one of: {', '.join(DAY_NAMES)}")
         return
     label = " ".join(context.args[2:]).strip()
@@ -4249,6 +4299,7 @@ async def job_shift_call(context: ContextTypes.DEFAULT_TYPE) -> None:
     try:
         await send_group(
             context.bot, text, thread=SHIFTCALL_THREAD_ID,
+            chat_id=SHIFTCALL_CHAT_ID,
             parse_mode=constants.ParseMode.HTML,
         )
     except Exception as e:
@@ -4258,8 +4309,8 @@ async def job_shift_call(context: ContextTypes.DEFAULT_TYPE) -> None:
 def build_shift_call(for_date: date | None = None) -> tuple[str | None, str]:
     """Returns (message, reason). Message is None when there's nothing to send."""
     target = for_date or (now() + timedelta(days=1)).date()
-    if not GROUP_CHAT_ID:
-        return None, "GROUP_CHAT_ID isn't set."
+    if not SHIFTCALL_CHAT_ID:
+        return None, "No chat is set for the shift call."
     day = q1("SELECT * FROM days WHERE the_date=?", (target.isoformat(),))
     if not day:
         return None, f"No posted week covers {target.isoformat()}."
@@ -4460,7 +4511,10 @@ async def post_init(app: Application) -> None:
         time(mins // 60, mins % 60, tzinfo=TZ),
         name="shift-call",
     )
-    log.info("Group shift call scheduled for %s daily", SHIFT_CALL_TIME)
+    log.info(
+        "Group shift call scheduled for %s daily, to chat %s topic %s",
+        SHIFT_CALL_TIME, SHIFTCALL_CHAT_ID, SHIFTCALL_THREAD_ID or "(none)",
+    )
     app.job_queue.run_repeating(
         job_auto_close, interval=timedelta(minutes=30),
         first=timedelta(minutes=5), name="auto-close",
