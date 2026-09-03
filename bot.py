@@ -268,7 +268,9 @@ CREATE TABLE IF NOT EXISTS time_entries (
     clock_out  TEXT,
     status     TEXT NOT NULL DEFAULT 'open',
     source     TEXT NOT NULL DEFAULT 'agent',
-    note       TEXT
+    note       TEXT,
+    shift_label TEXT,
+    opening_posted INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS time_edits (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -310,6 +312,11 @@ db.commit()
 _slot_cols = {r[1] for r in db.execute("PRAGMA table_info(slots)")}
 if "capacity" not in _slot_cols:
     db.execute("ALTER TABLE slots ADD COLUMN capacity INTEGER")
+_te_cols = {r[1] for r in db.execute("PRAGMA table_info(time_entries)")}
+for _c, _d in (("shift_label", "TEXT"),
+               ("opening_posted", "INTEGER NOT NULL DEFAULT 0")):
+    if _c not in _te_cols:
+        db.execute(f"ALTER TABLE time_entries ADD COLUMN {_c} {_d}")
 _cols = {r[1] for r in db.execute("PRAGMA table_info(agents)")}
 if "role" not in _cols:
     db.execute(
@@ -2373,6 +2380,52 @@ async def cmd_clockin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
     if open_row:
         started = datetime.fromisoformat(open_row["clock_in"])
+        given = " ".join(context.args).strip() if context.args else ""
+        if open_row["opening_posted"]:
+            shown = open_row["shift_label"] or ""
+            await update.message.reply_text(
+                f"You're already clocked in since {started.strftime('%-d %b, %H:%M')}"
+                + (f" on {shown}" if shown else "")
+                + ".\nYour [OPENING] has been posted. Send /clockout when you finish."
+            )
+            return
+        if given:
+            # They're mid-shift and now telling me which one it is.
+            nice_name = display_name_of(user.id, user.full_name)
+            match = q1(
+                """SELECT s.id FROM slots s JOIN days d ON d.id = s.day_id
+                   WHERE d.the_date=? AND lower(s.label)=lower(?)""",
+                (open_row["the_date"], given),
+            )
+            async with write_lock:
+                run(
+                    "UPDATE time_entries SET slot_id=COALESCE(?, slot_id), "
+                    "shift_label=?, opening_posted=1 WHERE id=?",
+                    (match["id"] if match else None, given, open_row["id"]),
+                )
+            block = opening_block(user.id, nice_name, given)
+            posted = await post_ops(context.bot, block)
+            if not posted:
+                await update.message.reply_text(block, parse_mode=None)
+            note = (
+                f"⏱ Clocked in since {started.strftime('%H:%M')}\n"
+                f"Shift: {esc(given)}\n"
+                f"Support: {esc(support_for(user.id, nice_name))}\n\n"
+            )
+            note += (
+                "Your [OPENING] has been posted ✅\n"
+                if posted else "Tap the message above to copy it.\n"
+            )
+            has_roster = q1(
+                "SELECT 1 FROM days WHERE the_date=?", (open_row["the_date"],)
+            )
+            if not match and has_roster:
+                note += "⚠️ That block isn't on today's roster, so it's flagged.\n"
+            note += "Send /clockout when you finish."
+            await update.message.reply_text(
+                note, parse_mode=constants.ParseMode.HTML
+            )
+            return
         await update.message.reply_text(
             f"You're already clocked in since {started.strftime('%-d %b, %H:%M')}.\n"
             "Send /clockout when you finish."
@@ -2427,17 +2480,30 @@ async def cmd_clockin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 row = []
         if row:
             rows.append(row)
-        await update.message.reply_text(
-            f"⏱ Clocked in at <b>{when.strftime('%H:%M')}</b>\n\n"
-            "Which shift is this? Tap it and I'll post your [OPENING].\n\n"
-            "<i>Next time you can send it straight away — "
-            "<code>/clockin 2pm-4pm</code></i>",
-            parse_mode=constants.ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup(rows) if rows else None,
-        )
+        if rows:
+            await update.message.reply_text(
+                f"⏱ Clocked in at <b>{when.strftime('%H:%M')}</b>\n\n"
+                "Which shift is this? Tap it and I'll post your [OPENING].\n\n"
+                "<i>Next time you can send it straight away — "
+                "<code>/clockin 2pm-4pm</code></i>",
+                parse_mode=constants.ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(rows),
+            )
+        else:
+            await update.message.reply_text(
+                f"⏱ Clocked in at <b>{when.strftime('%H:%M')}</b>\n\n"
+                "There's no roster for today, so tell me the shift and I'll post "
+                "your [OPENING]:\n\n<code>/clockin 4pm-6pm</code>",
+                parse_mode=constants.ParseMode.HTML,
+            )
         return
 
     block = opening_block(user.id, nice_name, slot_text)
+    run(
+        "UPDATE time_entries SET shift_label=?, opening_posted=1 "
+        "WHERE agent_id=? AND clock_out IS NULL",
+        (slot_text, user.id),
+    )
 
     posted = await post_ops(context.bot, block)
     if not posted:
@@ -2457,13 +2523,19 @@ async def cmd_clockin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         note += "Send /clockout when you finish."
         await update.message.reply_text(note, parse_mode=constants.ParseMode.HTML)
     elif override:
+        has_roster = q1(
+            "SELECT 1 FROM days WHERE the_date=?", (when.date().isoformat(),)
+        )
         note = (
             f"⏱ Clocked in at <b>{when.strftime('%H:%M')}</b>\n"
             f"Shift: {esc(override)}\n"
             f"Support: {esc(support_for(user.id, nice_name))}\n\n"
-            "⚠️ That block isn't on today's roster, so it's logged as unrostered "
-            "and your manager will see it flagged.\n\n"
         )
+        if has_roster:
+            note += (
+                "⚠️ That block isn't on today's roster, so it's logged as "
+                "unrostered and your manager will see it flagged.\n\n"
+            )
         note += (
             "Your [OPENING] has been posted ✅\n"
             if posted else "Tap the message above to copy it.\n"
@@ -2508,8 +2580,9 @@ async def on_clockin_slot(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     async with write_lock:
         run(
-            "UPDATE time_entries SET slot_id=? WHERE id=?",
-            (slot["id"], entry["id"]),
+            "UPDATE time_entries SET slot_id=?, shift_label=?, opening_posted=1 "
+            "WHERE id=?",
+            (slot["id"], slot["label"], entry["id"]),
         )
 
     nice_name = display_name_of(user.id, user.full_name)
