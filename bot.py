@@ -2858,14 +2858,45 @@ async def cmd_roster(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             "Roster is empty. Agents join it by tapping a slot, or by sending me /start."
         )
         return
-    lines = [f"<b>Roster ({len(rows)})</b>"] + [
-        f"{'🔔' if r['dm_ok'] else '🔕'} {esc(r['display_name'] or r['name'])}"
-        + (f" @{r['username']}" if r["username"] else "")
-        + f" · <code>{r['user_id']}</code>"
-        for r in rows
+    def line(r):
+        role = role_of(r["user_id"])
+        badge = {"owner": "👑", "admin": "🛠"}.get(role, "")
+        bits = f"{'🔔' if r['dm_ok'] else '🔕'}{badge} "
+        bits += esc(r["display_name"] or r["name"])
+        if r["username"]:
+            bits += f" @{r['username']}"
+        if not r["on_avails"]:
+            bits += " · not on avails"
+        bits += f" · <code>{r['user_id']}</code>"
+        return bits
+
+    owners = [r for r in rows if role_of(r["user_id"]) == "owner"]
+    admins = [r for r in rows if role_of(r["user_id"]) == "admin"]
+    agents = [r for r in rows if role_of(r["user_id"]) == "agent"]
+
+    lines = [f"<b>Roster ({len(rows)})</b>"]
+    if owners:
+        lines += ["", "<b>👑 Owners</b>"] + [line(r) for r in owners]
+    if admins:
+        lines += ["", "<b>🛠 Admins</b>"] + [line(r) for r in admins]
+    if agents:
+        lines += ["", f"<b>Agents ({len(agents)})</b>"] + [line(r) for r in agents]
+
+    # Owners set in config may have never messaged the bot.
+    missing = [
+        uid for uid in ADMIN_IDS
+        if not any(r["user_id"] == uid for r in rows)
     ]
+    if missing:
+        lines += ["", "<b>👑 Owners (config only)</b>"] + [
+            f"<code>{uid}</code> — hasn't messaged the bot" for uid in missing
+        ]
+
     lines.append("\n🔕 = hasn't sent me /start, so can't get shift reminders.")
-    lines.append("Remove someone with <code>/removeagent @handle</code> or their ID.")
+    lines.append(
+        "<code>/makeadmin @handle</code> · <code>/removeadmin @handle</code> "
+        "· <code>/removeagent @handle</code>"
+    )
     if waiting:
         lines.append(f"\n⏳ {waiting} waiting for approval — see /pending")
     await update.message.reply_text("\n".join(lines), parse_mode=constants.ParseMode.HTML)
