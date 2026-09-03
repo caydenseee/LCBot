@@ -2402,6 +2402,41 @@ async def cmd_clockin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
 
     nice_name = display_name_of(user.id, user.full_name)
+
+    if not slot and not override:
+        # Nothing to name the shift after — ask rather than posting a dash.
+        entry = q1(
+            "SELECT id FROM time_entries WHERE agent_id=? AND clock_out IS NULL "
+            "ORDER BY id DESC LIMIT 1",
+            (user.id,),
+        )
+        today_slots = q(
+            """SELECT s.id, s.label FROM slots s JOIN days d ON d.id = s.day_id
+               WHERE d.the_date=? ORDER BY s.idx""",
+            (when.date().isoformat(),),
+        )
+        rows, row = [], []
+        for sl in today_slots:
+            row.append(
+                InlineKeyboardButton(
+                    sl["label"], callback_data=f"ci:{entry['id']}:{sl['id']}"
+                )
+            )
+            if len(row) == 2:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        await update.message.reply_text(
+            f"⏱ Clocked in at <b>{when.strftime('%H:%M')}</b>\n\n"
+            "Which shift is this? Tap it and I'll post your [OPENING].\n\n"
+            "<i>Next time you can send it straight away — "
+            "<code>/clockin 2pm-4pm</code></i>",
+            parse_mode=constants.ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(rows) if rows else None,
+        )
+        return
+
     block = opening_block(user.id, nice_name, slot_text)
 
     posted = await post_ops(context.bot, block)
@@ -2444,6 +2479,56 @@ async def cmd_clockin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "Send /clockout when you finish.",
             parse_mode=constants.ParseMode.HTML,
         )
+
+
+async def on_clockin_slot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """They picked which shift they've just clocked into."""
+    query = update.callback_query
+    if not await gate_cb(query):
+        return
+    _, entry_id, slot_id = query.data.split(":")
+    user = query.from_user
+
+    entry = q1("SELECT * FROM time_entries WHERE id=?", (int(entry_id),))
+    if not entry or entry["agent_id"] != user.id:
+        await query.answer("That clock-in has gone.", show_alert=True)
+        return
+    if entry["clock_out"]:
+        await query.answer("That shift is already closed.", show_alert=True)
+        return
+
+    slot = q1(
+        """SELECT s.id, s.label, d.name AS day_name FROM slots s
+           JOIN days d ON d.id = s.day_id WHERE s.id=?""",
+        (int(slot_id),),
+    )
+    if not slot:
+        await query.answer("That slot no longer exists.", show_alert=True)
+        return
+
+    async with write_lock:
+        run(
+            "UPDATE time_entries SET slot_id=? WHERE id=?",
+            (slot["id"], entry["id"]),
+        )
+
+    nice_name = display_name_of(user.id, user.full_name)
+    block = opening_block(user.id, nice_name, slot["label"])
+    posted = await post_ops(context.bot, block)
+
+    await query.answer(f"{slot['label']} \u2713")
+    tail = (
+        "Your [OPENING] has been posted \u2705"
+        if posted else "Tap the message above to copy it."
+    )
+    if not posted:
+        await query.message.reply_text(block, parse_mode=None)
+    await query.edit_message_text(
+        f"\u23f1 Clocked in \u2014 <b>{esc(slot['label'])}</b>\n"
+        f"Support: {esc(support_for(user.id, nice_name))}\n\n"
+        f"{tail}\nSend /clockout when you finish.",
+        parse_mode=constants.ParseMode.HTML,
+    )
 
 
 async def cmd_clockout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4616,6 +4701,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_confirm, pattern=r"^[cu]:\d+$"))
     app.add_handler(CallbackQueryHandler(on_plan_toggle, pattern=r"^p:"))
     app.add_handler(CallbackQueryHandler(on_plan_nav, pattern=r"^pd:"))
+    app.add_handler(CallbackQueryHandler(on_clockin_slot, pattern=r"^ci:\d+:\d+$"))
     app.add_handler(CallbackQueryHandler(on_access_decision, pattern=r"^(ap|dn):\d+$"))
     app.add_handler(CallbackQueryHandler(on_plan_quick, pattern=r"^pq:"))
 
