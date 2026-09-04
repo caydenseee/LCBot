@@ -327,6 +327,7 @@ for _col, _ddl in [
     ("display_name", "TEXT"),
     ("support_name", "TEXT"),
     ("on_avails", "INTEGER NOT NULL DEFAULT 1"),
+    ("tag_calls", "INTEGER NOT NULL DEFAULT 1"),
     ("requested_at", "TEXT"),
     ("decided_by", "INTEGER"),
     ("decided_at", "TEXT"),
@@ -3465,6 +3466,56 @@ async def cmd_fixed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+async def cmd_tag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Who gets @-mentioned in the nightly on-duty post.
+
+    They still appear on the rota either way — this only stops the ping.
+    """
+    if not is_admin(update.effective_user.id):
+        return
+    if not context.args:
+        on = q("SELECT * FROM agents WHERE status='active' AND tag_calls=1 ORDER BY name")
+        off = q("SELECT * FROM agents WHERE status='active' AND tag_calls=0 ORDER BY name")
+        lines = [f"<b>Tagged in the nightly post ({len(on)})</b>"]
+        lines += [f"  {esc(a['display_name'] or a['name'])}" for a in on] or ["  nobody"]
+        lines += ["", f"<b>Not tagged ({len(off)})</b>"]
+        lines += [f"  {esc(a['display_name'] or a['name'])}" for a in off] or ["  nobody"]
+        lines += [
+            "",
+            "<code>/tag off @handle</code> — stop pinging them",
+            "<code>/tag on @handle</code> — start again",
+            "",
+            "<i>They still show on the rota either way.</i>",
+        ]
+        await update.message.reply_text(
+            "\n".join(lines), parse_mode=constants.ParseMode.HTML
+        )
+        return
+
+    mode = context.args[0].lower()
+    if mode not in ("on", "off") or len(context.args) < 2:
+        await update.message.reply_text(
+            "Usage: <code>/tag off @handle</code> or <code>/tag on @handle</code>",
+            parse_mode=constants.ParseMode.HTML,
+        )
+        return
+    row = find_agent(context.args[1])
+    if not row:
+        await update.message.reply_text("No one matches that. Check /roster.")
+        return
+
+    want = 1 if mode == "on" else 0
+    async with write_lock:
+        run("UPDATE agents SET tag_calls=? WHERE user_id=?", (want, row["user_id"]))
+    nm = row["display_name"] or row["name"]
+    if want:
+        msg = f"<b>{esc(nm)}</b> will be tagged in the nightly on-duty post again."
+    else:
+        msg = (f"<b>{esc(nm)}</b> won't be tagged in the nightly post.\n"
+               "They'll still appear on the rota.")
+    await update.message.reply_text(msg, parse_mode=constants.ParseMode.HTML)
+
+
 async def cmd_avails(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Take someone off the weekly avails roster without removing their access.
 
@@ -4308,7 +4359,13 @@ def build_shift_call(for_date: date | None = None) -> tuple[str | None, str]:
         return None, f"Nobody has claimed any slot on {day['name']} {fmt_day(target)}."
     if gaps:
         lines.append(f"\n\u26A0\uFE0F {gaps} slot(s) with nobody on")
-    lines.append("\n" + " ".join(mention(u, n) for u, n in working.items()))
+    taggable = []
+    for uid, nm in working.items():
+        row = q1("SELECT tag_calls FROM agents WHERE user_id=?", (uid,))
+        if row is None or row["tag_calls"]:
+            taggable.append(mention(uid, nm))
+    if taggable:
+        lines.append("\n" + " ".join(taggable))
     return "\n".join(lines), "ok"
 
 
@@ -4411,6 +4468,7 @@ ADMIN_GROUPS = [
         ("roster", "Who's on the list"),
         ("rename", "Fix someone's name on the schedule"),
         ("avails", "Who gets tagged for avails"),
+        ("tag", "Who gets pinged in the nightly post"),
         ("removeagent", "Remove someone, frees their slots"),
     ]),
     ("Hours and pay", [
@@ -4855,6 +4913,7 @@ def main() -> None:
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("removeagent", cmd_removeagent))
     app.add_handler(CommandHandler("avails", cmd_avails))
+    app.add_handler(CommandHandler("tag", cmd_tag))
     app.add_handler(CommandHandler("fixed", cmd_fixed))
     app.add_handler(CommandHandler("capacity", cmd_capacity))
     app.add_handler(CommandHandler("dropslot", cmd_dropslot))
