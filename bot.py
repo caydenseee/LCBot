@@ -2019,7 +2019,7 @@ async def cmd_shiftcall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def cmd_chatid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Setup helper — reports the IDs you need for the env file."""
-    if not is_admin(update.effective_user.id):
+    if not is_owner(update.effective_user.id):
         return
     chat = update.effective_chat
     user = update.effective_user
@@ -3591,7 +3591,7 @@ def parse_month(args) -> date:
 
 async def cmd_setrate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/setrate 14.50  (team)  ·  /setrate 16 @handle  (one person)"""
-    if not is_admin(update.effective_user.id):
+    if not is_owner(update.effective_user.id):
         return
     if not context.args:
         team = rate_for(-1, now().date())
@@ -3679,7 +3679,7 @@ async def cmd_timesheet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def cmd_payroll(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """CSV: one row per shift — date, hours, rate, pay."""
-    if not is_admin(update.effective_user.id):
+    if not is_owner(update.effective_user.id):
         return
     first = parse_month(context.args)
     _, last = month_bounds(first)
@@ -3975,7 +3975,7 @@ def backup_caption(counts: dict) -> str:
 
 
 async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user.id):
+    if not is_owner(update.effective_user.id):
         return
     try:
         data, counts = snapshot_db()
@@ -4072,7 +4072,7 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not is_admin(update.effective_user.id):
+    if not is_owner(update.effective_user.id):
         return
     w = latest_week()
     if not w:
@@ -4101,308 +4101,25 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     role = role_of(update.effective_user.id)
-    lines = [
-        "<b>What I can do</b>",
-        "",
-        "/plan — fill in your week, day by day",
-        "/myshifts — what you're signed up for",
-        "/summary — the current board",
-    ]
+    lines = ["<b>What I can do</b>", ""]
+    lines += [f"/{c} — {d}" for c, d in AGENT_COMMANDS if c != "help"]
+
     if role in ("admin", "owner"):
-        lines += [
-            "",
-            "<b>Admin</b>",
-            "/newweek — set up and post a week",
-            "/schedule — post the board to the group",
-            "/gaps — unfilled slots",
-            "/remind — nudge whoever hasn't confirmed",
-            "/shiftcall — post tomorrow's on-duty tags now",
-            "/roster — who's on the list",
-            "/removeagent — remove someone, freeing their slots",
-            "/export — download this week as CSV",
-            "/presets — saved timing patterns",
-            "/closeweek — close submissions early",
-        ]
+        for title, group in ADMIN_GROUPS:
+            lines += ["", f"<b>{title}</b>"]
+            lines += [f"/{c} — {d}" for c, d in group]
     if role == "owner":
-        lines += [
-            "",
-            "<b>Owner</b>",
-            "/makeadmin — give someone admin rights",
-            "/removeadmin — take them away",
-            "/chatid — show this chat's ID",
-        ]
-    await update.message.reply_text(
-        "\n".join(lines), parse_mode=constants.ParseMode.HTML
-    )
+        lines += ["", "<b>Owner</b>"]
+        lines += [f"/{c} — {d}" for c, d in OWNER_EXTRA]
 
-
-
-# --------------------------------------------------------------------------
-# Mini App
-# --------------------------------------------------------------------------
-
-MINIAPP_HTML = """<!DOCTYPE html>
-<html><head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>My hours</title>
-<script src="https://telegram.org/js/telegram-web-app.js"></script>
-<style>
-  :root { color-scheme: light dark; }
-  * { box-sizing: border-box; }
-  body {
-    margin: 0; padding: 16px 16px 40px;
-    font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    background: var(--tg-theme-bg-color, #fff);
-    color: var(--tg-theme-text-color, #111);
-  }
-  h1 { font-size: 20px; margin: 0 0 2px; }
-  .sub { color: var(--tg-theme-hint-color, #777); font-size: 13px; margin-bottom: 18px; }
-  .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 22px; }
-  .card {
-    background: var(--tg-theme-secondary-bg-color, #f4f4f5);
-    border-radius: 14px; padding: 14px;
-  }
-  .card .n { font-size: 22px; font-weight: 650; letter-spacing: -0.02em; }
-  .card .l { font-size: 12px; color: var(--tg-theme-hint-color, #777); margin-top: 2px; }
-  .card.wide { grid-column: 1 / -1; }
-  .card.pay .n { color: var(--tg-theme-link-color, #2a7); }
-  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em;
-       color: var(--tg-theme-hint-color, #777); margin: 0 0 8px; font-weight: 600; }
-  .row { display: flex; justify-content: space-between; align-items: baseline;
-         padding: 11px 0; border-bottom: 1px solid var(--tg-theme-secondary-bg-color, #eee); }
-  .row:last-child { border-bottom: 0; }
-  .d { font-weight: 550; }
-  .t { font-size: 12px; color: var(--tg-theme-hint-color, #777); margin-top: 1px; }
-  .h { font-variant-numeric: tabular-nums; text-align: right; }
-  .flag { font-size: 11px; color: #c60; }
-  .empty { text-align: center; padding: 40px 20px; color: var(--tg-theme-hint-color, #777); }
-  .note { margin-top: 22px; font-size: 12px; color: var(--tg-theme-hint-color, #777);
-          line-height: 1.5; }
-  .err { background: #fee; color: #900; padding: 14px; border-radius: 12px; }
-</style>
-</head><body>
-<div id="app"><div class="empty">Loading…</div></div>
-<script>
-const tg = window.Telegram?.WebApp;
-if (tg) { tg.ready(); tg.expand(); }
-const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
-
-async function load() {
-  const app = document.getElementById('app');
-  try {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 15000);
-    const r = await fetch('/api/me', {
-      headers: { 'X-Init-Data': tg?.initData || '' },
-      signal: ctrl.signal
-    });
-    clearTimeout(timer);
-    if (r.status === 401) {
-      app.innerHTML = '<div class="err">Could not verify who you are. Open this from the bot rather than a browser.</div>';
-      return;
-    }
-    if (r.status === 403) {
-      app.innerHTML = '<div class="err">You do not have access yet. Send /start to the bot.</div>';
-      return;
-    }
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    const d = await r.json();
-
-    let h = `<h1>${esc(d.name)}</h1><div class="sub">${esc(d.month)}</div>`;
-    h += '<div class="cards">';
-    h += `<div class="card"><div class="n">${d.count}</div><div class="l">Shifts</div></div>`;
-    h += `<div class="card"><div class="n">${esc(d.hours)}</div><div class="l">Hours</div></div>`;
-    if (d.showPay) {
-      h += `<div class="card pay wide"><div class="n">${esc(d.total)}</div>`;
-      h += `<div class="l">at ${esc(d.rate)}/hour</div></div>`;
-    }
-    h += '</div>';
-
-    if (d.shifts.length) {
-      h += '<h2>Shifts</h2>';
-      for (const s of d.shifts) {
-        h += '<div class="row"><div>';
-        h += `<div class="d">${esc(s.date)}</div>`;
-        h += `<div class="t">${esc(s.times)}${s.flagged ? ' <span class="flag">· auto-closed</span>' : ''}</div>`;
-        h += `</div><div class="h"><div>${esc(s.hours)}</div>`;
-        h += s.pay ? `<div class="t">${esc(s.pay)}</div>` : '';
-        h += `</div></div>`;
-      }
-    } else {
-      h += '<div class="empty">No shifts logged this month yet.<br>Use /clockin when you start.</div>';
-    }
-    if (d.openShift) {
-      h += '<div class="note">⏱ You are clocked in right now — this shift is not counted yet.</div>';
-    }
-    if (d.showPay) {
-    }
-    app.innerHTML = h;
-  } catch (e) {
-    const why = e.name === 'AbortError' ? 'The server did not answer in time.' : esc(e.message || e);
-    app.innerHTML = '<div class="err">Could not load your hours.<br><br>' + why + '</div>';
-  }
-}
-load();
-</script>
-</body></html>"""
-
-
-def miniapp_payload(user_id: int) -> dict:
-    """Built on a connection of its own — this runs on the web thread, not the
-    bot's, and sharing one SQLite connection across threads is unsafe."""
-    conn = sqlite3.connect(DB_PATH, timeout=5)
-    conn.row_factory = sqlite3.Row
-    try:
-        agent = conn.execute(
-            "SELECT display_name, name FROM agents WHERE user_id=?", (user_id,)
-        ).fetchone()
-        name = (agent["display_name"] or agent["name"] or "You") if agent else "You"
-
-        today = now().date()
-        first = today.replace(day=1)
-        last = (first + timedelta(days=32)).replace(day=1) - timedelta(days=1)
-
-        def rate_on(d: date) -> int:
-            row = conn.execute(
-                "SELECT cents FROM pay_rates WHERE agent_id=? AND effective_from<=? "
-                "ORDER BY effective_from DESC, id DESC LIMIT 1",
-                (user_id, d.isoformat()),
-            ).fetchone()
-            if row:
-                return row["cents"]
-            row = conn.execute(
-                "SELECT cents FROM pay_rates WHERE agent_id IS NULL AND effective_from<=? "
-                "ORDER BY effective_from DESC, id DESC LIMIT 1",
-                (d.isoformat(),),
-            ).fetchone()
-            return row["cents"] if row else DEFAULT_RATE_CENTS
-
-        rows = conn.execute(
-            "SELECT * FROM time_entries WHERE agent_id=? AND the_date BETWEEN ? AND ? "
-            "ORDER BY the_date, clock_in",
-            (user_id, first.isoformat(), last.isoformat()),
-        ).fetchall()
-
-        shifts, total_min, total_cents, open_count = [], 0, 0, 0
-        seen_days = set()
-        for r in rows:
-            if not r["clock_out"]:
-                open_count += 1
-                continue
-            a = datetime.fromisoformat(r["clock_in"])
-            b = datetime.fromisoformat(r["clock_out"])
-            actual = max(0, int((b - a).total_seconds() // 60))
-            mins = entry_paid_minutes(r)
-            day = date.fromisoformat(r["the_date"])
-            total_min += mins
-            total_cents += round(mins / 60 * rate_on(day)) if mins else 0
-            seen_days.add(day)
-            shifts.append({
-                "date": day.strftime("%a %-d %b"),
-                "times": f"{a.strftime('%H:%M')}\u2013{b.strftime('%H:%M')}",
-                "hours": hhmm(mins),
-                "pay": money(round(mins / 60 * rate_on(day))) if mins else "",
-                "flagged": r["status"] == "auto",
-            })
-        rate = rate_on(today)
-    finally:
-        conn.close()
-
-    shifts.reverse()
-    return {
-        "name": name,
-        "month": first.strftime("%B %Y"),
-        "hours": hhmm(total_min),
-        "days": len(seen_days),
-        "count": len(shifts),
-        "showPay": bool(rate),
-        "rate": money(rate),
-        "total": money(total_cents),
-        "openShift": bool(open_count),
-        "shifts": shifts,
-    }
-
-
-def web_has_access(user_id: int) -> bool:
-    """Access check on the web thread's own connection."""
-    if user_id in ADMIN_IDS:
-        return True
-    conn = sqlite3.connect(DB_PATH, timeout=5)
-    try:
-        row = conn.execute(
-            "SELECT status FROM agents WHERE user_id=?", (user_id,)
-        ).fetchone()
-    finally:
-        conn.close()
-    if row:
-        return row[0] == "active"
-    return not ADMIN_IDS
-
-
-class MiniAppHandler(BaseHTTPRequestHandler):
-    protocol_version = "HTTP/1.1"
-
-    def _send(self, code, body: bytes, ctype="application/json"):
-        self.send_response(code)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
-
-    def do_GET(self):
-        try:
-            self._route()
-        except Exception as e:
-            log.warning("Mini App handler error: %s", e, exc_info=True)
-            try:
-                self._send(500, b'{"error":"server"}')
-            except Exception:
-                pass
-
-    def _route(self):
-        path = urllib.parse.urlparse(self.path).path
-        if path in ("/", "/index.html"):
-            self._send(200, MINIAPP_HTML.encode(), "text/html; charset=utf-8")
-            return
-        if path == "/health":
-            self._send(200, b'{"ok":true}')
-            return
-        if path == "/api/me":
-            try:
-                raw = self.headers.get("X-Init-Data", "")
-                user = verify_init_data(raw)
-                if not user or "id" not in user:
-                    self._send(401, b'{"error":"unverified"}')
-                    return
-                uid = int(user["id"])
-                if not web_has_access(uid):
-                    self._send(403, b'{"error":"no access"}')
-                    return
-                body = json.dumps(miniapp_payload(uid)).encode()
-                self._send(200, body)
-            except Exception as e:
-                log.warning("Mini App request failed: %s", e, exc_info=True)
-                try:
-                    self._send(500, b'{"error":"server"}')
-                except Exception:
-                    pass
-            return
-        self._send(404, b'{"error":"not found"}')
-
-    def log_message(self, *a):
-        pass
-
-
-def start_web_server() -> None:
-    try:
-        srv = ThreadingHTTPServer(("0.0.0.0", WEB_PORT), MiniAppHandler)
-    except Exception as e:
-        log.warning("Mini App server could not start: %s", e)
+    text = "\n".join(lines)
+    # Telegram caps a message at 4096 characters.
+    if len(text) > 3900:
+        cut = text.rfind("\n\n<b>", 0, 3900)
+        await update.message.reply_text(text[:cut], parse_mode=constants.ParseMode.HTML)
+        await update.message.reply_text(text[cut:], parse_mode=constants.ParseMode.HTML)
         return
-    threading.Thread(target=srv.serve_forever, daemon=True).start()
-    log.info("Mini App server listening on port %s", WEB_PORT)
+    await update.message.reply_text(text, parse_mode=constants.ParseMode.HTML)
 
 
 async def cmd_payslip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4656,47 +4373,65 @@ def schedule_week_jobs(app: Application, week_id: int) -> None:
 
 AGENT_COMMANDS = [
     ("plan", "Fill in my week"),
-    ("clockin", "Start my shift"),
+    ("clockin", "Start my shift — or /clockin 2pm-4pm"),
     ("clockout", "End my shift"),
     ("mytime", "My hours this month"),
-    ("support", "Who I list as support"),
     ("payslip", "My hours and pay"),
     ("myshifts", "What I'm signed up for"),
+    ("support", "Who I list as support"),
     ("summary", "Show the current board"),
     ("help", "List commands"),
 ]
 GROUP_COMMANDS = [
     ("schedule", "Show this week's schedule"),
 ]
+
+# Grouped so /help and the command menu can never drift apart.
+ADMIN_GROUPS = [
+    ("Running the week", [
+        ("newweek", "Set up and post a week"),
+        ("schedule", "Move the board to the bottom of the group"),
+        ("gaps", "Unfilled slots"),
+        ("remind", "Nudge whoever hasn't confirmed"),
+        ("closeweek", "Close submissions early"),
+        ("shiftcall", "Post tomorrow's on-duty tags now"),
+        ("presets", "Saved timing patterns"),
+        ("savepreset", "Save this week's timings for reuse"),
+    ]),
+    ("Slots", [
+        ("capacity", "How many agents a slot takes"),
+        ("whohas", "Who is on a slot"),
+        ("dropslot", "Free one slot from someone"),
+        ("fixed", "Slots someone always works"),
+        ("applyfixed", "Apply fixed rosters to this week"),
+    ]),
+    ("People", [
+        ("pending", "Approve or decline access requests"),
+        ("access", "Who approved or declined whom"),
+        ("roster", "Who's on the list"),
+        ("rename", "Fix someone's name on the schedule"),
+        ("avails", "Who gets tagged for avails"),
+        ("removeagent", "Remove someone, frees their slots"),
+    ]),
+    ("Hours and pay", [
+        ("openshifts", "Who's clocked in now"),
+        ("clockoutfor", "Close a forgotten shift"),
+        ("fixtime", "Correct a time entry"),
+        ("timesheet", "Team hours this month"),
+    ]),
+]
 OWNER_EXTRA = [
     ("makeadmin", "Give someone admin rights"),
     ("removeadmin", "Take admin rights away"),
+    ("setrate", "Set the hourly rate"),
+    ("payroll", "Export shifts as CSV"),
+    ("export", "This week's board as CSV"),
+    ("backup", "Download a copy of the data"),
     ("chatid", "Show this chat's ID"),
+    ("reset", "Clear schedules and hours"),
 ]
 ADMIN_COMMANDS = AGENT_COMMANDS + [
-    ("newweek", "Set up and post a week"),
-    ("gaps", "Unfilled slots"),
-    ("remind", "Nudge the unconfirmed"),
-    ("shiftcall", "Post tomorrow's on-duty tags"),
-    ("roster", "Who's on the list"),
-    ("removeagent", "Remove someone"),
-    ("avails", "Who gets tagged for avails"),
-    ("fixed", "Slots someone always works"),
-    ("applyfixed", "Apply fixed rosters to this week"),
-    ("capacity", "Agents needed per slot"),
-    ("dropslot", "Free one slot from someone"),
-    ("whohas", "Who is on a slot"),
-    ("export", "Download this week as CSV"),
-    ("presets", "Saved timing patterns"),
-    ("closeweek", "Close submissions early"),
-    ("timesheet", "Team hours this month"),
-    ("payroll", "Export shifts as CSV"),
-    ("setrate", "Set the hourly rate"),
-    ("openshifts", "Who's clocked in now"),
-    ("clockoutfor", "Clock someone out"),
-    ("fixtime", "Correct a time entry"),
-    ("backup", "Download a copy of the data"),
-    ("reset", "Clear test data before launch"),
+    c for _, group in ADMIN_GROUPS for c in group
 ]
 
 
