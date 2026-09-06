@@ -103,6 +103,8 @@ SLOT_CAPACITY = max(1, env_int("SLOT_CAPACITY", 1))
 SHIFT_REMINDER_HOUR = env_int("SHIFT_REMINDER_HOUR", 20)
 # Group post tagging whoever is on duty tomorrow, e.g. "18:30".
 SHIFT_CALL_TIME = os.environ.get("SHIFT_CALL_TIME", "").strip() or "18:30"
+# Time of day the avails reminders go out, so nobody gets pinged at midnight.
+NUDGE_TIME = os.environ.get("NUDGE_TIME", "").strip() or "11:59"
 # Personal DMs the evening before. Off by default so nobody is pinged twice.
 DM_REMINDERS = os.environ.get("DM_REMINDERS", "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -4415,15 +4417,23 @@ def schedule_week_jobs(app: Application, week_id: int) -> None:
         for job in jq.get_jobs_by_name(name):
             job.schedule_removal()
 
-    for offset, prefix, name in [
-        (timedelta(days=-2), "Reminder", f"nudge1-{week_id}"),
-        (timedelta(hours=-12), "Last call", f"nudge2-{week_id}"),
+    # Both reminders land at a civil hour rather than whenever the offset falls.
+    try:
+        nm = parse_time_token(NUDGE_TIME)
+    except ValueError:
+        nm = 11 * 60 + 59
+    nudge_at = time(nm // 60, nm % 60)
+
+    for days_before, prefix, name in [
+        (2, "Reminder", f"nudge1-{week_id}"),
+        (0, "Last call", f"nudge2-{week_id}"),
     ]:
-        when = dl + offset
-        if when > now():
+        when = datetime.combine(dl.date() - timedelta(days=days_before), nudge_at, TZ)
+        if when > now() and when < dl:
             jq.run_once(
                 job_nudge, when, name=name, data={"week_id": week_id, "prefix": prefix}
             )
+            log.info("%s for week %s scheduled at %s", prefix, week_id, when)
     if dl > now():
         jq.run_once(job_close, dl, name=f"close-{week_id}", data={"week_id": week_id})
 
