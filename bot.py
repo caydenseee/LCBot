@@ -253,6 +253,16 @@ CREATE TABLE IF NOT EXISTS fixed_slots (
     label    TEXT NOT NULL,
     PRIMARY KEY (user_id, day_name, label)
 );
+CREATE TABLE IF NOT EXISTS drop_requests (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id     INTEGER NOT NULL,
+    slot_id      INTEGER NOT NULL,
+    reason       TEXT,
+    requested_at TEXT NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'pending',
+    decided_by   INTEGER,
+    decided_at   TEXT
+);
 CREATE TABLE IF NOT EXISTS pay_rates (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     agent_id       INTEGER,
@@ -2111,6 +2121,7 @@ async def cmd_savepreset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 ASK_NAME = 100
+DROP_PICK, DROP_REASON = 200, 201
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2345,16 +2356,33 @@ async def gate_cb(query) -> bool:
     return False
 
 
+def day_row_for(the_date: str):
+    """The day row for a date, from the live week.
+
+    Old closed weeks can cover the same dates, so always prefer the newest —
+    otherwise the rota is read out of a week nobody is working any more.
+    """
+    return q1(
+        """SELECT d.* FROM days d JOIN weeks w ON w.id = d.week_id
+           WHERE d.the_date=?
+           ORDER BY CASE w.status WHEN 'open' THEN 0 ELSE 1 END, w.id DESC
+           LIMIT 1""",
+        (the_date,),
+    )
+
+
 def current_slot_for(agent_id: int, when: datetime):
     """The rostered slot this clock-in most likely belongs to."""
-    today = when.date()
     mins = when.hour * 60 + when.minute
+    day = day_row_for(when.date().isoformat())
+    if not day:
+        return None
     rows = q(
         """SELECT s.id, s.label, s.start_min, d.name AS day_name, d.the_date
            FROM signups su JOIN slots s ON s.id = su.slot_id
            JOIN days d ON d.id = s.day_id
-           WHERE su.user_id=? AND d.the_date=? ORDER BY s.start_min""",
-        (agent_id, today.isoformat()),
+           WHERE su.user_id=? AND d.id=? ORDER BY s.start_min""",
+        (agent_id, day["id"]),
     )
     if not rows:
         return None
@@ -2395,11 +2423,12 @@ async def cmd_clockin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         if given:
             # They're mid-shift and now telling me which one it is.
             nice_name = display_name_of(user.id, user.full_name)
+            _d = day_row_for(open_row["the_date"])
             match = q1(
                 """SELECT s.id FROM slots s JOIN days d ON d.id = s.day_id
-                   WHERE d.the_date=? AND lower(s.label)=lower(?)""",
-                (open_row["the_date"], given),
-            )
+                   WHERE d.id=? AND lower(s.label)=lower(?)""",
+                (_d["id"], given),
+            ) if _d else None
             async with write_lock:
                 run(
                     "UPDATE time_entries SET slot_id=COALESCE(?, slot_id), "
@@ -2419,9 +2448,7 @@ async def cmd_clockin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 "Your [OPENING] has been posted ✅\n"
                 if posted else "Tap the message above to copy it.\n"
             )
-            has_roster = q1(
-                "SELECT 1 FROM days WHERE the_date=?", (open_row["the_date"],)
-            )
+            has_roster = day_row_for(open_row["the_date"])
             if not match and has_roster:
                 note += "⚠️ That block isn't on today's roster, so it's flagged.\n"
             note += "Send /clockout when you finish."
@@ -2438,12 +2465,13 @@ async def cmd_clockin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     override = " ".join(context.args).strip() if context.args else ""
     if override:
         # Covering a shift, or clocking in for a block they aren't rostered on.
+        _d = day_row_for(when.date().isoformat())
         slot = q1(
             """SELECT s.id, s.label, s.start_min, d.name AS day_name
                FROM slots s JOIN days d ON d.id = s.day_id
-               WHERE d.the_date=? AND lower(s.label)=lower(?)""",
-            (when.date().isoformat(), override),
-        )
+               WHERE d.id=? AND lower(s.label)=lower(?)""",
+            (_d["id"], override),
+        ) if _d else None
         slot_text = slot["label"] if slot else override
     else:
         slot = current_slot_for(user.id, when)
@@ -2466,11 +2494,11 @@ async def cmd_clockin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "ORDER BY id DESC LIMIT 1",
             (user.id,),
         )
+        today_row = day_row_for(when.date().isoformat())
         today_slots = q(
-            """SELECT s.id, s.label FROM slots s JOIN days d ON d.id = s.day_id
-               WHERE d.the_date=? ORDER BY s.idx""",
-            (when.date().isoformat(),),
-        )
+            "SELECT id, label FROM slots WHERE day_id=? ORDER BY idx",
+            (today_row["id"],),
+        ) if today_row else []
         rows, row = [], []
         for sl in today_slots:
             row.append(
@@ -2526,9 +2554,7 @@ async def cmd_clockin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         note += "Send /clockout when you finish."
         await update.message.reply_text(note, parse_mode=constants.ParseMode.HTML)
     elif override:
-        has_roster = q1(
-            "SELECT 1 FROM days WHERE the_date=?", (when.date().isoformat(),)
-        )
+        has_roster = day_row_for(when.date().isoformat())
         note = (
             f"⏱ Clocked in at <b>{when.strftime('%H:%M')}</b>\n"
             f"Shift: {esc(override)}\n"
@@ -2605,6 +2631,245 @@ async def on_clockin_slot(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         f"{tail}\nSend /clockout when you finish.",
         parse_mode=constants.ParseMode.HTML,
     )
+
+
+async def cmd_dropshift(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Ask to be taken off a shift you can no longer work."""
+    if update.effective_chat.type != constants.ChatType.PRIVATE:
+        await update.message.reply_text("Message me directly for that 🙂")
+        return ConversationHandler.END
+    if not await gate(update):
+        return ConversationHandler.END
+
+    user = update.effective_user
+    w = open_week() or latest_week()
+    if not w:
+        await update.message.reply_text("No week has been posted yet.")
+        return ConversationHandler.END
+
+    today = now().date().isoformat()
+    mine = q(
+        """SELECT s.id, s.label, d.name AS day_name, d.the_date
+           FROM signups su JOIN slots s ON s.id = su.slot_id
+           JOIN days d ON d.id = s.day_id
+           WHERE d.week_id=? AND su.user_id=? AND d.the_date >= ?
+           ORDER BY d.idx, s.idx""",
+        (w["id"], user.id, today),
+    )
+    if not mine:
+        await update.message.reply_text(
+            "You have no upcoming shifts this week."
+        )
+        return ConversationHandler.END
+
+    pending = {
+        r["slot_id"] for r in q(
+            "SELECT slot_id FROM drop_requests WHERE agent_id=? AND status='pending'",
+            (user.id,),
+        )
+    }
+    rows = []
+    for m in mine:
+        if m["id"] in pending:
+            continue
+        rows.append([InlineKeyboardButton(
+            f"{m['day_name']} {m['label']}", callback_data=f"ds:{m['id']}"
+        )])
+    if not rows:
+        await update.message.reply_text(
+            "You've already asked to drop all of your upcoming shifts. "
+            "Your manager will get back to you."
+        )
+        return ConversationHandler.END
+
+    rows.append([InlineKeyboardButton("Cancel", callback_data="ds:cancel")])
+    await update.message.reply_text(
+        "<b>Which shift can't you work?</b>\n\n"
+        "<i>Your manager has to approve it, so don't assume you're off "
+        "until they do.</i>",
+        parse_mode=constants.ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+    return DROP_PICK
+
+
+async def on_drop_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    raw = query.data.split(":", 1)[1]
+    await query.answer()
+    if raw == "cancel":
+        await query.edit_message_text("No problem — nothing changed.")
+        return ConversationHandler.END
+
+    slot = q1(
+        """SELECT s.id, s.label, d.name AS day_name FROM slots s
+           JOIN days d ON d.id = s.day_id WHERE s.id=?""",
+        (int(raw),),
+    )
+    if not slot:
+        await query.edit_message_text("That shift no longer exists.")
+        return ConversationHandler.END
+
+    context.user_data["drop_slot"] = slot["id"]
+    await query.edit_message_text(
+        f"<b>{slot['day_name']} {esc(slot['label'])}</b>\n\n"
+        "Why can't you work it? A short reason is fine — your manager sees this.",
+        parse_mode=constants.ParseMode.HTML,
+    )
+    return DROP_REASON
+
+
+async def got_drop_reason(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    slot_id = context.user_data.pop("drop_slot", None)
+    if not slot_id:
+        await update.message.reply_text("That request expired — send /dropshift again.")
+        return ConversationHandler.END
+
+    reason = " ".join(update.message.text.split()).strip()
+    if len(reason) < 3:
+        await update.message.reply_text("Give a little more detail than that.")
+        context.user_data["drop_slot"] = slot_id
+        return DROP_REASON
+
+    slot = q1(
+        """SELECT s.id, s.label, d.name AS day_name, d.the_date FROM slots s
+           JOIN days d ON d.id = s.day_id WHERE s.id=?""",
+        (slot_id,),
+    )
+    async with write_lock:
+        cur = run(
+            "INSERT INTO drop_requests (agent_id, slot_id, reason, requested_at) "
+            "VALUES (?,?,?,?)",
+            (user.id, slot_id, reason, now().isoformat()),
+        )
+        req_id = cur.lastrowid
+
+    nm = display_name_of(user.id, user.full_name)
+    await update.message.reply_text(
+        "✅ Sent to your manager.\n\n"
+        f"<b>{slot['day_name']} {esc(slot['label'])}</b>\n"
+        f"<i>{esc(reason)}</i>\n\n"
+        "You're still on the shift until they approve it.",
+        parse_mode=constants.ParseMode.HTML,
+    )
+
+    text = (
+        "🙋 <b>Shift drop request</b>\n\n"
+        f"<b>{esc(nm)}</b> can't work "
+        f"<b>{slot['day_name']} {esc(slot['label'])}</b>\n"
+        f"<i>{esc(reason)}</i>"
+    )
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Approve", callback_data=f"dq:a:{req_id}"),
+        InlineKeyboardButton("🚫 Decline", callback_data=f"dq:d:{req_id}"),
+    ]])
+    for aid in admin_ids():
+        try:
+            await context.bot.send_message(
+                aid, text, reply_markup=kb, parse_mode=constants.ParseMode.HTML
+            )
+        except Exception as e:
+            log.info("Couldn't notify admin %s about a drop request: %s", aid, e)
+    return ConversationHandler.END
+
+
+async def on_drop_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    _, action, raw = query.data.split(":")
+    if not is_admin(query.from_user.id):
+        await query.answer("Only admins can decide this.", show_alert=True)
+        return
+
+    req = q1("SELECT * FROM drop_requests WHERE id=?", (int(raw),))
+    if not req:
+        await query.answer("That request has gone.", show_alert=True)
+        return
+    if req["status"] != "pending":
+        await query.answer(f"Already {req['status']}.", show_alert=True)
+        return
+
+    slot = q1(
+        """SELECT s.id, s.label, d.id AS day_id, d.name AS day_name, d.week_id
+           FROM slots s JOIN days d ON d.id = s.day_id WHERE s.id=?""",
+        (req["slot_id"],),
+    )
+    nm = display_name_of(req["agent_id"], str(req["agent_id"]))
+    approve = action == "a"
+
+    async with write_lock:
+        run(
+            "UPDATE drop_requests SET status=?, decided_by=?, decided_at=? WHERE id=?",
+            ("approved" if approve else "declined",
+             query.from_user.id, now().isoformat(), req["id"]),
+        )
+        if approve and slot:
+            run(
+                "DELETE FROM signups WHERE slot_id=? AND user_id=?",
+                (slot["id"], req["agent_id"]),
+            )
+
+    verdict = "approved ✅" if approve else "declined 🚫"
+    await query.answer(f"{nm} {verdict}")
+    where = f"{slot['day_name']} {slot['label']}" if slot else "that shift"
+    try:
+        await query.edit_message_text(
+            f"🙋 <b>Shift drop request</b>\n\n"
+            f"<b>{esc(nm)}</b> — {esc(where)}\n"
+            f"<i>{esc(req['reason'] or '')}</i>\n\n"
+            f"{verdict} by {esc(display_name_of(query.from_user.id, 'admin'))}",
+            parse_mode=constants.ParseMode.HTML,
+        )
+    except BadRequest:
+        pass
+
+    try:
+        if approve:
+            await context.bot.send_message(
+                req["agent_id"],
+                f"✅ You've been taken off {where}.\n\n"
+                "It's open for someone else now. Check /myshifts.",
+            )
+        else:
+            await context.bot.send_message(
+                req["agent_id"],
+                f"Your request to drop {where} wasn't approved.\n\n"
+                "You're still on that shift — speak to your manager.",
+            )
+    except Exception:
+        pass
+
+    if approve and slot:
+        await refresh_group(context, slot["week_id"], slot["day_id"])
+
+
+async def cmd_dropreqs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Drop requests waiting on a decision."""
+    if not is_admin(update.effective_user.id):
+        return
+    rows = q(
+        "SELECT * FROM drop_requests WHERE status='pending' ORDER BY requested_at"
+    )
+    if not rows:
+        await update.message.reply_text("No shift drop requests waiting.")
+        return
+    await update.message.reply_text(f"{len(rows)} waiting:")
+    for r in rows:
+        slot = q1(
+            """SELECT s.label, d.name AS day_name FROM slots s
+               JOIN days d ON d.id = s.day_id WHERE s.id=?""",
+            (r["slot_id"],),
+        )
+        where = f"{slot['day_name']} {slot['label']}" if slot else "unknown shift"
+        nm = display_name_of(r["agent_id"], str(r["agent_id"]))
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ Approve", callback_data=f"dq:a:{r['id']}"),
+            InlineKeyboardButton("🚫 Decline", callback_data=f"dq:d:{r['id']}"),
+        ]])
+        await update.message.reply_text(
+            f"<b>{esc(nm)}</b> — {esc(where)}\n<i>{esc(r['reason'] or '')}</i>",
+            reply_markup=kb, parse_mode=constants.ParseMode.HTML,
+        )
 
 
 async def cmd_clockout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4066,6 +4331,70 @@ async def job_backup(context: ContextTypes.DEFAULT_TYPE) -> None:
     log.info("Backup sent to %d owner(s).", len(targets))
 
 
+async def cmd_tidy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Delete old closed weeks. The live week and all hours are untouched."""
+    if not is_owner(update.effective_user.id):
+        return
+
+    live = open_week()
+    old = q(
+        "SELECT * FROM weeks WHERE status='closed'"
+        + (" AND id <> ?" if live else "")
+        + " ORDER BY id",
+        (live["id"],) if live else (),
+    )
+    if not old:
+        await update.message.reply_text("No old weeks to clear.")
+        return
+
+    n_sign = q1(
+        """SELECT COUNT(*) c FROM signups su JOIN slots s ON s.id=su.slot_id
+           JOIN days d ON d.id=s.day_id WHERE d.week_id IN ({})""".format(
+            ",".join(str(w["id"]) for w in old)),
+    )["c"]
+
+    if not context.args or context.args[0] != "CONFIRM":
+        lines = [
+            f"This clears <b>{len(old)} closed week(s)</b> and their "
+            f"{n_sign} claim(s):",
+            "",
+        ]
+        lines += [f"  · {esc(w['label'])} ({w['start_date']})" for w in old[:10]]
+        if len(old) > 10:
+            lines.append(f"  · and {len(old) - 10} more")
+        lines += [
+            "",
+            "<b>Kept:</b> the live week, every clock-in record, agents, "
+            "rates and fixed rosters.",
+            "",
+            "To go ahead: <code>/tidy CONFIRM</code>",
+        ]
+        if live:
+            lines.append(f"\n<i>Live week {esc(live['label'])} is safe.</i>")
+        await update.message.reply_text(
+            "\n".join(lines), parse_mode=constants.ParseMode.HTML
+        )
+        return
+
+    ids = ",".join(str(w["id"]) for w in old)
+    async with write_lock:
+        run(f"""DELETE FROM signups WHERE slot_id IN
+                (SELECT s.id FROM slots s JOIN days d ON d.id=s.day_id
+                 WHERE d.week_id IN ({ids}))""")
+        run(f"DELETE FROM confirmations WHERE week_id IN ({ids})")
+        run(f"""DELETE FROM slots WHERE day_id IN
+                (SELECT id FROM days WHERE week_id IN ({ids}))""")
+        run(f"DELETE FROM days WHERE week_id IN ({ids})")
+        run(f"DELETE FROM weeks WHERE id IN ({ids})")
+
+    await update.message.reply_text(
+        f"✅ Cleared {len(old)} old week(s).\n"
+        "Clock-in records, agents, rates and fixed rosters all kept.",
+        parse_mode=constants.ParseMode.HTML,
+    )
+    log.info("Tidied %d old weeks", len(old))
+
+
 async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Clear test schedules and time entries. Keeps people and rates."""
     if not is_owner(update.effective_user.id):
@@ -4340,7 +4669,7 @@ def build_shift_call(for_date: date | None = None) -> tuple[str | None, str]:
     target = for_date or (now() + timedelta(days=1)).date()
     if not SHIFTCALL_CHAT_ID:
         return None, "No chat is set for the shift call."
-    day = q1("SELECT * FROM days WHERE the_date=?", (target.isoformat(),))
+    day = day_row_for(target.isoformat())
     if not day:
         return None, f"No posted week covers {target.isoformat()}."
 
@@ -4445,6 +4774,7 @@ AGENT_COMMANDS = [
     ("mytime", "My hours this month"),
     ("payslip", "My hours and pay"),
     ("myshifts", "What I'm signed up for"),
+    ("dropshift", "Ask to drop a shift"),
     ("support", "Who I list as support"),
     ("summary", "Show the current board"),
     ("help", "List commands"),
@@ -4474,6 +4804,7 @@ ADMIN_GROUPS = [
     ]),
     ("People", [
         ("pending", "Approve or decline access requests"),
+        ("dropreqs", "Shift drop requests waiting"),
         ("access", "Who approved or declined whom"),
         ("roster", "Who's on the list"),
         ("rename", "Fix someone's name on the schedule"),
@@ -4496,7 +4827,8 @@ OWNER_EXTRA = [
     ("export", "This week's board as CSV"),
     ("backup", "Download a copy of the data"),
     ("chatid", "Show this chat's ID"),
-    ("reset", "Clear schedules and hours"),
+    ("tidy", "Clear old closed weeks only"),
+    ("reset", "Clear EVERYTHING except people"),
 ]
 ADMIN_COMMANDS = AGENT_COMMANDS + [
     c for _, group in ADMIN_GROUPS for c in group
@@ -4909,6 +5241,20 @@ def main() -> None:
     app.add_handler(CommandHandler("roster", cmd_roster))
     app.add_handler(CommandHandler("export", cmd_export))
     app.add_handler(CommandHandler("clockin", cmd_clockin))
+    app.add_handler(
+        ConversationHandler(
+            entry_points=[CommandHandler("dropshift", cmd_dropshift)],
+            states={
+                DROP_PICK: [CallbackQueryHandler(on_drop_pick, pattern=r"^ds:")],
+                DROP_REASON: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, got_drop_reason)
+                ],
+            },
+            fallbacks=[CommandHandler("cancel", cancel)],
+        )
+    )
+    app.add_handler(CommandHandler("dropreqs", cmd_dropreqs))
+    app.add_handler(CallbackQueryHandler(on_drop_decision, pattern=r"^dq:[ad]:\d+$"))
     app.add_handler(CommandHandler("clockout", cmd_clockout))
     app.add_handler(CommandHandler("mytime", cmd_mytime))
     app.add_handler(CommandHandler("support", cmd_support))
@@ -4921,6 +5267,7 @@ def main() -> None:
     app.add_handler(CommandHandler("fixtime", cmd_fixtime))
     app.add_handler(CommandHandler("backup", cmd_backup))
     app.add_handler(CommandHandler("reset", cmd_reset))
+    app.add_handler(CommandHandler("tidy", cmd_tidy))
     app.add_handler(CommandHandler("removeagent", cmd_removeagent))
     app.add_handler(CommandHandler("avails", cmd_avails))
     app.add_handler(CommandHandler("tag", cmd_tag))
