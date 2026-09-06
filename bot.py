@@ -105,6 +105,15 @@ SHIFT_REMINDER_HOUR = env_int("SHIFT_REMINDER_HOUR", 20)
 SHIFT_CALL_TIME = os.environ.get("SHIFT_CALL_TIME", "").strip() or "18:30"
 # Time of day the avails reminders go out, so nobody gets pinged at midnight.
 NUDGE_TIME = os.environ.get("NUDGE_TIME", "").strip() or "11:59"
+# Suggested deadline time when you post a week. 23:59 means the closing notice
+# lands at midnight, so a daytime value keeps every message in waking hours.
+DEADLINE_TIME = os.environ.get("DEADLINE_TIME", "").strip() or "23:59"
+# Final call on the deadline day, well before it closes.
+LAST_CALL_TIME = os.environ.get("LAST_CALL_TIME", "").strip() or "20:00"
+# Don't announce a closure in the middle of the night — the board still closes,
+# it just doesn't ping anyone until morning.
+QUIET_FROM = env_int("QUIET_FROM", 22)
+QUIET_UNTIL = env_int("QUIET_UNTIL", 8)
 # Personal DMs the evening before. Off by default so nobody is pinged twice.
 DM_REMINDERS = os.environ.get("DM_REMINDERS", "").strip().lower() in {"1", "true", "yes", "on"}
 
@@ -255,6 +264,7 @@ CREATE TABLE IF NOT EXISTS fixed_slots (
 );
 CREATE TABLE IF NOT EXISTS drop_requests (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    kind         TEXT NOT NULL DEFAULT 'drop',
     agent_id     INTEGER NOT NULL,
     slot_id      INTEGER NOT NULL,
     reason       TEXT,
@@ -324,6 +334,9 @@ db.commit()
 _slot_cols = {r[1] for r in db.execute("PRAGMA table_info(slots)")}
 if "capacity" not in _slot_cols:
     db.execute("ALTER TABLE slots ADD COLUMN capacity INTEGER")
+_dr_cols = {r[1] for r in db.execute("PRAGMA table_info(drop_requests)")}
+if "kind" not in _dr_cols:
+    db.execute("ALTER TABLE drop_requests ADD COLUMN kind TEXT NOT NULL DEFAULT 'drop'")
 _te_cols = {r[1] for r in db.execute("PRAGMA table_info(time_entries)")}
 for _c, _d in (("shift_label", "TEXT"),
                ("opening_posted", "INTEGER NOT NULL DEFAULT 0")):
@@ -1207,8 +1220,12 @@ async def got_slots(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def ask_deadline(send, draft) -> int:
     """Step 5, reached either by typing timings or tapping them."""
+    try:
+        _dm = parse_time_token(DEADLINE_TIME)
+    except ValueError:
+        _dm = 23 * 60 + 59
     default_deadline = datetime.combine(
-        draft["monday"] - timedelta(days=1), time(23, 59), TZ
+        draft["monday"] - timedelta(days=1), time(_dm // 60, _dm % 60), TZ
     )
     draft["default_deadline"] = default_deadline
     total = sum(len(v) for v in draft["slots"].values())
@@ -2148,6 +2165,7 @@ async def cmd_savepreset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 ASK_NAME = 100
 DROP_PICK, DROP_REASON = 200, 201
+PICKUP_PICK, PICKUP_REASON = 210, 211
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2800,6 +2818,147 @@ async def got_drop_reason(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     return ConversationHandler.END
 
 
+async def cmd_pickup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Ask to take an open shift, including after the deadline."""
+    if update.effective_chat.type != constants.ChatType.PRIVATE:
+        await update.message.reply_text("Message me directly for that 🙂")
+        return ConversationHandler.END
+    if not await gate(update):
+        return ConversationHandler.END
+
+    user = update.effective_user
+    w = open_week() or latest_week()
+    if not w:
+        await update.message.reply_text("No week has been posted yet.")
+        return ConversationHandler.END
+
+    today = now().date().isoformat()
+    slots = q(
+        """SELECT s.id, s.label, s.capacity, d.name AS day_name
+           FROM slots s JOIN days d ON d.id = s.day_id
+           WHERE d.week_id=? AND d.the_date >= ?
+           ORDER BY d.idx, s.idx""",
+        (w["id"], today),
+    )
+    pending = {
+        r["slot_id"] for r in q(
+            "SELECT slot_id FROM drop_requests "
+            "WHERE agent_id=? AND kind='pickup' AND status='pending'",
+            (user.id,),
+        )
+    }
+
+    rows = []
+    for sl in slots:
+        holders = slot_holders(sl["id"])
+        if any(h["user_id"] == user.id for h in holders):
+            continue
+        if len(holders) >= (sl["capacity"] or SLOT_CAPACITY):
+            continue
+        if sl["id"] in pending:
+            continue
+        rows.append([InlineKeyboardButton(
+            f"{sl['day_name']} {sl['label']}", callback_data=f"pu:{sl['id']}"
+        )])
+
+    if not rows:
+        await update.message.reply_text(
+            "Nothing open at the moment — every upcoming slot is taken, "
+            "or you've already asked for the ones that are free."
+        )
+        return ConversationHandler.END
+
+    rows.append([InlineKeyboardButton("Cancel", callback_data="pu:cancel")])
+    await update.message.reply_text(
+        "<b>Which shift would you like to take?</b>\n\n"
+        "<i>Your manager has to approve it, so don't count on it "
+        "until they do.</i>",
+        parse_mode=constants.ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+    return PICKUP_PICK
+
+
+async def on_pickup_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    raw = query.data.split(":", 1)[1]
+    await query.answer()
+    if raw == "cancel":
+        await query.edit_message_text("No problem — nothing changed.")
+        return ConversationHandler.END
+
+    slot = q1(
+        """SELECT s.id, s.label, d.name AS day_name FROM slots s
+           JOIN days d ON d.id = s.day_id WHERE s.id=?""",
+        (int(raw),),
+    )
+    if not slot:
+        await query.edit_message_text("That shift no longer exists.")
+        return ConversationHandler.END
+
+    context.user_data["pickup_slot"] = slot["id"]
+    await query.edit_message_text(
+        f"<b>{slot['day_name']} {esc(slot['label'])}</b>\n\n"
+        "Anything your manager should know? Send a short note, "
+        "or just say <code>-</code>.",
+        parse_mode=constants.ParseMode.HTML,
+    )
+    return PICKUP_REASON
+
+
+async def got_pickup_reason(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    slot_id = context.user_data.pop("pickup_slot", None)
+    if not slot_id:
+        await update.message.reply_text("That request expired — send /pickup again.")
+        return ConversationHandler.END
+
+    note = " ".join(update.message.text.split()).strip()
+    if note == "-":
+        note = ""
+
+    slot = q1(
+        """SELECT s.id, s.label, d.name AS day_name FROM slots s
+           JOIN days d ON d.id = s.day_id WHERE s.id=?""",
+        (slot_id,),
+    )
+    async with write_lock:
+        cur = run(
+            "INSERT INTO drop_requests (kind, agent_id, slot_id, reason, requested_at) "
+            "VALUES ('pickup',?,?,?,?)",
+            (user.id, slot_id, note, now().isoformat()),
+        )
+        req_id = cur.lastrowid
+
+    nm = display_name_of(user.id, user.full_name)
+    await update.message.reply_text(
+        "✅ Sent to your manager.\n\n"
+        f"<b>{slot['day_name']} {esc(slot['label'])}</b>\n\n"
+        "You're not on it until they approve.",
+        parse_mode=constants.ParseMode.HTML,
+    )
+
+    text = (
+        "🙌 <b>Shift pickup request</b>\n\n"
+        f"<b>{esc(nm)}</b> would like to take "
+        f"<b>{slot['day_name']} {esc(slot['label'])}</b>"
+    )
+    if note:
+        text += f"\n<i>{esc(note)}</i>"
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Approve", callback_data=f"dq:a:{req_id}"),
+        InlineKeyboardButton("🚫 Decline", callback_data=f"dq:d:{req_id}"),
+    ]])
+    for aid in admin_ids():
+        try:
+            await context.bot.send_message(
+                aid, text, reply_markup=kb, parse_mode=constants.ParseMode.HTML
+            )
+        except Exception as e:
+            log.info("Couldn't notify admin %s about a pickup: %s", aid, e)
+    return ConversationHandler.END
+
+
 async def on_drop_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     _, action, raw = query.data.split(":")
@@ -2822,6 +2981,8 @@ async def on_drop_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
     nm = display_name_of(req["agent_id"], str(req["agent_id"]))
     approve = action == "a"
+    is_pickup = req["kind"] == "pickup"
+    where = f"{slot['day_name']} {slot['label']}" if slot else "that shift"
 
     async with write_lock:
         run(
@@ -2830,38 +2991,46 @@ async def on_drop_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -
              query.from_user.id, now().isoformat(), req["id"]),
         )
         if approve and slot:
-            run(
-                "DELETE FROM signups WHERE slot_id=? AND user_id=?",
-                (slot["id"], req["agent_id"]),
-            )
+            if is_pickup:
+                run(
+                    "INSERT OR IGNORE INTO signups (slot_id, user_id, name, ts) "
+                    "VALUES (?,?,?,?)",
+                    (slot["id"], req["agent_id"], nm, now().isoformat()),
+                )
+            else:
+                run(
+                    "DELETE FROM signups WHERE slot_id=? AND user_id=?",
+                    (slot["id"], req["agent_id"]),
+                )
 
     verdict = "approved ✅" if approve else "declined 🚫"
     await query.answer(f"{nm} {verdict}")
-    where = f"{slot['day_name']} {slot['label']}" if slot else "that shift"
+    title = "Shift pickup request" if is_pickup else "Shift drop request"
+    icon = "🙌" if is_pickup else "🙋"
     try:
         await query.edit_message_text(
-            f"🙋 <b>Shift drop request</b>\n\n"
+            f"{icon} <b>{title}</b>\n\n"
             f"<b>{esc(nm)}</b> — {esc(where)}\n"
-            f"<i>{esc(req['reason'] or '')}</i>\n\n"
-            f"{verdict} by {esc(display_name_of(query.from_user.id, 'admin'))}",
+            + (f"<i>{esc(req['reason'])}</i>\n" if req["reason"] else "")
+            + f"\n{verdict} by {esc(display_name_of(query.from_user.id, 'admin'))}",
             parse_mode=constants.ParseMode.HTML,
         )
     except BadRequest:
         pass
 
     try:
-        if approve:
-            await context.bot.send_message(
-                req["agent_id"],
-                f"✅ You've been taken off {where}.\n\n"
-                "It's open for someone else now. Check /myshifts.",
-            )
+        if approve and is_pickup:
+            msg = (f"✅ You're on {where}.\n\nCheck /myshifts.")
+        elif approve:
+            msg = (f"✅ You've been taken off {where}.\n\n"
+                   "It's open for someone else now. Check /myshifts.")
+        elif is_pickup:
+            msg = (f"Your request to take {where} wasn't approved.\n\n"
+                   "Speak to your manager if you'd still like it.")
         else:
-            await context.bot.send_message(
-                req["agent_id"],
-                f"Your request to drop {where} wasn't approved.\n\n"
-                "You're still on that shift — speak to your manager.",
-            )
+            msg = (f"Your request to drop {where} wasn't approved.\n\n"
+                   "You're still on that shift — speak to your manager.")
+        await context.bot.send_message(req["agent_id"], msg)
     except Exception:
         pass
 
@@ -2870,7 +3039,7 @@ async def on_drop_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 
 async def cmd_dropreqs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Drop requests waiting on a decision."""
+    """Shift requests waiting on a decision — both drops and pickups."""
     if not is_admin(update.effective_user.id):
         return
     rows = q(
@@ -2892,8 +3061,10 @@ async def cmd_dropreqs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             InlineKeyboardButton("✅ Approve", callback_data=f"dq:a:{r['id']}"),
             InlineKeyboardButton("🚫 Decline", callback_data=f"dq:d:{r['id']}"),
         ]])
+        icon = "🙌 wants" if r["kind"] == "pickup" else "🙋 can't work"
         await update.message.reply_text(
-            f"<b>{esc(nm)}</b> — {esc(where)}\n<i>{esc(r['reason'] or '')}</i>",
+            f"{icon} — <b>{esc(nm)}</b>, {esc(where)}\n"
+            + (f"<i>{esc(r['reason'])}</i>" if r["reason"] else ""),
             reply_markup=kb, parse_mode=constants.ParseMode.HTML,
         )
 
@@ -4602,6 +4773,12 @@ async def close_week(context: ContextTypes.DEFAULT_TYPE, week_id: int) -> None:
             await refresh_day(context, d["id"])
         await refresh_header(context, week_id)
 
+    hour = now().hour
+    quiet = (hour >= QUIET_FROM or hour < QUIET_UNTIL)
+    if quiet:
+        log.info("Week %s closed quietly at %02d:00", week_id, hour)
+        return
+
     st = week_stats(week_id)
     msg = [f"🔒 <b>{w['label']} submissions are closed.</b>"]
     if st["gaps"]:
@@ -4779,12 +4956,20 @@ def schedule_week_jobs(app: Application, week_id: int) -> None:
         nm = 11 * 60 + 59
     nudge_at = time(nm // 60, nm % 60)
 
-    for days_before, prefix, name in [
-        (2, "Reminder", f"nudge1-{week_id}"),
-        (0, "Last call", f"nudge2-{week_id}"),
-    ]:
-        when = datetime.combine(dl.date() - timedelta(days=days_before), nudge_at, TZ)
-        if when > now() and when < dl:
+    try:
+        lc = parse_time_token(LAST_CALL_TIME)
+    except ValueError:
+        lc = 20 * 60
+    last_call_at = time(lc // 60, lc % 60)
+
+    plan = [
+        (datetime.combine(dl.date() - timedelta(days=2), nudge_at, TZ),
+         "Reminder", f"nudge1-{week_id}"),
+        (datetime.combine(dl.date(), last_call_at, TZ),
+         "Last call", f"nudge2-{week_id}"),
+    ]
+    for when, prefix, name in plan:
+        if now() < when < dl:
             jq.run_once(
                 job_nudge, when, name=name, data={"week_id": week_id, "prefix": prefix}
             )
@@ -4801,6 +4986,7 @@ AGENT_COMMANDS = [
     ("payslip", "My hours and pay"),
     ("myshifts", "What I'm signed up for"),
     ("dropshift", "Ask to drop a shift"),
+    ("pickup", "Ask to take an open shift"),
     ("support", "Who I list as support"),
     ("summary", "Show the current board"),
     ("help", "List commands"),
@@ -4830,7 +5016,7 @@ ADMIN_GROUPS = [
     ]),
     ("People", [
         ("pending", "Approve or decline access requests"),
-        ("dropreqs", "Shift drop requests waiting"),
+        ("dropreqs", "Shift requests waiting"),
         ("access", "Who approved or declined whom"),
         ("roster", "Who's on the list"),
         ("rename", "Fix someone's name on the schedule"),
@@ -5274,6 +5460,18 @@ def main() -> None:
                 DROP_PICK: [CallbackQueryHandler(on_drop_pick, pattern=r"^ds:")],
                 DROP_REASON: [
                     MessageHandler(filters.TEXT & ~filters.COMMAND, got_drop_reason)
+                ],
+            },
+            fallbacks=[CommandHandler("cancel", cancel)],
+        )
+    )
+    app.add_handler(
+        ConversationHandler(
+            entry_points=[CommandHandler("pickup", cmd_pickup)],
+            states={
+                PICKUP_PICK: [CallbackQueryHandler(on_pickup_pick, pattern=r"^pu:")],
+                PICKUP_REASON: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, got_pickup_reason)
                 ],
             },
             fallbacks=[CommandHandler("cancel", cancel)],
