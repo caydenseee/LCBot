@@ -2009,22 +2009,48 @@ async def on_plan_quick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 async def cmd_shiftcall(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Post the on-duty tag list now, instead of waiting for the scheduled time."""
+    """Post the on-duty tags now, or preview them without posting."""
     if not is_admin(update.effective_user.id):
         return
+
+    args = [a.lower() for a in context.args]
+    preview = "preview" in args or "test" in args
     target = None
-    if context.args:
+    for a in context.args:
+        if a.lower() in ("preview", "test"):
+            continue
         try:
-            target = date.fromisoformat(context.args[0])
+            target = date.fromisoformat(a)
         except ValueError:
-            await update.message.reply_text("Usage: /shiftcall or /shiftcall 2026-08-25")
+            await update.message.reply_text(
+                "Usage:\n"
+                "<code>/shiftcall preview</code> — show it here, post nothing\n"
+                "<code>/shiftcall</code> — post it to the group\n"
+                "<code>/shiftcall 2026-09-08</code> — a specific day",
+                parse_mode=constants.ParseMode.HTML,
+            )
             return
+
     text, reason = build_shift_call(target)
     if not text:
         await update.message.reply_text(f"Nothing to post — {reason}")
         return
+
+    if preview:
+        # Mentions are shown as plain text so nobody is notified.
+        shown = re.sub(r'<a href="tg://user\?id=\d+">([^<]*)</a>', r"\1", text)
+        shown = shown.replace("@", "＠")
+        await update.message.reply_text(
+            "<b>Preview — nothing has been posted</b>\n"
+            "<i>Handles shown as plain text so nobody is pinged.</i>\n\n"
+            + shown + "\n\n<i>Send /shiftcall to post it for real.</i>",
+            parse_mode=constants.ParseMode.HTML,
+        )
+        return
+
     await send_group(
         context.bot, text, thread=SHIFTCALL_THREAD_ID,
+        chat_id=SHIFTCALL_CHAT_ID,
         parse_mode=constants.ParseMode.HTML,
     )
     await update.message.reply_text("Posted to the group ✅")
@@ -4791,7 +4817,7 @@ ADMIN_GROUPS = [
         ("gaps", "Unfilled slots"),
         ("remind", "Nudge whoever hasn't confirmed"),
         ("closeweek", "Close submissions early"),
-        ("shiftcall", "Post tomorrow's on-duty tags now"),
+        ("shiftcall", "On-duty tags — add 'preview' to test"),
         ("presets", "Saved timing patterns"),
         ("savepreset", "Save this week's timings for reuse"),
     ]),
