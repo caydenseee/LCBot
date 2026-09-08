@@ -337,6 +337,8 @@ if "capacity" not in _slot_cols:
 _dr_cols = {r[1] for r in db.execute("PRAGMA table_info(drop_requests)")}
 if "kind" not in _dr_cols:
     db.execute("ALTER TABLE drop_requests ADD COLUMN kind TEXT NOT NULL DEFAULT 'drop'")
+if "notified" not in _dr_cols:
+    db.execute("ALTER TABLE drop_requests ADD COLUMN notified TEXT")
 _te_cols = {r[1] for r in db.execute("PRAGMA table_info(time_entries)")}
 for _c, _d in (("shift_label", "TEXT"),
                ("opening_posted", "INTEGER NOT NULL DEFAULT 0")):
@@ -350,6 +352,7 @@ if "role" not in _cols:
 for _col, _ddl in [
     ("status", "TEXT NOT NULL DEFAULT 'active'"),
     ("display_name", "TEXT"),
+    ("req_msgs", "TEXT"),
     ("support_name", "TEXT"),
     ("on_avails", "INTEGER NOT NULL DEFAULT 1"),
     ("tag_calls", "INTEGER NOT NULL DEFAULT 1"),
@@ -441,6 +444,32 @@ async def post_ops(bot, text: str) -> bool:
     except Exception as e:
         log.warning("Couldn't post to the ops group: %s", e)
         return False
+
+
+async def notify_admins(bot, text: str, kb=None) -> list:
+    """Message every admin, and remember where, so a decision can update them all."""
+    sent = []
+    for aid in admin_ids():
+        try:
+            m = await bot.send_message(
+                aid, text, reply_markup=kb, parse_mode=constants.ParseMode.HTML
+            )
+            sent.append([aid, m.message_id])
+        except Exception as e:
+            log.info("Couldn't notify admin %s: %s", aid, e)
+    return sent
+
+
+async def settle_admin_messages(bot, sent, text: str) -> None:
+    """Replace the buttons everywhere with the outcome."""
+    for chat_id, msg_id in sent or []:
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id, message_id=msg_id, text=text,
+                parse_mode=constants.ParseMode.HTML,
+            )
+        except Exception:
+            pass
 
 
 async def send_group(bot, text: str, thread: int | None = -1,
@@ -2258,13 +2287,11 @@ async def got_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             ]
         ]
     )
-    for aid in admin_ids():
-        try:
-            await context.bot.send_message(
-                aid, text, reply_markup=kb, parse_mode=constants.ParseMode.HTML
-            )
-        except Exception as e:
-            log.info("Couldn't notify admin %s: %s", aid, e)
+    sent = await notify_admins(context.bot, text, kb)
+    run("UPDATE agents SET req_msgs=? WHERE user_id=?",
+        (json.dumps(sent), user.id))
+    if not sent:
+        log.warning("Access request from %s but no admin could be reached.", user.id)
     return ConversationHandler.END
 
 
@@ -2337,14 +2364,23 @@ async def on_access_decision(update: Update, context: ContextTypes.DEFAULT_TYPE)
     shown = row["display_name"] or row["name"]
     verdict = "approved ✅" if approve else "declined 🚫"
     await query.answer(f"{shown} {verdict}")
+    settled = (
+        f"🔔 <b>Access request</b>\n\n<b>{esc(shown)}</b>\n\n"
+        f"{verdict} by {esc(decider.full_name)}"
+    )
     try:
-        await query.edit_message_text(
-            f"🔔 <b>Access request</b>\n\n<b>{esc(shown)}</b>\n\n"
-            f"{verdict} by {esc(decider.full_name)}",
-            parse_mode=constants.ParseMode.HTML,
-        )
-    except BadRequest:
-        pass
+        sent = json.loads(row["req_msgs"] or "[]")
+    except (json.JSONDecodeError, TypeError):
+        sent = []
+    if sent:
+        await settle_admin_messages(context.bot, sent, settled)
+    else:
+        try:
+            await query.edit_message_text(
+                settled, parse_mode=constants.ParseMode.HTML
+            )
+        except BadRequest:
+            pass
 
     try:
         if approve:
@@ -2808,13 +2844,9 @@ async def got_drop_reason(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         InlineKeyboardButton("✅ Approve", callback_data=f"dq:a:{req_id}"),
         InlineKeyboardButton("🚫 Decline", callback_data=f"dq:d:{req_id}"),
     ]])
-    for aid in admin_ids():
-        try:
-            await context.bot.send_message(
-                aid, text, reply_markup=kb, parse_mode=constants.ParseMode.HTML
-            )
-        except Exception as e:
-            log.info("Couldn't notify admin %s about a drop request: %s", aid, e)
+    sent = await notify_admins(context.bot, text, kb)
+    run("UPDATE drop_requests SET notified=? WHERE id=?",
+        (json.dumps(sent), req_id))
     return ConversationHandler.END
 
 
@@ -2949,13 +2981,9 @@ async def got_pickup_reason(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         InlineKeyboardButton("✅ Approve", callback_data=f"dq:a:{req_id}"),
         InlineKeyboardButton("🚫 Decline", callback_data=f"dq:d:{req_id}"),
     ]])
-    for aid in admin_ids():
-        try:
-            await context.bot.send_message(
-                aid, text, reply_markup=kb, parse_mode=constants.ParseMode.HTML
-            )
-        except Exception as e:
-            log.info("Couldn't notify admin %s about a pickup: %s", aid, e)
+    sent = await notify_admins(context.bot, text, kb)
+    run("UPDATE drop_requests SET notified=? WHERE id=?",
+        (json.dumps(sent), req_id))
     return ConversationHandler.END
 
 
@@ -3007,16 +3035,25 @@ async def on_drop_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await query.answer(f"{nm} {verdict}")
     title = "Shift pickup request" if is_pickup else "Shift drop request"
     icon = "🙌" if is_pickup else "🙋"
+    settled = (
+        f"{icon} <b>{title}</b>\n\n"
+        f"<b>{esc(nm)}</b> — {esc(where)}\n"
+        + (f"<i>{esc(req['reason'])}</i>\n" if req["reason"] else "")
+        + f"\n{verdict} by {esc(display_name_of(query.from_user.id, 'admin'))}"
+    )
     try:
-        await query.edit_message_text(
-            f"{icon} <b>{title}</b>\n\n"
-            f"<b>{esc(nm)}</b> — {esc(where)}\n"
-            + (f"<i>{esc(req['reason'])}</i>\n" if req["reason"] else "")
-            + f"\n{verdict} by {esc(display_name_of(query.from_user.id, 'admin'))}",
-            parse_mode=constants.ParseMode.HTML,
-        )
-    except BadRequest:
-        pass
+        sent = json.loads(req["notified"] or "[]")
+    except (json.JSONDecodeError, TypeError):
+        sent = []
+    if sent:
+        await settle_admin_messages(context.bot, sent, settled)
+    else:
+        try:
+            await query.edit_message_text(
+                settled, parse_mode=constants.ParseMode.HTML
+            )
+        except BadRequest:
+            pass
 
     try:
         if approve and is_pickup:
