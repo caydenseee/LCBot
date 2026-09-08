@@ -753,7 +753,30 @@ def open_week() -> sqlite3.Row | None:
 
 
 def latest_week() -> sqlite3.Row | None:
-    return q1("SELECT * FROM weeks ORDER BY id DESC LIMIT 1")
+    """The week we're actually in.
+
+    Prefer the open one, then whichever covers today, then the one starting
+    soonest, and only fall back to newest-created. Picking purely by id means a
+    stray test week posted later hides the week everyone is working.
+    """
+    today = now().date().isoformat()
+    row = q1("SELECT * FROM weeks WHERE status='open' ORDER BY id DESC LIMIT 1")
+    if row:
+        return row
+    row = q1(
+        "SELECT * FROM weeks WHERE ? BETWEEN start_date AND end_date "
+        "ORDER BY id DESC LIMIT 1",
+        (today,),
+    )
+    if row:
+        return row
+    row = q1(
+        "SELECT * FROM weeks WHERE start_date >= ? ORDER BY start_date LIMIT 1",
+        (today,),
+    )
+    if row:
+        return row
+    return q1("SELECT * FROM weeks ORDER BY end_date DESC, id DESC LIMIT 1")
 
 
 def touch_agent(user, dm_ok: int | None = None) -> None:
@@ -2328,7 +2351,7 @@ async def cmd_rename(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         f"Renamed to <b>{esc(new_name)}</b> on the schedule.",
         parse_mode=constants.ParseMode.HTML,
     )
-    w = open_week()
+    w = open_week() or latest_week()
     if w:
         await refresh_group(context, w["id"])
 
@@ -3602,9 +3625,9 @@ async def cmd_dropslot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     """/dropslot @handle MON 10am-12pm — free one slot without touching anything else."""
     if not is_admin(update.effective_user.id):
         return
-    w = open_week()
+    w = open_week() or latest_week()
     if not w:
-        await update.message.reply_text("No week is open.")
+        await update.message.reply_text("No week has been posted yet.")
         return
 
     if len(context.args) < 3:
@@ -3735,9 +3758,9 @@ async def cmd_applyfixed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     """Fill fixed rosters into the week that's already posted."""
     if not is_admin(update.effective_user.id):
         return
-    w = open_week()
+    w = open_week() or latest_week()
     if not w:
-        await update.message.reply_text("No week is open.")
+        await update.message.reply_text("No week has been posted yet.")
         return
     async with write_lock:
         filled = apply_fixed_slots(w["id"])
@@ -3759,9 +3782,9 @@ async def cmd_capacity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     """/capacity 10am-12pm 2 — how many agents a slot takes this week."""
     if not is_admin(update.effective_user.id):
         return
-    w = open_week()
+    w = open_week() or latest_week()
     if not w:
-        await update.message.reply_text("No week is open.")
+        await update.message.reply_text("No week has been posted yet.")
         return
 
     if not context.args:
@@ -4068,7 +4091,7 @@ async def cmd_avails(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                "but they keep full access and can still pick slots.")
     await update.message.reply_text(msg, parse_mode=constants.ParseMode.HTML)
 
-    w = open_week()
+    w = open_week() or latest_week()
     if w:
         await refresh_group(context, w["id"])
 
@@ -4106,7 +4129,7 @@ async def cmd_removeagent(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             (row["user_id"],),
         )
         freed = 0
-        w = open_week()
+        w = open_week() or latest_week()
         if w:
             cur = run(
                 """DELETE FROM signups WHERE user_id=? AND slot_id IN
