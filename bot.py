@@ -122,6 +122,8 @@ DM_REMINDERS = os.environ.get("DM_REMINDERS", "").strip().lower() in {"1", "true
 WEEK_NUM_OFFSET = env_int("WEEK_NUM_OFFSET", -1)
 # Fallback hourly rate in cents, used until you set one with /setrate.
 DEFAULT_RATE_CENTS = env_int("DEFAULT_RATE_CENTS", 0)
+# Paid per Google review credited to an agent.
+REVIEW_RATE_CENTS = env_int("REVIEW_RATE_CENTS", 1000)
 # How long after a shift ends before an open clock-in is auto-closed.
 AUTO_CLOSE_GRACE_MIN = env_int("AUTO_CLOSE_GRACE_MIN", 120)
 # Automatic database backup, DM'd to owners. 0-6 = Mon-Sun.
@@ -272,6 +274,15 @@ CREATE TABLE IF NOT EXISTS drop_requests (
     status       TEXT NOT NULL DEFAULT 'pending',
     decided_by   INTEGER,
     decided_at   TEXT
+);
+CREATE TABLE IF NOT EXISTS reviews (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id   INTEGER NOT NULL,
+    the_date   TEXT NOT NULL,
+    photo_id   TEXT,
+    note       TEXT,
+    added_by   INTEGER NOT NULL,
+    created_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS handovers (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2227,6 +2238,7 @@ DROP_PICK, DROP_REASON = 200, 201
 PICKUP_PICK, PICKUP_REASON = 210, 211
 HANDOVER_TEXT = 220
 HO_SECTION, HO_PRIO, HO_PLATFORM, HO_STORE, HO_BODY, HO_MORE = range(221, 227)
+REVIEW_PHOTO = 230
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2676,6 +2688,14 @@ async def cmd_clockin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             note += (
                 "⚠️ That block isn't on today's roster, so it's logged as "
                 "unrostered and your manager will see it flagged.\n\n"
+            )
+            await flag_to_admins(
+                context.bot,
+                f"⚠️ <b>Unrostered clock-in</b>\n\n"
+                f"<b>{esc(nice_name)}</b> clocked in at "
+                f"{when.strftime('%H:%M')} for <b>{esc(override)}</b>, "
+                "which isn't on today's roster.\n\n"
+                "<code>/openshifts</code> · <code>/fixtime</code>",
             )
         note += (
             "Your [OPENING] has been posted ✅\n"
@@ -3649,6 +3669,131 @@ async def cmd_handovers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     )
 
 
+def reviews_for(agent_id: int, first: date, last: date) -> list:
+    return q(
+        "SELECT * FROM reviews WHERE agent_id=? AND the_date BETWEEN ? AND ? "
+        "ORDER BY the_date",
+        (agent_id, first.isoformat(), last.isoformat()),
+    )
+
+
+async def flag_to_admins(bot, text: str) -> None:
+    """Quietly tell the admins something needs a look."""
+    for aid in admin_ids():
+        try:
+            await bot.send_message(aid, text, parse_mode=constants.ParseMode.HTML)
+        except Exception:
+            pass
+
+
+async def cmd_addreview(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """/addreview @handle — credit a Google review, with a screenshot."""
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: <code>/addreview @handle</code>\n\n"
+            f"Credits one review at {money(REVIEW_RATE_CENTS)}. "
+            "I'll ask for the screenshot next.",
+            parse_mode=constants.ParseMode.HTML,
+        )
+        return ConversationHandler.END
+
+    row = find_agent(context.args[0])
+    if not row:
+        await update.message.reply_text("No one matches that. Check /roster.")
+        return ConversationHandler.END
+
+    context.user_data["review_for"] = row["user_id"]
+    context.user_data["review_note"] = " ".join(context.args[1:]).strip()
+    nm = row["display_name"] or row["name"]
+    await update.message.reply_text(
+        f"Crediting a review to <b>{esc(nm)}</b>.\n\n"
+        "Send the screenshot now, or <code>skip</code> to record it without one.",
+        parse_mode=constants.ParseMode.HTML,
+    )
+    return REVIEW_PHOTO
+
+
+async def got_review_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    agent_id = context.user_data.pop("review_for", None)
+    note = context.user_data.pop("review_note", "")
+    if not agent_id:
+        await update.message.reply_text("That expired — send /addreview again.")
+        return ConversationHandler.END
+
+    photo_id = None
+    if update.message.photo:
+        photo_id = update.message.photo[-1].file_id
+    elif (update.message.text or "").strip().lower() not in ("skip", "-"):
+        await update.message.reply_text(
+            "Send a screenshot, or <code>skip</code> to record it without one.",
+            parse_mode=constants.ParseMode.HTML,
+        )
+        context.user_data["review_for"] = agent_id
+        context.user_data["review_note"] = note
+        return REVIEW_PHOTO
+
+    today = now().date()
+    async with write_lock:
+        run(
+            "INSERT INTO reviews (agent_id, the_date, photo_id, note, added_by, "
+            "created_at) VALUES (?,?,?,?,?,?)",
+            (agent_id, today.isoformat(), photo_id, note,
+             update.effective_user.id, now().isoformat()),
+        )
+
+    first, last = month_bounds(today)
+    total = len(reviews_for(agent_id, first, last))
+    nm = display_name_of(agent_id, str(agent_id))
+    await update.message.reply_text(
+        f"✅ Review credited to <b>{esc(nm)}</b>"
+        + ("" if photo_id else " (no screenshot)") + ".\n"
+        f"{total} this month — {money(total * REVIEW_RATE_CENTS)}.",
+        parse_mode=constants.ParseMode.HTML,
+    )
+    try:
+        await context.bot.send_message(
+            agent_id,
+            f"⭐ A Google review has been credited to you "
+            f"({money(REVIEW_RATE_CENTS)}).\n\n"
+            f"That's {total} this month. Check /mytime.",
+        )
+    except Exception:
+        pass
+    return ConversationHandler.END
+
+
+async def cmd_reviews(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Reviews credited this month."""
+    if not is_admin(update.effective_user.id):
+        return
+    first = parse_month(context.args)
+    _, last = month_bounds(first)
+    rows = q(
+        "SELECT agent_id, COUNT(*) c FROM reviews WHERE the_date BETWEEN ? AND ? "
+        "GROUP BY agent_id",
+        (first.isoformat(), last.isoformat()),
+    )
+    lines = [f"⭐ <b>Reviews — {first.strftime('%B %Y')}</b>", ""]
+    if not rows:
+        lines.append("None credited yet.")
+    total = 0
+    for r in sorted(rows, key=lambda x: -x["c"]):
+        nm = display_name_of(r["agent_id"], str(r["agent_id"]))
+        lines.append(
+            f"{esc(nm)} — {r['c']} × {money(REVIEW_RATE_CENTS)} "
+            f"= {money(r['c'] * REVIEW_RATE_CENTS)}"
+        )
+        total += r["c"]
+    if total:
+        lines += ["", f"<b>{total} review(s) · {money(total * REVIEW_RATE_CENTS)}</b>"]
+    lines.append("\n<code>/addreview @handle</code> to credit one.")
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode=constants.ParseMode.HTML
+    )
+
+
 async def cmd_mytime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_chat.type != constants.ChatType.PRIVATE:
         return
@@ -3677,7 +3822,17 @@ async def cmd_mytime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             f"<b>{len(t['shifts'])} shift(s) · {hhmm(t['minutes'])}</b>",
         ]
         if t["cents"]:
-            lines.append(f"<b>{money(t['cents'])}</b> at {money(rate_for(user.id, now().date()))}/hour")
+            lines.append(
+                f"<b>{money(t['cents'])}</b> at "
+                f"{money(rate_for(user.id, now().date()))}/hour"
+            )
+    revs = reviews_for(user.id, first, last)
+    if revs:
+        rc = len(revs) * REVIEW_RATE_CENTS
+        lines.append(
+            f"⭐ {len(revs)} review(s) × {money(REVIEW_RATE_CENTS)} = <b>{money(rc)}</b>"
+        )
+        lines.append(f"<b>Total: {money(t['cents'] + rc)}</b>")
     if t["open"]:
         lines.append("\n⏱ You have a shift still clocked in.")
     await update.message.reply_text(
@@ -5321,6 +5476,14 @@ async def job_auto_close(context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception:
             pass
         log.info("Auto-closed entry %s for %s", r["id"], r["agent_id"])
+        await flag_to_admins(
+            context.bot,
+            f"⚠️ <b>Missed clock-out</b>\n\n"
+            f"<b>{esc(display_name_of(r['agent_id'], str(r['agent_id'])))}</b> "
+            f"didn't clock out. I closed it at {end.strftime('%H:%M')} "
+            f"({hhmm(paid)} credited).\n\n"
+            f"<code>/fixtime {r['id']} 10:00 18:00</code> to correct it.",
+        )
 
 
 async def job_shift_call(context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -5503,6 +5666,8 @@ ADMIN_GROUPS = [
         ("clockoutfor", "Close a forgotten shift"),
         ("fixtime", "Correct a time entry"),
         ("timesheet", "Team hours this month"),
+        ("addreview", "Credit a Google review"),
+        ("reviews", "Reviews credited this month"),
     ]),
 ]
 OWNER_EXTRA = [
@@ -6007,6 +6172,21 @@ def main() -> None:
     )
     app.add_handler(CommandHandler("handover", cmd_handover))
     app.add_handler(CommandHandler("handovers", cmd_handovers))
+    app.add_handler(
+        ConversationHandler(
+            entry_points=[CommandHandler("addreview", cmd_addreview)],
+            states={
+                REVIEW_PHOTO: [
+                    MessageHandler(
+                        (filters.PHOTO | (filters.TEXT & ~filters.COMMAND)),
+                        got_review_photo,
+                    )
+                ]
+            },
+            fallbacks=[CommandHandler("cancel", cancel)],
+        )
+    )
+    app.add_handler(CommandHandler("reviews", cmd_reviews))
 
     log.info("Avails bot running.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
