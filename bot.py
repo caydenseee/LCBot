@@ -273,6 +273,13 @@ CREATE TABLE IF NOT EXISTS drop_requests (
     decided_by   INTEGER,
     decided_at   TEXT
 );
+CREATE TABLE IF NOT EXISTS handovers (
+    id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id  INTEGER NOT NULL,
+    the_date  TEXT NOT NULL,
+    body      TEXT,
+    created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS pay_rates (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     agent_id       INTEGER,
@@ -2218,6 +2225,7 @@ async def cmd_savepreset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 ASK_NAME = 100
 DROP_PICK, DROP_REASON = 200, 201
 PICKUP_PICK, PICKUP_REASON = 210, 211
+HANDOVER_TEXT = 220
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -3173,6 +3181,20 @@ async def cmd_clockout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "\n".join(msg), parse_mode=constants.ParseMode.HTML
     )
 
+    prev = last_open_handover()
+    note = ""
+    if prev and prev["body"]:
+        note = (
+            f"\n\n<i>Last handover from "
+            f"{esc(display_name_of(prev['agent_id'], 'the previous agent'))} "
+            "left something open.</i>"
+        )
+    await update.message.reply_text(
+        "<b>Closing handover</b>\n\nAnything for the next agent?" + note,
+        parse_mode=constants.ParseMode.HTML,
+        reply_markup=handover_keyboard(prev),
+    )
+
 
 async def cmd_support(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/support           — show who you list as support
@@ -3234,6 +3256,205 @@ async def cmd_support(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     await update.message.reply_text(
         f"Your openings will list <b>{esc(value)}</b> as support.",
         parse_mode=constants.ParseMode.HTML,
+    )
+
+
+HANDOVER_TEMPLATE = """▫️DUOKE
+🔴customer_handle
+🇸🇬[SG]STORE NAME
+ORDER NUMBER
+Product name
+
+• what happened
+• what you did
+• who you notified
+
+‼️Need Help: what the next agent should pick up"""
+
+
+def last_open_handover(exclude_agent: int | None = None):
+    """The most recent handover that left something open."""
+    row = q1(
+        "SELECT * FROM handovers WHERE body IS NOT NULL AND body <> '' "
+        "ORDER BY created_at DESC LIMIT 1"
+    )
+    return row
+
+
+def handover_keyboard(carry_from=None) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton("📝 Add handover", callback_data="ho:add")]]
+    if carry_from:
+        who = display_name_of(carry_from["agent_id"], "the last agent")
+        rows.append([InlineKeyboardButton(
+            f"↩️ Still open from {who}", callback_data="ho:carry"
+        )])
+    rows.append([InlineKeyboardButton(
+        "✅ Nothing to handover", callback_data="ho:none"
+    )])
+    return InlineKeyboardMarkup(rows)
+
+
+def handover_header(the_date: date) -> str:
+    return (
+        "⭐️ Live Chat Agent Closing Handover ⭐️\n\n"
+        "> I have closed the tickets on my shift: ✅\n\n"
+        f"🔸{the_date.strftime('%-d %b %Y')}, Open Cases"
+    )
+
+
+async def on_handover_none(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    user = query.from_user
+    if not await gate_cb(query):
+        return
+    today = now().date()
+    body = ""
+    async with write_lock:
+        run(
+            "INSERT INTO handovers (agent_id, the_date, body, created_at) "
+            "VALUES (?,?,?,?)",
+            (user.id, today.isoformat(), body, now().isoformat()),
+        )
+    text = (
+        "⭐️ Live Chat Agent Closing Handover ⭐️\n\n"
+        "> I have closed the tickets on my shift: ✅\n\n"
+        f"🔸{today.strftime('%-d %b %Y')} — no open cases\n\n"
+        f"— {display_name_of(user.id, user.full_name)}"
+    )
+    posted = await post_ops(context.bot, text)
+    await query.answer("Nothing to hand over ✓")
+    await query.edit_message_text(
+        "✅ Handover posted — nothing outstanding.\n\nThanks, enjoy your evening."
+        if posted else text,
+        parse_mode=None,
+    )
+
+
+async def on_handover_carry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Repost the previous agent's open cases, still outstanding."""
+    query = update.callback_query
+    user = query.from_user
+    if not await gate_cb(query):
+        return
+    prev = last_open_handover()
+    if not prev or not prev["body"]:
+        await query.answer("Nothing outstanding to carry.", show_alert=True)
+        return
+
+    today = now().date()
+    async with write_lock:
+        run(
+            "INSERT INTO handovers (agent_id, the_date, body, created_at) "
+            "VALUES (?,?,?,?)",
+            (user.id, today.isoformat(), prev["body"], now().isoformat()),
+        )
+
+    from_who = display_name_of(prev["agent_id"], "the previous agent")
+    text = (
+        handover_header(today)
+        + f"\n↩️ Still open from {from_who} — nothing new from my shift\n\n"
+        + prev["body"]
+        + f"\n\n— {display_name_of(user.id, user.full_name)}"
+    )
+    posted = await post_ops(context.bot, text)
+    await query.answer("Carried forward ✓")
+    await query.edit_message_text(
+        "✅ Handover posted — carried the open case forward."
+        if posted else text,
+        parse_mode=None,
+    )
+
+
+async def on_handover_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    if not await gate_cb(query):
+        return ConversationHandler.END
+    await query.answer()
+    await query.edit_message_text(
+        "Send me the open cases and I'll post the handover.\n\n"
+        "One block per case, in the usual format — copy the template below "
+        "and edit it, or just type it out.",
+        parse_mode=None,
+    )
+    await query.message.reply_text(HANDOVER_TEMPLATE, parse_mode=None)
+    await query.message.reply_text(
+        "Tap the message above to copy it. Send /cancel to skip the handover."
+    )
+    return HANDOVER_TEXT
+
+
+async def got_handover(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    body = update.message.text.strip()
+    if len(body) < 10:
+        await update.message.reply_text(
+            "That looks too short — send the case details, or /cancel to skip."
+        )
+        return HANDOVER_TEXT
+
+    today = now().date()
+    async with write_lock:
+        run(
+            "INSERT INTO handovers (agent_id, the_date, body, created_at) "
+            "VALUES (?,?,?,?)",
+            (user.id, today.isoformat(), body, now().isoformat()),
+        )
+
+    text = (
+        handover_header(today)
+        + "\n\n" + body
+        + f"\n\n— {display_name_of(user.id, user.full_name)}"
+    )
+    posted = await post_ops(context.bot, text)
+    if posted:
+        await update.message.reply_text(
+            "✅ Handover posted to TC Online. Thanks!"
+        )
+    else:
+        await update.message.reply_text(text, parse_mode=None)
+        await update.message.reply_text("Tap the message above to copy it.")
+    return ConversationHandler.END
+
+
+async def cmd_handover(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Post a handover outside of clocking out."""
+    if update.effective_chat.type != constants.ChatType.PRIVATE:
+        return
+    if not await gate(update):
+        return
+    prev = last_open_handover()
+    note = ""
+    if prev and prev["body"]:
+        note = (
+            f"\n\n<i>Last handover from "
+            f"{esc(display_name_of(prev['agent_id'], 'the previous agent'))} "
+            "left something open.</i>"
+        )
+    await update.message.reply_text(
+        "<b>Closing handover</b>\n\nAnything for the next agent?" + note,
+        parse_mode=constants.ParseMode.HTML,
+        reply_markup=handover_keyboard(prev),
+    )
+
+
+async def cmd_handovers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Recent handovers, for admins."""
+    if not is_admin(update.effective_user.id):
+        return
+    rows = q(
+        "SELECT * FROM handovers ORDER BY created_at DESC LIMIT 10"
+    )
+    if not rows:
+        await update.message.reply_text("No handovers recorded yet.")
+        return
+    lines = ["<b>Recent handovers</b>", ""]
+    for r in rows:
+        nm = display_name_of(r["agent_id"], str(r["agent_id"]))
+        when = datetime.fromisoformat(r["created_at"]).strftime("%-d %b %H:%M")
+        state = "nothing outstanding" if not r["body"] else "open cases"
+        lines.append(f"{when} — <b>{esc(nm)}</b>, {state}")
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode=constants.ParseMode.HTML
     )
 
 
@@ -5048,6 +5269,7 @@ AGENT_COMMANDS = [
     ("dropshift", "Ask to drop a shift"),
     ("pickup", "Ask to take an open shift"),
     ("support", "Who I list as support"),
+    ("handover", "Post a closing handover"),
     ("summary", "Show the current board"),
     ("help", "List commands"),
 ]
@@ -5077,6 +5299,7 @@ ADMIN_GROUPS = [
     ("People", [
         ("pending", "Approve or decline access requests"),
         ("dropreqs", "Shift requests waiting"),
+        ("handovers", "Recent closing handovers"),
         ("access", "Who approved or declined whom"),
         ("roster", "Who's on the list"),
         ("rename", "Fix someone's name on the schedule"),
@@ -5571,6 +5794,23 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_clockin_slot, pattern=r"^ci:\d+:\d+$"))
     app.add_handler(CallbackQueryHandler(on_access_decision, pattern=r"^(ap|dn):\d+$"))
     app.add_handler(CallbackQueryHandler(on_plan_quick, pattern=r"^pq:"))
+    app.add_handler(CallbackQueryHandler(on_handover_none, pattern=r"^ho:none$"))
+    app.add_handler(CallbackQueryHandler(on_handover_carry, pattern=r"^ho:carry$"))
+    app.add_handler(
+        ConversationHandler(
+            entry_points=[
+                CallbackQueryHandler(on_handover_add, pattern=r"^ho:add$")
+            ],
+            states={
+                HANDOVER_TEXT: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, got_handover)
+                ]
+            },
+            fallbacks=[CommandHandler("cancel", cancel)],
+        )
+    )
+    app.add_handler(CommandHandler("handover", cmd_handover))
+    app.add_handler(CommandHandler("handovers", cmd_handovers))
 
     log.info("Avails bot running.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
