@@ -4782,6 +4782,160 @@ async def cmd_setrate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+def week_bounds(d: date) -> tuple:
+    mon = d - timedelta(days=d.weekday())
+    return mon, mon + timedelta(days=6)
+
+
+def week_report(first: date, last: date) -> str:
+    """Hours, pay and anything that needs a look, for one week."""
+    lines = [
+        f"📊 <b>Week of {first.strftime('%-d %b')} – {last.strftime('%-d %b %Y')}</b>",
+        "",
+    ]
+
+    # ---- hours and pay per agent
+    people = []
+    total_min = total_cents = 0
+    for a in q("SELECT * FROM agents WHERE status='active' ORDER BY name"):
+        t = timesheet(a["user_id"], first, last)
+        revs = len(reviews_for(a["user_id"], first, last))
+        if not t["shifts"] and not revs and not t["open"]:
+            continue
+        rc = revs * REVIEW_RATE_CENTS
+        people.append((a, t, revs, rc))
+        total_min += t["minutes"]
+        total_cents += t["cents"] + rc
+
+    if people:
+        lines.append("<b>Worked</b>")
+        for a, t, revs, rc in sorted(people, key=lambda x: -x[1]["minutes"]):
+            nm = a["display_name"] or a["name"]
+            bit = f"{esc(nm)} — {len(t['shifts'])} shift(s), {hhmm(t['minutes'])}"
+            if t["cents"] or rc:
+                bit += f" · {money(t['cents'] + rc)}"
+            if revs:
+                bit += f" ({revs}⭐)"
+            lines.append(bit)
+        lines += ["", f"<b>Team: {hhmm(total_min)} · {money(total_cents)}</b>"]
+    else:
+        lines.append("<i>Nothing logged this week yet.</i>")
+
+    # ---- things worth a look
+    flags = []
+
+    auto = q(
+        """SELECT te.*, a.display_name, a.name FROM time_entries te
+           JOIN agents a ON a.user_id = te.agent_id
+           WHERE te.status='auto' AND te.the_date BETWEEN ? AND ?""",
+        (first.isoformat(), last.isoformat()),
+    )
+    for r in auto:
+        who = r["display_name"] or r["name"]
+        flags.append(
+            f"⏰ {esc(who)} missed a clock-out on "
+            f"{date.fromisoformat(r['the_date']).strftime('%a')} "
+            f"(#{r['id']})"
+        )
+
+    unros = q(
+        """SELECT te.*, a.display_name, a.name FROM time_entries te
+           JOIN agents a ON a.user_id = te.agent_id
+           WHERE te.slot_id IS NULL AND te.the_date BETWEEN ? AND ?""",
+        (first.isoformat(), last.isoformat()),
+    )
+    for r in unros:
+        who = r["display_name"] or r["name"]
+        flags.append(
+            f"❓ {esc(who)} clocked in unrostered on "
+            f"{date.fromisoformat(r['the_date']).strftime('%a')} (#{r['id']})"
+        )
+
+    # rostered, the slot has passed, but never clocked in
+    today = now().date()
+    noshow = q(
+        """SELECT su.user_id, s.label, d.name AS day_name, d.the_date,
+                  a.display_name, a.name
+           FROM signups su
+           JOIN slots s ON s.id = su.slot_id
+           JOIN days d ON d.id = s.day_id
+           JOIN agents a ON a.user_id = su.user_id
+           WHERE d.the_date BETWEEN ? AND ? AND d.the_date < ?
+             AND NOT EXISTS (
+               SELECT 1 FROM time_entries te
+               WHERE te.agent_id = su.user_id AND te.the_date = d.the_date
+             )
+           ORDER BY d.the_date""",
+        (first.isoformat(), last.isoformat(), today.isoformat()),
+    )
+    for r in noshow:
+        who = r["display_name"] or r["name"]
+        flags.append(
+            f"🚫 {esc(who)} never clocked in for "
+            f"{r['day_name']} {r['label']}"
+        )
+
+    if flags:
+        lines += ["", "<b>Worth a look</b>"] + flags[:15]
+        if len(flags) > 15:
+            lines.append(f"<i>+{len(flags) - 15} more</i>")
+    else:
+        lines += ["", "✅ <i>Nothing flagged.</i>"]
+
+    # ---- coverage of the live week
+    w = q1(
+        "SELECT * FROM weeks WHERE start_date=? ORDER BY id DESC LIMIT 1",
+        (first.isoformat(),),
+    )
+    if w:
+        st = week_stats(w["id"])
+        if st["gaps"]:
+            lines += ["", f"⚠️ <b>{len(st['gaps'])} slot(s) uncovered</b>"]
+            for g in st["gaps"][:6]:
+                lines.append(f"  {g['name']} {g['label']}")
+            if len(st["gaps"]) > 6:
+                lines.append(f"  +{len(st['gaps']) - 6} more")
+
+    return "\n".join(lines)
+
+
+async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """This week at a glance — hours, pay and anything odd."""
+    if not is_admin(update.effective_user.id):
+        return
+    target = now().date()
+    if context.args:
+        try:
+            target = date.fromisoformat(context.args[0])
+        except ValueError:
+            await update.message.reply_text(
+                "Usage: <code>/week</code> or <code>/week 2026-09-07</code>",
+                parse_mode=constants.ParseMode.HTML,
+            )
+            return
+    first, last = week_bounds(target)
+    await update.message.reply_text(
+        week_report(first, last), parse_mode=constants.ParseMode.HTML
+    )
+
+
+async def job_week_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Monday morning summary of the week just gone."""
+    if now().weekday() != 0:
+        return
+    last_mon = now().date() - timedelta(days=7)
+    first, last = week_bounds(last_mon)
+    text = week_report(first, last)
+    for aid in admin_ids():
+        try:
+            await context.bot.send_message(
+                aid, text, parse_mode=constants.ParseMode.HTML
+            )
+        except Exception:
+            pass
+    log.info("Weekly digest sent for %s", first)
+
+
 async def cmd_timesheet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Everyone's hours for a month."""
     if not is_admin(update.effective_user.id):
@@ -5665,6 +5819,7 @@ ADMIN_GROUPS = [
         ("openshifts", "Who's clocked in now"),
         ("clockoutfor", "Close a forgotten shift"),
         ("fixtime", "Correct a time entry"),
+        ("week", "This week at a glance"),
         ("timesheet", "Team hours this month"),
         ("addreview", "Credit a Google review"),
         ("reviews", "Reviews credited this month"),
@@ -6025,6 +6180,11 @@ async def post_init(app: Application) -> None:
     app.job_queue.run_daily(
         job_backup, time(bmins // 60, bmins % 60, tzinfo=TZ), name="backup",
     )
+    dmins = parse_time_token(os.environ.get("DIGEST_TIME", "").strip() or "09:00")
+    app.job_queue.run_daily(
+        job_week_digest, time(dmins // 60, dmins % 60, tzinfo=TZ),
+        name="week-digest",
+    )
     log.info(
         "Weekly backup scheduled for %s at %s",
         ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][BACKUP_DAY % 7],
@@ -6124,6 +6284,7 @@ def main() -> None:
     app.add_handler(CommandHandler("payslip", cmd_payslip))
     app.add_handler(CommandHandler("setrate", cmd_setrate))
     app.add_handler(CommandHandler("timesheet", cmd_timesheet))
+    app.add_handler(CommandHandler("week", cmd_week))
     app.add_handler(CommandHandler("payroll", cmd_payroll))
     app.add_handler(CommandHandler("openshifts", cmd_openshifts))
     app.add_handler(CommandHandler("clockoutfor", cmd_clockoutfor))
