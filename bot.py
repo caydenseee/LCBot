@@ -4937,9 +4937,66 @@ async def job_week_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def cmd_timesheet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Everyone's hours for a month."""
+    """Everyone's hours for a month, or one agent's shifts with entry numbers."""
     if not is_admin(update.effective_user.id):
         return
+
+    # /timesheet @handle — that person's shifts, with the numbers /fixtime needs
+    who = None
+    rest = []
+    for a in context.args:
+        if who is None and not re.fullmatch(r"\d{4}-\d{2}", a):
+            cand = find_agent(a)
+            if cand:
+                who = cand
+                continue
+        rest.append(a)
+
+    if who:
+        first = parse_month(rest)
+        _, last = month_bounds(first)
+        t = timesheet(who["user_id"], first, last)
+        nm = who["display_name"] or who["name"]
+        lines = [
+            f"🕐 <b>{esc(nm)} — {first.strftime('%B %Y')}</b>", ""
+        ]
+        if not t["shifts"] and not t["open"]:
+            lines.append("Nothing logged.")
+        for sh in t["shifts"]:
+            r = sh["row"]
+            a_t = datetime.fromisoformat(r["clock_in"]).strftime("%H:%M")
+            b_t = datetime.fromisoformat(r["clock_out"]).strftime("%H:%M")
+            flag = " ⚠️" if r["status"] == "auto" else ""
+            if r["status"] == "edited":
+                flag = " ✏️"
+            slot = q1(
+                "SELECT label FROM slots WHERE id=?", (r["slot_id"],)
+            ) if r["slot_id"] else None
+            where = slot["label"] if slot else "unrostered"
+            lines.append(
+                f"<code>#{r['id']}</code>  "
+                f"{sh['date'].strftime('%a %-d %b')}  {a_t}–{b_t}  "
+                f"{hhmm(sh['minutes'])}  {money(sh['cents'])}{flag}"
+                f"\n      <i>{esc(where)}</i>"
+            )
+        if t["shifts"]:
+            lines += [
+                "",
+                f"<b>{len(t['shifts'])} shift(s) · {hhmm(t['minutes'])} · "
+                f"{money(t['cents'])}</b>",
+            ]
+        if t["open"]:
+            lines.append("⏱ Still clocked in.")
+        lines += [
+            "",
+            "<code>/fixtime 42 11:00 17:30</code> to correct one",
+            "<code>/fixtime 42 delete</code> to remove it",
+        ]
+        await update.message.reply_text(
+            "\n".join(lines), parse_mode=constants.ParseMode.HTML
+        )
+        return
+
     first = parse_month(context.args)
     _, last = month_bounds(first)
 
@@ -5820,7 +5877,7 @@ ADMIN_GROUPS = [
         ("clockoutfor", "Close a forgotten shift"),
         ("fixtime", "Correct a time entry"),
         ("week", "This week at a glance"),
-        ("timesheet", "Team hours this month"),
+        ("timesheet", "Team hours — or /timesheet @handle"),
         ("addreview", "Credit a Google review"),
         ("reviews", "Reviews credited this month"),
     ]),
