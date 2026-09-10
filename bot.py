@@ -683,6 +683,8 @@ def timesheet(agent_id: int, first: date, last: date) -> dict:
         (agent_id, first.isoformat(), last.isoformat()),
     )
     shifts, minutes, cents, open_count = [], 0, 0, 0
+    # A rostered block is paid once, however many times someone clocked into it.
+    credited: set = set()
     for r in rows:
         if not r["clock_out"]:
             open_count += 1
@@ -690,12 +692,19 @@ def timesheet(agent_id: int, first: date, last: date) -> dict:
         m = entry_paid_minutes(r)
         actual = entry_minutes(r)
         day = date.fromisoformat(r["the_date"])
+        dup = False
+        if PAY_MODE == "slot" and r["slot_id"]:
+            key = (r["the_date"], r["slot_id"])
+            if key in credited:
+                m, dup = 0, True
+            else:
+                credited.add(key)
         pay = round(m / 60 * rate_for(agent_id, day))
         minutes += m
         cents += pay
         shifts.append({
             "row": r, "date": day, "minutes": m,
-            "actual": actual, "cents": pay,
+            "actual": actual, "cents": pay, "duplicate": dup,
         })
     return {
         "shifts": shifts,
@@ -3486,9 +3495,14 @@ def case_picker(keep: set) -> InlineKeyboardMarkup:
     for c in open_cases():
         mark = "✅" if c["id"] in keep else "☑️"
         who = display_name_of(c["agent_id"], "")
+        age = (now().date() - date.fromisoformat(c["the_date"])).days
         label = f"{mark} {c['prio']} {c['username']}"
         if who:
             label += f" · {who.split()[0]}"
+        if age >= 3:
+            label += f" · {age}d ⏳"
+        elif age:
+            label += f" · {age}d"
         rows.append([InlineKeyboardButton(label[:60], callback_data=f"hk:{c['id']}")])
     rows.append([InlineKeyboardButton("➕ Add a new case", callback_data="hk:new")])
     rows.append([InlineKeyboardButton("📤 Post handover", callback_data="hk:post")])
@@ -5099,6 +5113,8 @@ async def cmd_timesheet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             flag = " ⚠️" if r["status"] == "auto" else ""
             if r["status"] == "edited":
                 flag = " ✏️"
+            if sh.get("duplicate"):
+                flag += " ♻️ already paid"
             slot = q1(
                 "SELECT label FROM slots WHERE id=?", (r["slot_id"],)
             ) if r["slot_id"] else None
@@ -6215,6 +6231,7 @@ def miniapp_payload(user_id: int) -> dict:
 
         shifts, total_min, total_cents, open_count = [], 0, 0, 0
         seen_days = set()
+        credited = set()
         for r in rows:
             if not r["clock_out"]:
                 open_count += 1
@@ -6222,6 +6239,11 @@ def miniapp_payload(user_id: int) -> dict:
             a = datetime.fromisoformat(r["clock_in"])
             b = datetime.fromisoformat(r["clock_out"])
             mins = entry_paid_minutes(r)
+            if PAY_MODE == "slot" and r["slot_id"]:
+                key = (r["the_date"], r["slot_id"])
+                if key in credited:
+                    continue          # same block, already counted
+                credited.add(key)
             day = date.fromisoformat(r["the_date"])
             cents = round(mins / 60 * rate_on(day)) if mins else 0
             total_min += mins
@@ -6542,4 +6564,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    main()    
