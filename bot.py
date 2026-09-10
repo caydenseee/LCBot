@@ -3323,7 +3323,8 @@ def render_case(c: dict) -> str:
     return "\n".join(lines) + "\n" + c["body"].strip()
 
 
-def render_handover(cases: list, who: str, the_date: date) -> str:
+def render_handover(cases: list, who: str, the_date: date,
+                    closed: list | None = None) -> str:
     out = [
         "⭐️ Live Chat Agent Closing Handover ⭐️",
         "",
@@ -3341,6 +3342,9 @@ def render_handover(cases: list, who: str, the_date: date) -> str:
         out += ["\n\n".join(render_case(c) for c in later)]
     if not cases:
         out += ["", f"🔸{the_date.strftime('%-d %b %Y')} — no open cases"]
+    if closed:
+        out += ["", "✔️ Closed this shift"]
+        out += [f"  {c['prio']} {c['username']} — {c['store']}" for c in closed]
     out += ["", f"— {who}"]
     return "\n".join(out)
 
@@ -3432,6 +3436,7 @@ async def on_handover_none(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not await gate_cb(query):
         return
     today = now().date()
+    cleared = [case_row_to_dict(c) for c in open_cases()]
     async with write_lock:
         for c in open_cases():
             run(
@@ -3443,11 +3448,8 @@ async def on_handover_none(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             "VALUES (?,?,?,?)",
             (user.id, today.isoformat(), "", now().isoformat()),
         )
-    text = (
-        "⭐️ Live Chat Agent Closing Handover ⭐️\n\n"
-        "> I have closed the tickets on my shift: ✅\n\n"
-        f"🔸{today.strftime('%-d %b %Y')} — no open cases\n\n"
-        f"— {display_name_of(user.id, user.full_name)}"
+    text = render_handover(
+        [], display_name_of(user.id, user.full_name), today, cleared
     )
     posted = await post_ops(context.bot, text)
     await query.answer("Nothing to hand over ✓")
@@ -3540,7 +3542,7 @@ async def finish_handover(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         keep = {c["id"] for c in open_cases()}
     new_cases = context.user_data.get("ho_cases", [])
 
-    cases, closed = [], 0
+    cases, closed = [], []
     async with write_lock:
         for c in open_cases():
             if c["id"] in keep:
@@ -3551,7 +3553,7 @@ async def finish_handover(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     "WHERE id=?",
                     (user.id, now().isoformat(), c["id"]),
                 )
-                closed += 1
+                closed.append(case_row_to_dict(c))
         for d in new_cases:
             run(
                 "INSERT INTO ho_cases (agent_id, the_date, section, prio, platform,"
@@ -3570,14 +3572,14 @@ async def finish_handover(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
 
     who = display_name_of(user.id, user.full_name)
-    text = render_handover(cases, who, today)
+    text = render_handover(cases, who, today, closed)
     posted = await post_ops(context.bot, text)
     for k in ("ho_cases", "ho_draft", "ho_keep"):
         context.user_data.pop(k, None)
 
     if posted:
         msg = f"✅ Handover posted — {len(cases)} open case(s)"
-        msg += f", {closed} closed." if closed else "."
+        msg += f", {len(closed)} closed." if closed else "."
         await query.edit_message_text(msg, parse_mode=None)
     else:
         await query.edit_message_text(text, parse_mode=None)
