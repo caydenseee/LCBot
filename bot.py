@@ -284,6 +284,22 @@ CREATE TABLE IF NOT EXISTS reviews (
     added_by   INTEGER NOT NULL,
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS ho_cases (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    agent_id   INTEGER NOT NULL,
+    the_date   TEXT NOT NULL,
+    section    TEXT NOT NULL DEFAULT 'open',
+    prio       TEXT,
+    platform   TEXT,
+    flag       TEXT,
+    store      TEXT,
+    username   TEXT,
+    body       TEXT,
+    closed     INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL,
+    closed_by  INTEGER,
+    closed_at  TEXT
+);
 CREATE TABLE IF NOT EXISTS handovers (
     id        INTEGER PRIMARY KEY AUTOINCREMENT,
     agent_id  INTEGER NOT NULL,
@@ -2239,6 +2255,7 @@ PICKUP_PICK, PICKUP_REASON = 210, 211
 HANDOVER_TEXT = 220
 HO_SECTION, HO_PRIO, HO_PLATFORM, HO_STORE, HO_BODY, HO_MORE = range(221, 227)
 REVIEW_PHOTO = 230
+HO_PICK = 231
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -3202,18 +3219,14 @@ async def cmd_clockout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "\n".join(msg), parse_mode=constants.ParseMode.HTML
     )
 
-    prev = last_open_handover()
+    running = open_cases()
     note = ""
-    if prev and prev["body"]:
-        note = (
-            f"\n\n<i>Last handover from "
-            f"{esc(display_name_of(prev['agent_id'], 'the previous agent'))} "
-            "left something open.</i>"
-        )
+    if running:
+        note = f"\n\n<i>{len(running)} case(s) still open from earlier shifts.</i>"
     await update.message.reply_text(
         "<b>Closing handover</b>\n\nAnything for the next agent?" + note,
         parse_mode=constants.ParseMode.HTML,
-        reply_markup=handover_keyboard(prev),
+        reply_markup=handover_keyboard(running),
     )
 
 
@@ -3354,17 +3367,55 @@ def last_open_handover(exclude_agent: int | None = None):
     return row
 
 
-def handover_keyboard(carry_from=None) -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton("📝 Add handover", callback_data="ho:add")]]
-    if carry_from:
-        who = display_name_of(carry_from["agent_id"], "the last agent")
-        rows.append([InlineKeyboardButton(
-            f"↩️ Still open from {who}", callback_data="ho:carry"
-        )])
-    rows.append([InlineKeyboardButton(
-        "✅ Nothing to handover", callback_data="ho:none"
-    )])
-    return InlineKeyboardMarkup(rows)
+def handover_keyboard(running=None) -> InlineKeyboardMarkup:
+    running = open_cases() if running is None else running
+    if running:
+        n = len(running)
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton(
+                f"📝 Update handover ({n} open)", callback_data="ho:add")],
+            [InlineKeyboardButton(
+                "↩️ All still open, nothing new", callback_data="ho:carry")],
+            [InlineKeyboardButton(
+                "✅ All cases closed", callback_data="ho:none")],
+        ])
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("📝 Add handover", callback_data="ho:add")],
+        [InlineKeyboardButton("✅ Nothing to handover", callback_data="ho:none")],
+    ])
+
+
+async def on_handover_carry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Everything still open, nothing new from this shift."""
+    query = update.callback_query
+    user = query.from_user
+    if not await gate_cb(query):
+        return
+    running = open_cases()
+    if not running:
+        await query.answer("Nothing outstanding.", show_alert=True)
+        return
+    today = now().date()
+    cases = [case_row_to_dict(c) for c in running]
+    who = display_name_of(user.id, user.full_name)
+    text = render_handover(cases, who, today)
+    text = text.replace(
+        "Open Cases", "Open Cases\n↩️ Still open — nothing new from my shift", 1
+    )
+    async with write_lock:
+        run(
+            "INSERT INTO handovers (agent_id, the_date, body, created_at) "
+            "VALUES (?,?,?,?)",
+            (user.id, today.isoformat(),
+             "\n\n".join(render_case(c) for c in cases), now().isoformat()),
+        )
+    posted = await post_ops(context.bot, text)
+    await query.answer("Carried forward ✓")
+    await query.edit_message_text(
+        f"✅ Handover posted — {len(cases)} case(s) still open."
+        if posted else text,
+        parse_mode=None,
+    )
 
 
 def handover_header(the_date: date) -> str:
@@ -3381,12 +3432,16 @@ async def on_handover_none(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not await gate_cb(query):
         return
     today = now().date()
-    body = ""
     async with write_lock:
+        for c in open_cases():
+            run(
+                "UPDATE ho_cases SET closed=1, closed_by=?, closed_at=? WHERE id=?",
+                (user.id, now().isoformat(), c["id"]),
+            )
         run(
             "INSERT INTO handovers (agent_id, the_date, body, created_at) "
             "VALUES (?,?,?,?)",
-            (user.id, today.isoformat(), body, now().isoformat()),
+            (user.id, today.isoformat(), "", now().isoformat()),
         )
     text = (
         "⭐️ Live Chat Agent Closing Handover ⭐️\n\n"
@@ -3403,48 +3458,149 @@ async def on_handover_none(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     )
 
 
-async def on_handover_carry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Repost the previous agent's open cases, still outstanding."""
+def open_cases() -> list:
+    """Cases still live, oldest first."""
+    return q("SELECT * FROM ho_cases WHERE closed=0 ORDER BY id")
+
+
+def case_row_to_dict(r) -> dict:
+    return {
+        "section": r["section"], "prio": r["prio"], "platform": r["platform"],
+        "flag": r["flag"], "store": r["store"], "username": r["username"],
+        "body": r["body"],
+    }
+
+
+PICKER_HELP = (
+    "<b>Which cases are still open?</b>\n\n"
+    "✅ = still open, carries over\n"
+    "☑️ = tap to mark it closed\n\n"
+    "<i>Anything you untick won't appear again.</i>"
+)
+
+
+def case_picker(keep: set) -> InlineKeyboardMarkup:
+    rows = []
+    for c in open_cases():
+        mark = "✅" if c["id"] in keep else "☑️"
+        who = display_name_of(c["agent_id"], "")
+        label = f"{mark} {c['prio']} {c['username']}"
+        if who:
+            label += f" · {who.split()[0]}"
+        rows.append([InlineKeyboardButton(label[:60], callback_data=f"hk:{c['id']}")])
+    rows.append([InlineKeyboardButton("➕ Add a new case", callback_data="hk:new")])
+    rows.append([InlineKeyboardButton("📤 Post handover", callback_data="hk:post")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def on_handover_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Tick which of the running cases are still live."""
+    query = update.callback_query
+    choice = query.data.split(":", 1)[1]
+    keep = context.user_data.setdefault(
+        "ho_keep", {c["id"] for c in open_cases()}
+    )
+
+    if choice == "new":
+        await query.answer()
+        await query.edit_message_text(
+            "<b>New case</b>\n\nIs this open now, or for the next working day?",
+            parse_mode=constants.ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔸 Open now", callback_data="hs:open")],
+                [InlineKeyboardButton("🔹 Follow up next working day",
+                                      callback_data="hs:follow")],
+            ]),
+        )
+        return HO_SECTION
+
+    if choice == "post":
+        await query.answer()
+        return await finish_handover(update, context)
+
+    keep.symmetric_difference_update({int(choice)})
+    await query.answer()
+    try:
+        await query.edit_message_text(
+            PICKER_HELP, parse_mode=constants.ParseMode.HTML,
+            reply_markup=case_picker(keep),
+        )
+    except BadRequest:
+        pass
+    return HO_PICK
+
+
+async def finish_handover(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Close what wasn't kept, save what's new, and post."""
     query = update.callback_query
     user = query.from_user
-    if not await gate_cb(query):
-        return
-    prev = last_open_handover()
-    if not prev or not prev["body"]:
-        await query.answer("Nothing outstanding to carry.", show_alert=True)
-        return
-
     today = now().date()
+    keep = context.user_data.get("ho_keep")
+    if keep is None:
+        keep = {c["id"] for c in open_cases()}
+    new_cases = context.user_data.get("ho_cases", [])
+
+    cases, closed = [], 0
     async with write_lock:
+        for c in open_cases():
+            if c["id"] in keep:
+                cases.append(case_row_to_dict(c))
+            else:
+                run(
+                    "UPDATE ho_cases SET closed=1, closed_by=?, closed_at=? "
+                    "WHERE id=?",
+                    (user.id, now().isoformat(), c["id"]),
+                )
+                closed += 1
+        for d in new_cases:
+            run(
+                "INSERT INTO ho_cases (agent_id, the_date, section, prio, platform,"
+                " flag, store, username, body, created_at) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                (user.id, today.isoformat(), d["section"], d["prio"],
+                 d["platform"], d["flag"], d["store"], d["username"], d["body"],
+                 now().isoformat()),
+            )
+            cases.append(d)
         run(
             "INSERT INTO handovers (agent_id, the_date, body, created_at) "
             "VALUES (?,?,?,?)",
-            (user.id, today.isoformat(), prev["body"], now().isoformat()),
+            (user.id, today.isoformat(),
+             "\n\n".join(render_case(c) for c in cases), now().isoformat()),
         )
 
-    from_who = display_name_of(prev["agent_id"], "the previous agent")
-    text = (
-        handover_header(today)
-        + f"\n↩️ Still open from {from_who} — nothing new from my shift\n\n"
-        + prev["body"]
-        + f"\n\n— {display_name_of(user.id, user.full_name)}"
-    )
+    who = display_name_of(user.id, user.full_name)
+    text = render_handover(cases, who, today)
     posted = await post_ops(context.bot, text)
-    await query.answer("Carried forward ✓")
-    await query.edit_message_text(
-        "✅ Handover posted — carried the open case forward."
-        if posted else text,
-        parse_mode=None,
-    )
+    for k in ("ho_cases", "ho_draft", "ho_keep"):
+        context.user_data.pop(k, None)
+
+    if posted:
+        msg = f"✅ Handover posted — {len(cases)} open case(s)"
+        msg += f", {closed} closed." if closed else "."
+        await query.edit_message_text(msg, parse_mode=None)
+    else:
+        await query.edit_message_text(text, parse_mode=None)
+    return ConversationHandler.END
 
 
 async def on_handover_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Guided case entry — taps for the coded bits, typing for the rest."""
+    """Start a handover: review running cases first, then add new ones."""
     query = update.callback_query
     if not await gate_cb(query):
         return ConversationHandler.END
     await query.answer()
     context.user_data["ho_cases"] = []
+    running = open_cases()
+    if running:
+        context.user_data["ho_keep"] = {c["id"] for c in running}
+        await query.edit_message_text(
+            PICKER_HELP, parse_mode=constants.ParseMode.HTML,
+            reply_markup=case_picker(context.user_data["ho_keep"]),
+        )
+        return HO_PICK
+
+    context.user_data["ho_keep"] = set()
     await query.edit_message_text(
         "<b>Case 1</b>\n\nIs this open now, or for the next working day?",
         parse_mode=constants.ParseMode.HTML,
@@ -3541,7 +3697,7 @@ async def on_ho_body(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     n = len(context.user_data["ho_cases"])
 
     await update.message.reply_text(
-        f"✅ Case {n} saved.",
+        f"✅ Case saved ({n} new this shift).",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Add another case", callback_data="hm:more")],
             [InlineKeyboardButton("📤 Post handover", callback_data="hm:post")],
@@ -3552,14 +3708,12 @@ async def on_ho_body(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 async def on_ho_more(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    await query.answer()
     choice = query.data.split(":")[1]
-    cases = context.user_data.get("ho_cases", [])
-
     if choice == "more":
+        await query.answer()
+        n = len(context.user_data.get("ho_cases", [])) + 1
         await query.edit_message_text(
-            f"<b>Case {len(cases) + 1}</b>\n\n"
-            "Is this open now, or for the next working day?",
+            f"<b>Case {n}</b>\n\nIs this open now, or for the next working day?",
             parse_mode=constants.ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🔸 Open now", callback_data="hs:open")],
@@ -3568,30 +3722,8 @@ async def on_ho_more(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             ]),
         )
         return HO_SECTION
-
-    user = query.from_user
-    today = now().date()
-    who = display_name_of(user.id, user.full_name)
-    text = render_handover(cases, who, today)
-
-    body = "\n\n".join(render_case(c) for c in cases)
-    async with write_lock:
-        run(
-            "INSERT INTO handovers (agent_id, the_date, body, created_at) "
-            "VALUES (?,?,?,?)",
-            (user.id, today.isoformat(), body, now().isoformat()),
-        )
-    posted = await post_ops(context.bot, text)
-    context.user_data.pop("ho_cases", None)
-    context.user_data.pop("ho_draft", None)
-
-    if posted:
-        await query.edit_message_text(
-            f"✅ Handover posted — {len(cases)} case(s).", parse_mode=None
-        )
-    else:
-        await query.edit_message_text(text, parse_mode=None)
-    return ConversationHandler.END
+    await query.answer()
+    return await finish_handover(update, context)
 
 
 async def got_handover(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -3633,18 +3765,14 @@ async def cmd_handover(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     if not await gate(update):
         return
-    prev = last_open_handover()
+    running = open_cases()
     note = ""
-    if prev and prev["body"]:
-        note = (
-            f"\n\n<i>Last handover from "
-            f"{esc(display_name_of(prev['agent_id'], 'the previous agent'))} "
-            "left something open.</i>"
-        )
+    if running:
+        note = f"\n\n<i>{len(running)} case(s) still open from earlier shifts.</i>"
     await update.message.reply_text(
         "<b>Closing handover</b>\n\nAnything for the next agent?" + note,
         parse_mode=constants.ParseMode.HTML,
-        reply_markup=handover_keyboard(prev),
+        reply_markup=handover_keyboard(running),
     )
 
 
@@ -6384,6 +6512,7 @@ def main() -> None:
                     MessageHandler(filters.TEXT & ~filters.COMMAND, on_ho_body)
                 ],
                 HO_MORE: [CallbackQueryHandler(on_ho_more, pattern=r"^hm:")],
+                HO_PICK: [CallbackQueryHandler(on_handover_pick, pattern=r"^hk:")],
             },
             fallbacks=[CommandHandler("cancel", cancel)],
         )
