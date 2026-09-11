@@ -6398,13 +6398,110 @@ MINIAPP_HTML = """<!DOCTYPE html>
   .empty { text-align:center; padding:40px 20px; color: var(--tg-theme-hint-color,#777); }
   .note { margin-top:22px; font-size:12px; color: var(--tg-theme-hint-color,#777); }
   .err { background:#fee; color:#900; padding:14px; border-radius:12px; }
+  .tabs { display:flex; gap:8px; margin-bottom:18px; }
+  .tab { flex:1; padding:9px; text-align:center; border-radius:10px; font-size:14px;
+         font-weight:600; background: var(--tg-theme-secondary-bg-color,#f4f4f5);
+         color: var(--tg-theme-hint-color,#777); cursor:pointer; }
+  .tab.on { background: var(--tg-theme-link-color,#2a7); color:#fff; }
+  .nav { display:flex; align-items:center; justify-content:space-between;
+         margin-bottom:16px; }
+  .nav button { background: var(--tg-theme-secondary-bg-color,#f4f4f5);
+     border:0; border-radius:9px; padding:7px 14px; font-size:16px;
+     color: var(--tg-theme-text-color,#111); cursor:pointer; }
+  .nav button[disabled] { opacity:.3; }
+  .nav .m { font-weight:650; }
+  .p { padding:12px 0; border-bottom:1px solid var(--tg-theme-secondary-bg-color,#eee); }
+  .p:last-child { border-bottom:0; }
+  .ptop { display:flex; justify-content:space-between; align-items:baseline; }
+  .pn { font-weight:600; }
+  .pp { font-variant-numeric:tabular-nums; font-weight:600; }
+  .track { height:5px; border-radius:3px; margin-top:7px;
+           background: var(--tg-theme-secondary-bg-color,#eee); overflow:hidden; }
+  .fill { height:100%; background: var(--tg-theme-link-color,#2a7); }
+  .warn { background:#fff6e5; color:#8a5a00; padding:11px 13px;
+          border-radius:11px; font-size:13px; margin-bottom:16px; }
 </style>
 </head><body>
 <div id="app"><div class="empty">Loading…</div></div>
 <script>
 const tg = window.Telegram?.WebApp;
 if (tg) { tg.ready(); tg.expand(); }
+let VIEW = 'me', MONTH = '', IS_ADMIN = false;
 const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+
+function tabs() {
+  if (!IS_ADMIN) return '';
+  return '<div class="tabs">'
+    + `<div class="tab ${VIEW === 'me' ? 'on' : ''}" data-v="me">My hours</div>`
+    + `<div class="tab ${VIEW === 'team' ? 'on' : ''}" data-v="team">Team</div>`
+    + '</div>';
+}
+
+function wire() {
+  document.querySelectorAll('.tab').forEach(el => {
+    el.onclick = () => { VIEW = el.dataset.v; MONTH = ''; render(); };
+  });
+  const p = document.getElementById('prev'), n = document.getElementById('next');
+  if (p) p.onclick = () => { MONTH = p.dataset.m; render(); };
+  if (n) n.onclick = () => { MONTH = n.dataset.m; render(); };
+}
+
+async function loadTeam() {
+  const app = document.getElementById('app');
+  const r = await fetch('/api/team' + (MONTH ? '?month=' + MONTH : ''), {
+    headers: { 'X-Init-Data': tg?.initData || '' }
+  });
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  const d = await r.json();
+
+  let h = '<div class="nav">'
+    + `<button id="prev" data-m="${d.prev}">‹</button>`
+    + `<div class="m">${esc(d.month)}</div>`
+    + `<button id="next" data-m="${d.next}" ${d.hasNext ? '' : 'disabled'}>›</button>`
+    + '</div>';
+
+  h += '<div class="cards">';
+  h += `<div class="card"><div class="n">${esc(d.totalHours)}</div><div class="l">Team hours</div></div>`;
+  h += `<div class="card"><div class="n">${d.headcount}</div><div class="l">Worked</div></div>`;
+  h += `<div class="card pay wide"><div class="n">${esc(d.totalPay)}</div>`;
+  h += `<div class="l">${d.totalReviews} review(s)${d.totalOt ? ' · ' + esc(d.totalOt) + ' OT' : ''}</div></div>`;
+  h += '</div>';
+
+  if (d.flags) {
+    h += `<div class="warn">⚠️ ${d.flags} shift(s) auto-closed or unrostered — check /week</div>`;
+  }
+
+  if (d.people.length) {
+    h += '<h2>By agent</h2>';
+    for (const p of d.people) {
+      h += '<div class="p"><div class="ptop">';
+      h += `<div class="pn">${esc(p.name)}${p.flags ? ' <span class="flag">⚠️</span>' : ''}</div>`;
+      h += `<div class="pp">${esc(p.pay)}</div></div>`;
+      h += `<div class="t">${p.shifts} shift(s) · ${esc(p.hours)}`;
+      h += p.ot ? ` · +${esc(p.ot)} OT` : '';
+      h += p.reviews ? ` · ${p.reviews}⭐` : '';
+      h += '</div>';
+      h += `<div class="track"><div class="fill" style="width:${p.bar}%"></div></div>`;
+      h += '</div>';
+    }
+  } else {
+    h += '<div class="empty">Nothing logged this month.</div>';
+  }
+  app.innerHTML = tabs() + h;
+  wire();
+}
+
+async function render() {
+  if (VIEW === 'team') {
+    try { await loadTeam(); }
+    catch (e) {
+      document.getElementById('app').innerHTML =
+        '<div class="err">Could not load the team view.</div>';
+    }
+    return;
+  }
+  await load();
+}
 
 async function load() {
   const app = document.getElementById('app');
@@ -6426,6 +6523,7 @@ async function load() {
     }
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const d = await r.json();
+    IS_ADMIN = !!d.isAdmin;
 
     let h = `<h1>${esc(d.name)}</h1><div class="sub">${esc(d.month)}</div>`;
     h += '<div class="cards">';
@@ -6452,13 +6550,14 @@ async function load() {
     if (d.openShift) {
       h += '<div class="note">⏱ You are clocked in right now — this shift is not counted yet.</div>';
     }
-    app.innerHTML = h;
+    app.innerHTML = tabs() + h;
+    wire();
   } catch (e) {
     const why = e.name === 'AbortError' ? 'The server did not answer in time.' : esc(e.message || e);
     app.innerHTML = '<div class="err">Could not load your hours.<br><br>' + why + '</div>';
   }
 }
-load();
+render();
 </script>
 </body></html>"""
 
@@ -6533,6 +6632,7 @@ def miniapp_payload(user_id: int) -> dict:
 
     shifts.reverse()
     return {
+        "isAdmin": is_admin(user_id),
         "name": name,
         "month": first.strftime("%B %Y"),
         "hours": hhmm(total_min),
@@ -6543,6 +6643,68 @@ def miniapp_payload(user_id: int) -> dict:
         "total": money(total_cents),
         "openShift": bool(open_count),
         "shifts": shifts,
+    }
+
+
+def team_payload(month_first: date) -> dict:
+    """Everyone's month, for the admin view in the app."""
+    conn = sqlite3.connect(DB_PATH, timeout=5)
+    conn.row_factory = sqlite3.Row
+    try:
+        last = (month_first + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+        agents = conn.execute(
+            "SELECT user_id, display_name, name FROM agents WHERE status='active' "
+            "ORDER BY name"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    rows, tot_min, tot_ot, tot_cents, tot_rev = [], 0, 0, 0, 0
+    flags = 0
+    for a in agents:
+        t = timesheet(a["user_id"], month_first, last)
+        revs = len(reviews_for(a["user_id"], month_first, last))
+        rc = revs * REVIEW_RATE_CENTS
+        if not t["shifts"] and not revs:
+            continue
+        odd = sum(
+            1 for sh in t["shifts"]
+            if sh["row"]["status"] == "auto" or not sh["row"]["slot_id"]
+        )
+        flags += odd
+        tot_min += t["minutes"]
+        tot_ot += t.get("overtime", 0)
+        tot_cents += t["cents"] + rc
+        tot_rev += revs
+        rows.append({
+            "name": a["display_name"] or a["name"],
+            "shifts": len(t["shifts"]),
+            "minutes": t["minutes"],
+            "hours": hhmm(t["minutes"]),
+            "ot": hhmm(t.get("overtime", 0)) if t.get("overtime") else "",
+            "reviews": revs,
+            "pay": money(t["cents"] + rc),
+            "cents": t["cents"] + rc,
+            "flags": odd,
+        })
+    rows.sort(key=lambda r: -r["minutes"])
+    top = rows[0]["minutes"] if rows else 1
+    for r in rows:
+        r["bar"] = round(r["minutes"] / top * 100) if top else 0
+
+    return {
+        "month": month_first.strftime("%B %Y"),
+        "monthKey": month_first.strftime("%Y-%m"),
+        "prev": (month_first - timedelta(days=1)).strftime("%Y-%m"),
+        "next": (last + timedelta(days=1)).strftime("%Y-%m"),
+        "hasNext": last < now().date(),
+        "people": rows,
+        "totalHours": hhmm(tot_min),
+        "totalOt": hhmm(tot_ot) if tot_ot else "",
+        "totalPay": money(tot_cents),
+        "totalReviews": tot_rev,
+        "flags": flags,
+        "headcount": len(rows),
     }
 
 
@@ -6589,6 +6751,30 @@ class MiniAppHandler(BaseHTTPRequestHandler):
             return
         if path == "/health":
             self._send(200, b'{"ok":true}')
+            return
+        if path == "/api/team":
+            try:
+                qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                user = verify_init_data(self.headers.get("X-Init-Data", ""))
+                if not user or "id" not in user:
+                    self._send(401, b'{"error":"unverified"}')
+                    return
+                uid = int(user["id"])
+                if not is_admin(uid):
+                    self._send(403, b'{"error":"admins only"}')
+                    return
+                mk = (qs.get("month") or [""])[0]
+                try:
+                    first = date.fromisoformat(mk + "-01")
+                except ValueError:
+                    first = now().date().replace(day=1)
+                self._send(200, json.dumps(team_payload(first)).encode())
+            except Exception as e:
+                log.warning("Team view failed: %s", e)
+                try:
+                    self._send(500, b'{"error":"server"}')
+                except Exception:
+                    pass
             return
         if path == "/api/me":
             try:
