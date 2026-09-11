@@ -6468,13 +6468,19 @@ MINIAPP_HTML = """<!DOCTYPE html>
   .fill { height:100%; background: var(--tg-theme-link-color,#2a7); }
   .warn { background:#fff6e5; color:#8a5a00; padding:11px 13px;
           border-radius:11px; font-size:13px; margin-bottom:16px; }
+  .seg { display:inline-flex; gap:2px; padding:3px; border-radius:9px;
+         background: var(--tg-theme-secondary-bg-color,#f4f4f5); margin-bottom:14px; }
+  .seg div { padding:5px 16px; border-radius:7px; font-size:13px; font-weight:600;
+             color: var(--tg-theme-hint-color,#777); cursor:pointer; }
+  .seg div.on { background: var(--tg-theme-bg-color,#fff);
+                color: var(--tg-theme-text-color,#111); }
 </style>
 </head><body>
 <div id="app"><div class="empty">Loading…</div></div>
 <script>
 const tg = window.Telegram?.WebApp;
 if (tg) { tg.ready(); tg.expand(); }
-let VIEW = 'me', MONTH = '', IS_ADMIN = false;
+let VIEW = 'me', MODE = 'week', START = '', IS_ADMIN = false;
 const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 
 function tabs() {
@@ -6490,21 +6496,29 @@ function wire() {
     el.onclick = () => { VIEW = el.dataset.v; MONTH = ''; render(); };
   });
   const p = document.getElementById('prev'), n = document.getElementById('next');
-  if (p) p.onclick = () => { MONTH = p.dataset.m; render(); };
-  if (n) n.onclick = () => { MONTH = n.dataset.m; render(); };
+  if (p) p.onclick = () => { START = p.dataset.m; render(); };
+  if (n) n.onclick = () => { START = n.dataset.m; render(); };
+  document.querySelectorAll('.seg div').forEach(el => {
+    el.onclick = () => { MODE = el.dataset.p; START = ''; render(); };
+  });
 }
 
 async function loadTeam() {
   const app = document.getElementById('app');
-  const r = await fetch('/api/team' + (MONTH ? '?month=' + MONTH : ''), {
+  const qs = '?mode=' + MODE + (START ? '&start=' + START : '');
+  const r = await fetch('/api/team' + qs, {
     headers: { 'X-Init-Data': tg?.initData || '' }
   });
   if (!r.ok) throw new Error('HTTP ' + r.status);
   const d = await r.json();
 
-  let h = '<div class="nav">'
+  let h = '<div class="seg">'
+    + `<div data-p="week" class="${MODE === 'week' ? 'on' : ''}">Week</div>`
+    + `<div data-p="month" class="${MODE === 'month' ? 'on' : ''}">Month</div>`
+    + '</div>';
+  h += '<div class="nav">'
     + `<button id="prev" data-m="${d.prev}">‹</button>`
-    + `<div class="m">${esc(d.month)}</div>`
+    + `<div class="m">${esc(d.label)}</div>`
     + `<button id="next" data-m="${d.next}" ${d.hasNext ? '' : 'disabled'}>›</button>`
     + '</div>';
 
@@ -6533,7 +6547,7 @@ async function loadTeam() {
       h += '</div>';
     }
   } else {
-    h += '<div class="empty">Nothing logged this month.</div>';
+    h += `<div class="empty">Nothing logged this ${MODE}.</div>`;
   }
   app.innerHTML = tabs() + h;
   wire();
@@ -6694,12 +6708,28 @@ def miniapp_payload(user_id: int) -> dict:
     }
 
 
-def team_payload(month_first: date) -> dict:
-    """Everyone's month, for the admin view in the app."""
+def team_payload(first: date, mode: str = "month") -> dict:
+    """Everyone's hours for a week or a month, for the admin view."""
+    if mode == "week":
+        first = first - timedelta(days=first.weekday())
+        last = first + timedelta(days=6)
+        label = (
+            f"{first.strftime('%-d')}–{last.strftime('%-d %b')}"
+            if first.month == last.month
+            else f"{first.strftime('%-d %b')} – {last.strftime('%-d %b')}"
+        )
+        prev_s = (first - timedelta(days=7)).isoformat()
+        next_s = (first + timedelta(days=7)).isoformat()
+    else:
+        first = first.replace(day=1)
+        last = (first + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+        label = first.strftime("%B %Y")
+        prev_s = (first - timedelta(days=1)).replace(day=1).isoformat()
+        next_s = (last + timedelta(days=1)).isoformat()
+
     conn = sqlite3.connect(DB_PATH, timeout=5)
     conn.row_factory = sqlite3.Row
     try:
-        last = (month_first + timedelta(days=32)).replace(day=1) - timedelta(days=1)
         agents = conn.execute(
             "SELECT user_id, display_name, name FROM agents WHERE status='active' "
             "ORDER BY name"
@@ -6707,11 +6737,10 @@ def team_payload(month_first: date) -> dict:
     finally:
         conn.close()
 
-    rows, tot_min, tot_ot, tot_cents, tot_rev = [], 0, 0, 0, 0
-    flags = 0
+    rows, tot_min, tot_ot, tot_cents, tot_rev, flags = [], 0, 0, 0, 0, 0
     for a in agents:
-        t = timesheet(a["user_id"], month_first, last)
-        revs = len(reviews_for(a["user_id"], month_first, last))
+        t = timesheet(a["user_id"], first, last)
+        revs = len(reviews_for(a["user_id"], first, last))
         rc = revs * REVIEW_RATE_CENTS
         if not t["shifts"] and not revs:
             continue
@@ -6732,7 +6761,6 @@ def team_payload(month_first: date) -> dict:
             "ot": hhmm(t.get("overtime", 0)) if t.get("overtime") else "",
             "reviews": revs,
             "pay": money(t["cents"] + rc),
-            "cents": t["cents"] + rc,
             "flags": odd,
         })
     rows.sort(key=lambda r: -r["minutes"])
@@ -6741,10 +6769,10 @@ def team_payload(month_first: date) -> dict:
         r["bar"] = round(r["minutes"] / top * 100) if top else 0
 
     return {
-        "month": month_first.strftime("%B %Y"),
-        "monthKey": month_first.strftime("%Y-%m"),
-        "prev": (month_first - timedelta(days=1)).strftime("%Y-%m"),
-        "next": (last + timedelta(days=1)).strftime("%Y-%m"),
+        "mode": mode,
+        "label": label,
+        "prev": prev_s,
+        "next": next_s,
         "hasNext": last < now().date(),
         "people": rows,
         "totalHours": hhmm(tot_min),
@@ -6811,12 +6839,14 @@ class MiniAppHandler(BaseHTTPRequestHandler):
                 if not is_admin(uid):
                     self._send(403, b'{"error":"admins only"}')
                     return
-                mk = (qs.get("month") or [""])[0]
+                mode = (qs.get("mode") or ["week"])[0]
+                mode = "week" if mode == "week" else "month"
+                raw = (qs.get("start") or [""])[0]
                 try:
-                    first = date.fromisoformat(mk + "-01")
+                    first = date.fromisoformat(raw)
                 except ValueError:
-                    first = now().date().replace(day=1)
-                self._send(200, json.dumps(team_payload(first)).encode())
+                    first = now().date()
+                self._send(200, json.dumps(team_payload(first, mode)).encode())
             except Exception as e:
                 log.warning("Team view failed: %s", e)
                 try:
