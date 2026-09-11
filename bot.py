@@ -826,6 +826,24 @@ def open_week() -> sqlite3.Row | None:
     return q1("SELECT * FROM weeks WHERE status='open' ORDER BY id DESC LIMIT 1")
 
 
+def week_containing(d: date) -> sqlite3.Row | None:
+    """The week whose dates cover this day, whatever its status."""
+    return q1(
+        "SELECT * FROM weeks WHERE ? BETWEEN start_date AND end_date "
+        "ORDER BY id DESC LIMIT 1",
+        (d.isoformat(),),
+    )
+
+
+def this_week() -> sqlite3.Row | None:
+    """The week being worked right now.
+
+    Different from latest_week(): once next week opens for avails, that one is
+    'latest', but people still need to see the week they're actually in.
+    """
+    return week_containing(now().date()) or latest_week()
+
+
 def latest_week() -> sqlite3.Row | None:
     """The week we're actually in.
 
@@ -4352,7 +4370,10 @@ async def cmd_myshifts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     if not await gate(update):
         return
-    w = latest_week()
+    wants_next = bool(context.args) and context.args[0].lower() in ("next", "new")
+    here = this_week()
+    nxt = open_week()
+    w = nxt if wants_next and nxt else here
     if not w:
         await update.message.reply_text("No week has been posted yet.")
         return
@@ -4362,17 +4383,27 @@ async def cmd_myshifts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
            WHERE d.week_id=? AND su.user_id=? ORDER BY d.idx, s.idx""",
         (w["id"], update.effective_user.id),
     )
+    hint = ""
+    if nxt and here and nxt["id"] != here["id"]:
+        hint = (
+            f"\n<i>{esc(nxt['label'])} is open — /myshifts next</i>"
+            if not wants_next
+            else "\n<i>/myshifts for this week</i>"
+        )
     if not rows:
         await update.message.reply_text(
-            f"You haven't claimed anything for {w['label']} yet."
+            f"You haven't claimed anything for {esc(w['label'])} yet." + hint,
+            parse_mode=constants.ParseMode.HTML,
         )
         return
-    lines = [f"<b>Your shifts — {w['label']}</b>"] + [
+    lines = [f"<b>Your shifts — {esc(w['label'])}</b>"] + [
         f"{r['name']} {fmt_day(date.fromisoformat(r['the_date']))}: {r['label']}"
         for r in rows
     ]
     lines.append(f"\n{len(rows)} slot(s)")
-    await update.message.reply_text("\n".join(lines), parse_mode=constants.ParseMode.HTML)
+    await update.message.reply_text(
+        "\n".join(lines) + hint, parse_mode=constants.ParseMode.HTML
+    )
 
 
 async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -4381,13 +4412,30 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     if not await gate(update):
         return
-    w = latest_week()
+
+    wants_next = bool(context.args) and context.args[0].lower() in ("next", "new")
+    here = this_week()
+    nxt = open_week()
+    w = nxt if wants_next and nxt else here
     if not w:
         await update.message.reply_text("No week has been posted yet.")
         return
+
+    tail = ""
+    if nxt and here and nxt["id"] != here["id"]:
+        tail = (
+            f"\n\n<i>Showing {esc(here['label'])}. "
+            f"{esc(nxt['label'])} is open for avails — /summary next</i>"
+            if not wants_next else
+            f"\n\n<i>Showing {esc(nxt['label'])}, open for avails. "
+            "/summary for this week</i>"
+        )
+
     if BOARD_MODE == "single":
         text, _ = render_board(w["id"])
-        await update.message.reply_text(text, parse_mode=constants.ParseMode.HTML)
+        await update.message.reply_text(
+            text + tail, parse_mode=constants.ParseMode.HTML
+        )
         return
     lines = [render_header(w["id"])[0], ""]
     for d in q("SELECT * FROM days WHERE week_id=? ORDER BY idx", (w["id"],)):
@@ -6244,13 +6292,13 @@ AGENT_COMMANDS = [
     ("clockout", "End my shift"),
     ("mytime", "My hours this month"),
     ("payslip", "My hours and pay"),
-    ("myshifts", "What I'm signed up for"),
+    ("myshifts", "My shifts — or /myshifts next"),
     ("dropshift", "Ask to drop a shift"),
     ("pickup", "Ask to take an open shift"),
     ("swap", "Hand a shift to someone"),
     ("support", "Who I list as support"),
     ("handover", "Post a closing handover"),
-    ("summary", "Show the current board"),
+    ("summary", "This week's board — or /summary next"),
     ("help", "List commands"),
 ]
 GROUP_COMMANDS = [
