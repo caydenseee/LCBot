@@ -134,6 +134,11 @@ BACKUP_TIME = os.environ.get("BACKUP_TIME", "").strip() or "09:00"
 PAY_MODE = (os.environ.get("PAY_MODE", "").strip().lower() or "slot")
 # Allowed early finish, in minutes, before a slot stops counting as worked.
 SLOT_GRACE_MIN = env_int("SLOT_GRACE_MIN", 15)
+# Overtime past the end of a rostered block. Anything under OT_MIN_MINUTES is
+# treated as packing up rather than work, so a 12:02 clock-out isn't paid as OT.
+OT_MIN_MINUTES = env_int("OT_MIN_MINUTES", 5)
+# Above this, admins get told — usually a forgotten clock-out rather than real OT.
+OT_ALERT_MINUTES = env_int("OT_ALERT_MINUTES", 60)
 # Forum topics. Leave blank for a normal group. Get the number by sending
 # /chatid inside the topic you want.
 GROUP_THREAD_ID = env_int("GROUP_THREAD_ID") or None
@@ -270,6 +275,7 @@ CREATE TABLE IF NOT EXISTS drop_requests (
     agent_id     INTEGER NOT NULL,
     slot_id      INTEGER NOT NULL,
     reason       TEXT,
+    target_id    INTEGER,
     requested_at TEXT NOT NULL,
     status       TEXT NOT NULL DEFAULT 'pending',
     decided_by   INTEGER,
@@ -373,6 +379,8 @@ if "kind" not in _dr_cols:
     db.execute("ALTER TABLE drop_requests ADD COLUMN kind TEXT NOT NULL DEFAULT 'drop'")
 if "notified" not in _dr_cols:
     db.execute("ALTER TABLE drop_requests ADD COLUMN notified TEXT")
+if "target_id" not in _dr_cols:
+    db.execute("ALTER TABLE drop_requests ADD COLUMN target_id INTEGER")
 _te_cols = {r[1] for r in db.execute("PRAGMA table_info(time_entries)")}
 for _c, _d in (("shift_label", "TEXT"),
                ("opening_posted", "INTEGER NOT NULL DEFAULT 0")):
@@ -643,23 +651,44 @@ def slot_run_from(slot_id: int):
     return run_
 
 
-def entry_paid_minutes(row) -> int:
-    """Minutes an entry is paid for."""
+def entry_split(row) -> tuple:
+    """(rostered minutes, overtime minutes) for one entry.
+
+    The rostered block is the floor — clocking in a minute late doesn't cost
+    anyone. Staying past the end is paid on top, to the minute.
+    """
     if not row["clock_out"]:
-        return 0
+        return 0, 0
     actual = entry_minutes(row)
     if PAY_MODE != "slot" or not row["slot_id"]:
-        return actual
+        return actual, 0
+
     out = datetime.fromisoformat(row["clock_out"])
     day = date.fromisoformat(row["the_date"])
-    total = 0
+    midnight = datetime.combine(day, time(0, 0), TZ)
+
+    base, last_end = 0, None
     for sl in slot_run_from(row["slot_id"]):
-        start = sl["start_min"]
-        end_min = start + slot_minutes(sl["label"])
-        slot_end = datetime.combine(day, time(0, 0), TZ) + timedelta(minutes=end_min)
+        end_min = sl["start_min"] + slot_minutes(sl["label"])
+        slot_end = midnight + timedelta(minutes=end_min)
         if out >= slot_end - timedelta(minutes=SLOT_GRACE_MIN):
-            total += slot_minutes(sl["label"])
-    return total or actual
+            base += slot_minutes(sl["label"])
+            last_end = slot_end
+    if not base:
+        return actual, 0
+
+    ot = 0
+    if last_end and out > last_end:
+        over = int((out - last_end).total_seconds() // 60)
+        if over >= OT_MIN_MINUTES:
+            ot = over
+    return base, ot
+
+
+def entry_paid_minutes(row) -> int:
+    """Total minutes an entry is paid for, rostered plus any overtime."""
+    base, ot = entry_split(row)
+    return base + ot
 
 
 def entry_minutes(row) -> int:
@@ -689,25 +718,27 @@ def timesheet(agent_id: int, first: date, last: date) -> dict:
         if not r["clock_out"]:
             open_count += 1
             continue
-        m = entry_paid_minutes(r)
+        base, ot = entry_split(r)
+        m = base + ot
         actual = entry_minutes(r)
         day = date.fromisoformat(r["the_date"])
         dup = False
         if PAY_MODE == "slot" and r["slot_id"]:
             key = (r["the_date"], r["slot_id"])
             if key in credited:
-                m, dup = 0, True
+                m, base, ot, dup = 0, 0, 0, True
             else:
                 credited.add(key)
         pay = round(m / 60 * rate_for(agent_id, day))
         minutes += m
         cents += pay
         shifts.append({
-            "row": r, "date": day, "minutes": m,
+            "row": r, "date": day, "minutes": m, "base": base, "ot": ot,
             "actual": actual, "cents": pay, "duplicate": dup,
         })
     return {
         "shifts": shifts,
+        "overtime": sum(sh["ot"] for sh in shifts),
         "minutes": minutes,
         "cents": cents,
         "open": open_count,
@@ -2265,6 +2296,7 @@ HANDOVER_TEXT = 220
 HO_SECTION, HO_PRIO, HO_PLATFORM, HO_STORE, HO_BODY, HO_MORE = range(221, 227)
 REVIEW_PHOTO = 230
 HO_PICK = 231
+SWAP_PICK, SWAP_WHO, SWAP_REASON = 240, 241, 242
 
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -3065,6 +3097,186 @@ async def got_pickup_reason(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     return ConversationHandler.END
 
 
+async def cmd_swap(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Hand a shift straight to a named colleague."""
+    if update.effective_chat.type != constants.ChatType.PRIVATE:
+        await update.message.reply_text("Message me directly for that 🙂")
+        return ConversationHandler.END
+    if not await gate(update):
+        return ConversationHandler.END
+
+    user = update.effective_user
+    w = open_week() or latest_week()
+    if not w:
+        await update.message.reply_text("No week has been posted yet.")
+        return ConversationHandler.END
+
+    today = now().date().isoformat()
+    mine = q(
+        """SELECT s.id, s.label, d.name AS day_name FROM signups su
+           JOIN slots s ON s.id = su.slot_id
+           JOIN days d ON d.id = s.day_id
+           WHERE d.week_id=? AND su.user_id=? AND d.the_date >= ?
+           ORDER BY d.idx, s.idx""",
+        (w["id"], user.id, today),
+    )
+    if not mine:
+        await update.message.reply_text("You have no upcoming shifts this week.")
+        return ConversationHandler.END
+
+    pending = {
+        r["slot_id"] for r in q(
+            "SELECT slot_id FROM drop_requests WHERE agent_id=? AND status='pending'",
+            (user.id,),
+        )
+    }
+    rows = [
+        [InlineKeyboardButton(f"{m['day_name']} {m['label']}",
+                              callback_data=f"sw:{m['id']}")]
+        for m in mine if m["id"] not in pending
+    ]
+    if not rows:
+        await update.message.reply_text(
+            "You've already got requests in for all of those."
+        )
+        return ConversationHandler.END
+    rows.append([InlineKeyboardButton("Cancel", callback_data="sw:cancel")])
+    await update.message.reply_text(
+        "<b>Which shift are you handing over?</b>",
+        parse_mode=constants.ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+    return SWAP_PICK
+
+
+async def on_swap_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    raw = query.data.split(":", 1)[1]
+    await query.answer()
+    if raw == "cancel":
+        await query.edit_message_text("No problem — nothing changed.")
+        return ConversationHandler.END
+
+    slot = q1(
+        """SELECT s.id, s.label, s.capacity, d.name AS day_name FROM slots s
+           JOIN days d ON d.id = s.day_id WHERE s.id=?""",
+        (int(raw),),
+    )
+    if not slot:
+        await query.edit_message_text("That shift no longer exists.")
+        return ConversationHandler.END
+
+    context.user_data["swap_slot"] = slot["id"]
+    holders = {h["user_id"] for h in slot_holders(slot["id"])}
+    others = [
+        a for a in q("SELECT * FROM agents WHERE status='active' ORDER BY name")
+        if a["user_id"] != query.from_user.id and a["user_id"] not in holders
+    ]
+    if not others:
+        await query.edit_message_text("There's nobody else to hand it to.")
+        return ConversationHandler.END
+
+    rows, row = [], []
+    for a in others:
+        nm = a["display_name"] or a["name"]
+        row.append(InlineKeyboardButton(nm[:20], callback_data=f"sq:{a['user_id']}"))
+        if len(row) == 2:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("Cancel", callback_data="sq:cancel")])
+
+    await query.edit_message_text(
+        f"<b>{slot['day_name']} {esc(slot['label'])}</b>\n\n"
+        "Who's taking it?",
+        parse_mode=constants.ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+    return SWAP_WHO
+
+
+async def on_swap_who(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    raw = query.data.split(":", 1)[1]
+    await query.answer()
+    if raw == "cancel":
+        await query.edit_message_text("No problem — nothing changed.")
+        return ConversationHandler.END
+
+    context.user_data["swap_to"] = int(raw)
+    nm = display_name_of(int(raw), "them")
+    await query.edit_message_text(
+        f"Handing it to <b>{esc(nm)}</b>.\n\n"
+        "Why? A short reason is fine — your manager sees this.",
+        parse_mode=constants.ParseMode.HTML,
+    )
+    return SWAP_REASON
+
+
+async def got_swap_reason(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    user = update.effective_user
+    slot_id = context.user_data.pop("swap_slot", None)
+    to_id = context.user_data.pop("swap_to", None)
+    if not slot_id or not to_id:
+        await update.message.reply_text("That expired — send /swap again.")
+        return ConversationHandler.END
+
+    reason = " ".join(update.message.text.split()).strip()
+    if len(reason) < 3:
+        await update.message.reply_text("A little more detail, or /cancel.")
+        context.user_data["swap_slot"] = slot_id
+        context.user_data["swap_to"] = to_id
+        return SWAP_REASON
+
+    slot = q1(
+        """SELECT s.label, d.name AS day_name FROM slots s
+           JOIN days d ON d.id = s.day_id WHERE s.id=?""",
+        (slot_id,),
+    )
+    async with write_lock:
+        cur = run(
+            "INSERT INTO drop_requests (kind, agent_id, slot_id, target_id, reason,"
+            " requested_at) VALUES ('swap',?,?,?,?,?)",
+            (user.id, slot_id, to_id, reason, now().isoformat()),
+        )
+        req_id = cur.lastrowid
+
+    from_nm = display_name_of(user.id, user.full_name)
+    to_nm = display_name_of(to_id, "them")
+    where = f"{slot['day_name']} {slot['label']}"
+
+    await update.message.reply_text(
+        f"✅ Sent to your manager.\n\n"
+        f"<b>{esc(where)}</b> → {esc(to_nm)}\n\n"
+        "You're still on it until they approve.",
+        parse_mode=constants.ParseMode.HTML,
+    )
+    try:
+        await context.bot.send_message(
+            to_id,
+            f"🔄 {from_nm} has asked to hand you {where}.\n"
+            f"Reason: {reason}\n\n"
+            "Waiting on a manager to approve it.",
+        )
+    except Exception:
+        pass
+
+    text = (
+        "🔄 <b>Shift swap request</b>\n\n"
+        f"<b>{esc(from_nm)}</b> → <b>{esc(to_nm)}</b>\n"
+        f"{esc(where)}\n"
+        f"<i>{esc(reason)}</i>"
+    )
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Approve", callback_data=f"dq:a:{req_id}"),
+        InlineKeyboardButton("🚫 Decline", callback_data=f"dq:d:{req_id}"),
+    ]])
+    sent = await notify_admins(context.bot, text, kb)
+    run("UPDATE drop_requests SET notified=? WHERE id=?",
+        (json.dumps(sent), req_id))
+    return ConversationHandler.END
+
+
 async def on_drop_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     _, action, raw = query.data.split(":")
@@ -3088,6 +3300,8 @@ async def on_drop_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     nm = display_name_of(req["agent_id"], str(req["agent_id"]))
     approve = action == "a"
     is_pickup = req["kind"] == "pickup"
+    is_swap = req["kind"] == "swap"
+    to_nm = display_name_of(req["target_id"], "them") if req["target_id"] else ""
     where = f"{slot['day_name']} {slot['label']}" if slot else "that shift"
 
     async with write_lock:
@@ -3097,7 +3311,18 @@ async def on_drop_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -
              query.from_user.id, now().isoformat(), req["id"]),
         )
         if approve and slot:
-            if is_pickup:
+            if is_swap:
+                # One move, so the slot is never open for anyone else to take.
+                run(
+                    "DELETE FROM signups WHERE slot_id=? AND user_id=?",
+                    (slot["id"], req["agent_id"]),
+                )
+                run(
+                    "INSERT OR IGNORE INTO signups (slot_id, user_id, name, ts) "
+                    "VALUES (?,?,?,?)",
+                    (slot["id"], req["target_id"], to_nm, now().isoformat()),
+                )
+            elif is_pickup:
                 run(
                     "INSERT OR IGNORE INTO signups (slot_id, user_id, name, ts) "
                     "VALUES (?,?,?,?)",
@@ -3111,8 +3336,9 @@ async def on_drop_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     verdict = "approved ✅" if approve else "declined 🚫"
     await query.answer(f"{nm} {verdict}")
-    title = "Shift pickup request" if is_pickup else "Shift drop request"
-    icon = "🙌" if is_pickup else "🙋"
+    title = ("Shift swap request" if is_swap
+             else "Shift pickup request" if is_pickup else "Shift drop request")
+    icon = "🔄" if is_swap else "🙌" if is_pickup else "🙋"
     settled = (
         f"{icon} <b>{title}</b>\n\n"
         f"<b>{esc(nm)}</b> — {esc(where)}\n"
@@ -3132,6 +3358,36 @@ async def on_drop_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             )
         except BadRequest:
             pass
+
+    if is_swap:
+        try:
+            if approve:
+                await context.bot.send_message(
+                    req["agent_id"],
+                    f"✅ {to_nm} is taking {where}. You're off it.\n\n"
+                    "Check /myshifts.",
+                )
+                await context.bot.send_message(
+                    req["target_id"],
+                    f"✅ You're on {where}, taking over from {nm}.\n\n"
+                    "Check /myshifts.",
+                )
+            else:
+                await context.bot.send_message(
+                    req["agent_id"],
+                    f"Your swap for {where} wasn't approved.\n"
+                    "You're still on that shift.",
+                )
+                await context.bot.send_message(
+                    req["target_id"],
+                    f"The swap for {where} wasn't approved — "
+                    f"{nm} is keeping it.",
+                )
+        except Exception:
+            pass
+        if approve and slot:
+            await refresh_group(context, slot["week_id"], slot["day_id"])
+        return
 
     try:
         if approve and is_pickup:
@@ -3176,7 +3432,8 @@ async def cmd_dropreqs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             InlineKeyboardButton("✅ Approve", callback_data=f"dq:a:{r['id']}"),
             InlineKeyboardButton("🚫 Decline", callback_data=f"dq:d:{r['id']}"),
         ]])
-        icon = "🙌 wants" if r["kind"] == "pickup" else "🙋 can't work"
+        icon = ("🔄 swap" if r["kind"] == "swap"
+                else "🙌 wants" if r["kind"] == "pickup" else "🙋 can't work")
         await update.message.reply_text(
             f"{icon} — <b>{esc(nm)}</b>, {esc(where)}\n"
             + (f"<i>{esc(r['reason'])}</i>" if r["reason"] else ""),
@@ -3215,10 +3472,14 @@ async def cmd_clockout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     day = date.fromisoformat(fresh["the_date"])
     pay = round(mins / 60 * rate_for(user.id, day))
 
+    _base, _ot = entry_split(fresh)
     msg = [f"✅ Clocked out at <b>{when.strftime('%H:%M')}</b>"]
-    if PAY_MODE == "slot" and fresh["slot_id"] and mins != actual:
-        msg.append(f"On duty: {hhmm(actual)}")
-        msg.append(f"Credited: <b>{hhmm(mins)}</b> (full shift)")
+    if _ot:
+        msg.append(f"Shift: {hhmm(_base)}")
+        msg.append(f"Overtime: <b>+{hhmm(_ot)}</b>")
+        msg.append(f"Total: <b>{hhmm(mins)}</b>")
+    elif PAY_MODE == "slot" and fresh["slot_id"] and mins != actual:
+        msg.append(f"Credited: <b>{hhmm(mins)}</b>")
     else:
         msg.append(f"Worked: <b>{hhmm(mins)}</b>")
     if pay:
@@ -3956,9 +4217,10 @@ async def cmd_mytime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         b = datetime.fromisoformat(r["clock_out"]).strftime("%H:%M")
         flag = " ⚠️" if r["status"] == "auto" else ""
         pay = f"  {money(sh['cents'])}" if sh["cents"] else ""
+        ot = f"  (+{hhmm(sh['ot'])} OT)" if sh.get("ot") else ""
         lines.append(
             f"{sh['date'].strftime('%a %-d %b')}  {a}–{b}  "
-            f"<b>{hhmm(sh['minutes'])}</b>{pay}{flag}  <code>#{r['id']}</code>"
+            f"<b>{hhmm(sh['minutes'])}</b>{ot}{pay}{flag}  <code>#{r['id']}</code>"
         )
     if t["shifts"]:
         lines += [
@@ -3970,6 +4232,8 @@ async def cmd_mytime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
                 f"<b>{money(t['cents'])}</b> at "
                 f"{money(rate_for(user.id, now().date()))}/hour"
             )
+            if t.get("overtime"):
+                lines.append(f"<i>includes {hhmm(t['overtime'])} overtime</i>")
     revs = reviews_for(user.id, first, last)
     if revs:
         rc = len(revs) * REVIEW_RATE_CENTS
@@ -4956,6 +5220,8 @@ def week_report(first: date, last: date) -> str:
         for a, t, revs, rc in sorted(people, key=lambda x: -x[1]["minutes"]):
             nm = a["display_name"] or a["name"]
             bit = f"{esc(nm)} — {len(t['shifts'])} shift(s), {hhmm(t['minutes'])}"
+            if t.get("overtime"):
+                bit += f" (+{hhmm(t['overtime'])} OT)"
             if t["cents"] or rc:
                 bit += f" · {money(t['cents'] + rc)}"
             if revs:
@@ -5187,8 +5453,8 @@ async def cmd_payroll(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     wr = csv.writer(buf)
     wr.writerow([
         "entry", "agent", "telegram_id", "date", "day", "slot",
-        "clock_in", "clock_out", "actual_hours", "paid_hours",
-        "rate", "pay", "status",
+        "clock_in", "clock_out", "actual_hours", "shift_hours", "ot_hours",
+        "paid_hours", "rate", "pay", "status",
     ])
     rows_written = 0
     for a in q("SELECT * FROM agents ORDER BY name"):
@@ -5210,6 +5476,8 @@ async def cmd_payroll(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 datetime.fromisoformat(r["clock_in"]).strftime("%H:%M"),
                 datetime.fromisoformat(r["clock_out"]).strftime("%H:%M"),
                 f"{sh['actual'] / 60:.2f}",
+                f"{sh.get('base', 0) / 60:.2f}",
+                f"{sh.get('ot', 0) / 60:.2f}",
                 f"{sh['minutes'] / 60:.2f}",
                 f"{rate_for(a['user_id'], sh['date']) / 100:.2f}",
                 f"{sh['cents'] / 100:.2f}",
@@ -5979,6 +6247,7 @@ AGENT_COMMANDS = [
     ("myshifts", "What I'm signed up for"),
     ("dropshift", "Ask to drop a shift"),
     ("pickup", "Ask to take an open shift"),
+    ("swap", "Hand a shift to someone"),
     ("support", "Who I list as support"),
     ("handover", "Post a closing handover"),
     ("summary", "Show the current board"),
@@ -6172,7 +6441,7 @@ async function load() {
       for (const s of d.shifts) {
         h += '<div class="row"><div>';
         h += `<div class="d">${esc(s.date)}</div>`;
-        h += `<div class="t">${esc(s.times)}${s.flagged ? ' <span class="flag">· auto-closed</span>' : ''}</div>`;
+        h += `<div class="t">${esc(s.times)}${s.ot ? ' · +' + esc(s.ot) + ' OT' : ''}${s.flagged ? ' <span class="flag">· auto-closed</span>' : ''}</div>`;
         h += `</div><div class="h"><div>${esc(s.hours)}</div>`;
         h += s.pay ? `<div class="t">${esc(s.pay)}</div>` : '';
         h += `</div></div>`;
@@ -6238,7 +6507,8 @@ def miniapp_payload(user_id: int) -> dict:
                 continue
             a = datetime.fromisoformat(r["clock_in"])
             b = datetime.fromisoformat(r["clock_out"])
-            mins = entry_paid_minutes(r)
+            b_min, ot_min = entry_split(r)
+            mins = b_min + ot_min
             if PAY_MODE == "slot" and r["slot_id"]:
                 key = (r["the_date"], r["slot_id"])
                 if key in credited:
@@ -6253,6 +6523,7 @@ def miniapp_payload(user_id: int) -> dict:
                 "date": day.strftime("%a %-d %b"),
                 "times": f"{a.strftime('%H:%M')}\u2013{b.strftime('%H:%M')}",
                 "hours": hhmm(mins),
+                "ot": hhmm(ot_min) if ot_min else "",
                 "pay": money(cents) if cents else "",
                 "flagged": r["status"] == "auto",
             })
@@ -6485,6 +6756,19 @@ def main() -> None:
             fallbacks=[CommandHandler("cancel", cancel)],
         )
     )
+    app.add_handler(
+        ConversationHandler(
+            entry_points=[CommandHandler("swap", cmd_swap)],
+            states={
+                SWAP_PICK: [CallbackQueryHandler(on_swap_pick, pattern=r"^sw:")],
+                SWAP_WHO: [CallbackQueryHandler(on_swap_who, pattern=r"^sq:")],
+                SWAP_REASON: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, got_swap_reason)
+                ],
+            },
+            fallbacks=[CommandHandler("cancel", cancel)],
+        )
+    )
     app.add_handler(CommandHandler("dropreqs", cmd_dropreqs))
     app.add_handler(CallbackQueryHandler(on_drop_decision, pattern=r"^dq:[ad]:\d+$"))
     app.add_handler(CommandHandler("clockout", cmd_clockout))
@@ -6564,4 +6848,4 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()    
+    main()
