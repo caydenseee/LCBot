@@ -308,14 +308,6 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(text, parse_mode=constants.ParseMode.HTML)
 
 
-async def job_nudge(context: ContextTypes.DEFAULT_TYPE) -> None:
-    await nudge(context, context.job.data["week_id"], context.job.data["prefix"])
-
-
-async def job_close(context: ContextTypes.DEFAULT_TYPE) -> None:
-    await close_week(context, context.job.data["week_id"])
-
-
 async def job_shift_call(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Evening-before group post tagging tomorrow's agents."""
     text, reason = build_shift_call()

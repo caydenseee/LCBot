@@ -1749,6 +1749,10 @@ async def nudge(context: ContextTypes.DEFAULT_TYPE, week_id: int, prefix: str) -
     )
 
 
+async def job_nudge(context: ContextTypes.DEFAULT_TYPE) -> None:
+    await nudge(context, context.job.data["week_id"], context.job.data["prefix"])
+
+
 async def close_week(context: ContextTypes.DEFAULT_TYPE, week_id: int) -> None:
     w = q1("SELECT * FROM weeks WHERE id=?", (week_id,))
     if not w or w["status"] != "open":
@@ -1780,6 +1784,10 @@ async def close_week(context: ContextTypes.DEFAULT_TYPE, week_id: int) -> None:
     await send_group(
         context.bot, "\n".join(msg), parse_mode=constants.ParseMode.HTML
     )
+
+
+async def job_close(context: ContextTypes.DEFAULT_TYPE) -> None:
+    await close_week(context, context.job.data["week_id"])
 
 
 def mention(user_id: int, name: str) -> str:
