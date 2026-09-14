@@ -102,7 +102,8 @@ def miniapp_payload(user_id: int) -> dict:
         "hours": hhmm(total_min),
         "days": len(seen_days),
         "count": len(shifts),
-        "showPay": bool(rate),
+        "showPay": bool(rate) and not is_salaried(user_id),
+        "salaried": is_salaried(user_id),
         "rate": money(rate),
         "total": money(total_cents),
         "openShift": bool(open_count),
@@ -162,7 +163,7 @@ def team_payload(first: date, mode: str = "month") -> dict:
             "hours": hhmm(t["minutes"]),
             "ot": hhmm(t.get("overtime", 0)) if t.get("overtime") else "",
             "reviews": revs,
-            "pay": money(t["cents"] + rc),
+            "pay": "salaried" if is_salaried(a["user_id"]) else money(t["cents"] + rc),
             "flags": odd,
         })
     rows.sort(key=lambda r: -r["minutes"])

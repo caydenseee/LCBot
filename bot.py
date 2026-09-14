@@ -523,6 +523,7 @@ def main() -> None:
     app.add_handler(CommandHandler("tidy", cmd_tidy))
     app.add_handler(CommandHandler("removeagent", cmd_removeagent))
     app.add_handler(CommandHandler("avails", cmd_avails))
+    app.add_handler(CommandHandler("salaried", cmd_salaried))
     app.add_handler(CommandHandler("tag", cmd_tag))
     app.add_handler(CommandHandler("fixed", cmd_fixed))
     app.add_handler(CommandHandler("capacity", cmd_capacity))

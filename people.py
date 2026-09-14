@@ -370,6 +370,8 @@ async def cmd_roster(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             bits += f" @{r['username']}"
         if not r["on_avails"]:
             bits += " · not on avails"
+        if r["salaried"]:
+            bits += " · salaried"
         bits += f" · <code>{r['user_id']}</code>"
         return bits
 
@@ -503,6 +505,56 @@ async def cmd_tag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     else:
         msg = (f"<b>{esc(nm)}</b> won't be tagged in the nightly post.\n"
                "They'll still appear on the rota.")
+    await update.message.reply_text(msg, parse_mode=constants.ParseMode.HTML)
+
+
+async def cmd_salaried(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Mark someone as salaried, so their hours aren't paid hourly."""
+    if not is_admin(update.effective_user.id):
+        return
+    if not context.args:
+        sal = q("SELECT * FROM agents WHERE status='active' AND salaried=1 ORDER BY name")
+        hourly = q("SELECT * FROM agents WHERE status='active' AND salaried=0 ORDER BY name")
+        lines = [f"<b>Salaried — no hourly pay ({len(sal)})</b>"]
+        lines += [f"  {esc(a['display_name'] or a['name'])}" for a in sal] or ["  nobody"]
+        lines += ["", f"<b>Paid hourly ({len(hourly)})</b>"]
+        lines += [f"  {esc(a['display_name'] or a['name'])}" for a in hourly] or ["  nobody"]
+        lines += [
+            "",
+            "<code>/salaried on @handle</code> — stop hourly pay",
+            "<code>/salaried off @handle</code> — pay them hourly again",
+            "",
+            "<i>Salaried agents still appear on the board, still clock in "
+            "and out, and their hours are still recorded.</i>",
+        ]
+        await update.message.reply_text(
+            "\n".join(lines), parse_mode=constants.ParseMode.HTML
+        )
+        return
+
+    mode = context.args[0].lower()
+    if mode not in ("on", "off") or len(context.args) < 2:
+        await update.message.reply_text(
+            "Usage: <code>/salaried on @handle</code> or "
+            "<code>/salaried off @handle</code>",
+            parse_mode=constants.ParseMode.HTML,
+        )
+        return
+    row = find_agent(context.args[1])
+    if not row:
+        await update.message.reply_text("No one matches that. Check /roster.")
+        return
+
+    want = 1 if mode == "on" else 0
+    async with write_lock:
+        run("UPDATE agents SET salaried=? WHERE user_id=?", (want, row["user_id"]))
+    nm = row["display_name"] or row["name"]
+    if want:
+        msg = (f"<b>{esc(nm)}</b> is salaried — livechat hours won't be paid "
+               "hourly.\nThey still show on the board and still clock in and out.")
+    else:
+        msg = (f"<b>{esc(nm)}</b> is back on hourly pay at "
+               f"{money(rate_for(row['user_id'], now().date()))}/hour.")
     await update.message.reply_text(msg, parse_mode=constants.ParseMode.HTML)
 
 

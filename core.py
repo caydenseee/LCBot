@@ -400,6 +400,7 @@ for _col, _ddl in [
     ("support_name", "TEXT"),
     ("on_avails", "INTEGER NOT NULL DEFAULT 1"),
     ("tag_calls", "INTEGER NOT NULL DEFAULT 1"),
+    ("salaried", "INTEGER NOT NULL DEFAULT 0"),
     ("requested_at", "TEXT"),
     ("decided_by", "INTEGER"),
     ("decided_at", "TEXT"),
@@ -585,8 +586,17 @@ def is_admin(user_id: int) -> bool:
     return bool(row and row["role"] == "admin")
 
 
+def is_salaried(agent_id: int) -> bool:
+    """Full-timers on a salary — rostered and clocked like anyone else, but
+    their livechat hours don't accrue hourly pay."""
+    row = q1("SELECT salaried FROM agents WHERE user_id=?", (agent_id,))
+    return bool(row and row["salaried"])
+
+
 def rate_for(agent_id: int, on: date) -> int:
     """Hourly rate in cents that applied on a given day."""
+    if is_salaried(agent_id):
+        return 0
     row = q1(
         "SELECT cents FROM pay_rates WHERE agent_id=? AND effective_from<=? "
         "ORDER BY effective_from DESC, id DESC LIMIT 1",
@@ -1882,6 +1892,7 @@ ADMIN_GROUPS = [
         ("roster", "Who's on the list"),
         ("rename", "Fix someone's name on the schedule"),
         ("avails", "Who gets tagged for avails"),
+        ("salaried", "Who isn't paid hourly"),
         ("tag", "Who gets pinged in the nightly post"),
         ("removeagent", "Remove someone, frees their slots"),
     ]),
@@ -2144,6 +2155,8 @@ async function load() {
     if (d.showPay) {
       h += `<div class="card pay wide"><div class="n">${esc(d.total)}</div>`;
       h += `<div class="l">at ${esc(d.rate)}/hour</div></div>`;
+    } else if (d.salaried) {
+      h += `<div class="card wide"><div class="l">Salaried — hours are recorded but not paid hourly</div></div>`;
     }
     h += '</div>';
     if (d.shifts.length) {

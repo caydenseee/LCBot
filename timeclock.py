@@ -446,7 +446,9 @@ async def cmd_mytime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             "",
             f"<b>{len(t['shifts'])} shift(s) · {hhmm(t['minutes'])}</b>",
         ]
-        if t["cents"]:
+        if is_salaried(user.id):
+            lines.append("<i>Salaried — these hours aren't paid hourly.</i>")
+        elif t["cents"]:
             lines.append(
                 f"<b>{money(t['cents'])}</b> at "
                 f"{money(rate_for(user.id, now().date()))}/hour"
@@ -545,6 +547,8 @@ def week_report(first: date, last: date) -> str:
             bit = f"{esc(nm)} — {len(t['shifts'])} shift(s), {hhmm(t['minutes'])}"
             if t.get("overtime"):
                 bit += f" (+{hhmm(t['overtime'])} OT)"
+            if is_salaried(a["user_id"]):
+                bit += " · salaried"
             if t["cents"] or rc:
                 bit += f" · {money(t['cents'] + rc)}"
             if revs:
@@ -745,7 +749,9 @@ async def cmd_timesheet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         any_rows = True
         nm = a["display_name"] or a["name"]
         row = f"{esc(nm)} — {t['days']}d · {hhmm(t['minutes'])}"
-        if t["cents"]:
+        if is_salaried(a["user_id"]):
+            row += " · salaried"
+        elif t["cents"]:
             row += f" · {money(t['cents'])}"
         if t["open"]:
             row += " ⏱"
@@ -775,7 +781,7 @@ async def cmd_payroll(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     buf = io.StringIO()
     wr = csv.writer(buf)
     wr.writerow([
-        "entry", "agent", "telegram_id", "date", "day", "slot",
+        "entry", "agent", "telegram_id", "salaried", "date", "day", "slot",
         "clock_in", "clock_out", "actual_hours", "shift_hours", "ot_hours",
         "paid_hours", "rate", "pay", "status",
     ])
@@ -793,6 +799,7 @@ async def cmd_payroll(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 r["id"],
                 a["display_name"] or a["name"],
                 a["user_id"],
+                "yes" if is_salaried(a["user_id"]) else "no",
                 sh["date"].isoformat(),
                 sh["date"].strftime("%a"),
                 slot["label"] if slot else "unrostered",
