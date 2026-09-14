@@ -116,11 +116,12 @@ def team_payload(first: date, mode: str = "month") -> dict:
     if mode == "week":
         first = first - timedelta(days=first.weekday())
         last = first + timedelta(days=6)
-        label = (
+        span = (
             f"{first.strftime('%-d')}–{last.strftime('%-d %b')}"
             if first.month == last.month
             else f"{first.strftime('%-d %b')} – {last.strftime('%-d %b')}"
         )
+        label = f"{quarter_week(first)} · {span}"
         prev_s = (first - timedelta(days=7)).isoformat()
         next_s = (first + timedelta(days=7)).isoformat()
     else:

@@ -523,7 +523,8 @@ async def cmd_setrate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 def week_report(first: date, last: date) -> str:
     """Hours, pay and anything that needs a look, for one week."""
     lines = [
-        f"📊 <b>Week of {first.strftime('%-d %b')} – {last.strftime('%-d %b %Y')}</b>",
+        f"📊 <b>{quarter_week(first)} · {first.strftime('%-d %b')} – "
+        f"{last.strftime('%-d %b %Y')}</b>",
         "",
     ]
 
@@ -702,7 +703,8 @@ async def cmd_timesheet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             except ValueError:
                 pass
         first, last = week_bounds(anchor)
-        span = f"{first.strftime('%-d %b')} – {last.strftime('%-d %b')}"
+        span = (f"{quarter_week(first)} · "
+                f"{first.strftime('%-d %b')} – {last.strftime('%-d %b')}")
     else:
         first = parse_month(rest)
         _, last = month_bounds(first)
