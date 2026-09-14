@@ -362,7 +362,7 @@ def build_shift_call(for_date: date | None = None) -> tuple[str | None, str]:
 
 async def post_init(app: Application) -> None:
     """Re-arm jobs after a restart."""
-    start_web_server()
+    start_web_server(app)
     if PUBLIC_URL:
         try:
             await app.bot.set_chat_menu_button(
@@ -513,6 +513,8 @@ def main() -> None:
     app.add_handler(CommandHandler("payslip", cmd_payslip))
     app.add_handler(CommandHandler("setrate", cmd_setrate))
     app.add_handler(CommandHandler("timesheet", cmd_timesheet))
+    app.add_handler(CommandHandler("audit", cmd_audit))
+    app.add_handler(CommandHandler("addtime", cmd_addtime))
     app.add_handler(CommandHandler("week", cmd_week))
     app.add_handler(CommandHandler("payroll", cmd_payroll))
     app.add_handler(CommandHandler("openshifts", cmd_openshifts))

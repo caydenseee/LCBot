@@ -680,6 +680,239 @@ async def job_week_digest(context: ContextTypes.DEFAULT_TYPE) -> None:
     log.info("Weekly digest sent for %s", first)
 
 
+async def cmd_addtime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/addtime @handle 2026-09-12 12:00 14:00 — record a shift that was worked
+    but never clocked in."""
+    if not is_admin(update.effective_user.id):
+        return
+    if len(context.args) < 4:
+        await update.message.reply_text(
+            "Usage: <code>/addtime @handle 2026-09-12 12:00 14:00</code>\n\n"
+            "Records a shift they worked but never clocked into. Pays the same "
+            "as any other shift, overtime included.",
+            parse_mode=constants.ParseMode.HTML,
+        )
+        return
+
+    row = find_agent(context.args[0])
+    if not row:
+        await update.message.reply_text("No one matches that. Check /roster.")
+        return
+    try:
+        the_day = date.fromisoformat(context.args[1])
+    except ValueError:
+        await update.message.reply_text("Give the date as 2026-09-12.")
+        return
+    a_t = at_time_on(the_day.isoformat(), context.args[2])
+    b_t = at_time_on(the_day.isoformat(), context.args[3])
+    if not a_t or not b_t:
+        await update.message.reply_text("Give times like 12:00 and 14:00.")
+        return
+    if b_t <= a_t:
+        b_t += timedelta(days=1)
+
+    # match it to the slot they were rostered for, so it pays as a full block
+    d = day_row_for(the_day.isoformat())
+    slot = None
+    if d:
+        mins = a_t.hour * 60 + a_t.minute
+        best, gap = None, 10 ** 9
+        for sl in q(
+            """SELECT s.id, s.label, s.start_min FROM slots s
+               JOIN signups su ON su.slot_id = s.id
+               WHERE s.day_id=? AND su.user_id=?""",
+            (d["id"], row["user_id"]),
+        ):
+            delta = abs(sl["start_min"] - mins)
+            if delta < gap:
+                best, gap = sl, delta
+        if best and gap <= 150:
+            slot = best
+
+    dupe = q1(
+        "SELECT id FROM time_entries WHERE agent_id=? AND the_date=? "
+        "AND clock_in=?",
+        (row["user_id"], the_day.isoformat(), a_t.isoformat()),
+    )
+    if dupe:
+        await update.message.reply_text(
+            f"There's already an entry for that exact start — #{dupe['id']}."
+        )
+        return
+
+    async with write_lock:
+        cur = run(
+            "INSERT INTO time_entries (agent_id, slot_id, the_date, clock_in, "
+            "clock_out, status, source, note) "
+            "VALUES (?,?,?,?,?,'edited','admin',?)",
+            (row["user_id"], slot["id"] if slot else None, the_day.isoformat(),
+             a_t.isoformat(), b_t.isoformat(),
+             "added by admin — no clock-in recorded"),
+        )
+        new_id = cur.lastrowid
+        log_edit(
+            new_id, update.effective_user.id, {"existed": False},
+            {"clock_in": a_t.isoformat(), "clock_out": b_t.isoformat()},
+            "admin added a missing shift",
+        )
+
+    fresh = q1("SELECT * FROM time_entries WHERE id=?", (new_id,))
+    base, ot = entry_split(fresh)
+    cents = round((base + ot) / 60 * rate_for(row["user_id"], the_day))
+    nm = row["display_name"] or row["name"]
+
+    msg = [
+        f"✅ Added <code>#{new_id}</code> for <b>{esc(nm)}</b>",
+        f"{the_day.strftime('%a %-d %b')}  "
+        f"{a_t.strftime('%H:%M')}–{b_t.strftime('%H:%M')}",
+        f"Shift: <b>{hhmm(base)}</b>" + (f" · Overtime: <b>+{hhmm(ot)}</b>" if ot else ""),
+    ]
+    if slot:
+        msg.append(f"Matched to their rostered {esc(slot['label'])}")
+    else:
+        msg.append("⚠️ Not matched to a rostered slot — paid on actual time")
+    if cents and not is_salaried(row["user_id"]):
+        msg.append(f"Pay: <b>{money(cents)}</b>")
+    await update.message.reply_text(
+        "\n".join(msg), parse_mode=constants.ParseMode.HTML
+    )
+    try:
+        await context.bot.send_message(
+            row["user_id"],
+            f"A shift has been added to your hours: "
+            f"{the_day.strftime('%a %-d %b')} "
+            f"{a_t.strftime('%H:%M')}–{b_t.strftime('%H:%M')} "
+            f"({hhmm(base + ot)}).\n\nCheck /mytime — tell your manager if "
+            "that's not right.",
+        )
+    except Exception:
+        pass
+
+
+async def cmd_audit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/audit @handle — every rostered slot against what was actually clocked."""
+    if not is_admin(update.effective_user.id):
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: <code>/audit @handle</code> or <code>/audit @handle W36</code>\n\n"
+            "Lists every shift they were rostered for and whether it was clocked, "
+            "so you can see what's missing.",
+            parse_mode=constants.ParseMode.HTML,
+        )
+        return
+
+    args, year = [], None
+    for a in context.args:
+        if re.fullmatch(r"20\d{2}", a):
+            year = int(a)
+        else:
+            args.append(a)
+
+    who = None
+    anchor = None
+    for a in args:
+        m = re.fullmatch(r"[wW]?(\d{1,2})", a)
+        if m and week_number_start(int(m.group(1)), year):
+            anchor = week_number_start(int(m.group(1)), year)
+            continue
+        if who is None:
+            cand = find_agent(a)
+            if cand:
+                who = cand
+                continue
+        try:
+            anchor = date.fromisoformat(a)
+        except ValueError:
+            pass
+    if not who:
+        await update.message.reply_text("No one matches that. Check /roster.")
+        return
+
+    if anchor:
+        first, last = week_bounds(anchor)
+        span = f"{quarter_week(first)} · {first.strftime('%-d %b')} – {last.strftime('%-d %b')}"
+    else:
+        first, last = month_bounds(now().date())
+        span = first.strftime("%B %Y")
+
+    rostered = q(
+        """SELECT s.id, s.label, s.start_min, d.name AS day_name, d.the_date
+           FROM signups su JOIN slots s ON s.id = su.slot_id
+           JOIN days d ON d.id = s.day_id
+           WHERE su.user_id=? AND d.the_date BETWEEN ? AND ?
+           ORDER BY d.the_date, s.start_min""",
+        (who["user_id"], first.isoformat(), last.isoformat()),
+    )
+    entries = q(
+        "SELECT * FROM time_entries WHERE agent_id=? AND the_date BETWEEN ? AND ? "
+        "ORDER BY the_date, clock_in",
+        (who["user_id"], first.isoformat(), last.isoformat()),
+    )
+
+    nm = who["display_name"] or who["name"]
+    lines = [f"🔍 <b>{esc(nm)} — {esc(span)}</b>", ""]
+
+    covered, merged, missed = set(), [], []
+    today = now().date()
+    for slot in rostered:
+        day = date.fromisoformat(slot["the_date"])
+        start = datetime.combine(day, time(0, 0), TZ) + timedelta(minutes=slot["start_min"])
+        end = start + timedelta(minutes=slot_minutes(slot["label"]))
+        hit = None
+        for e in entries:
+            if not e["clock_out"]:
+                continue
+            a = datetime.fromisoformat(e["clock_in"])
+            b = datetime.fromisoformat(e["clock_out"])
+            if a < end and b > start - timedelta(minutes=SLOT_GRACE_MIN):
+                hit = e
+                break
+        tag = f"{slot['day_name']} {slot['label']}"
+        if hit:
+            covered.add(slot["id"])
+            if hit["slot_id"] != slot["id"]:
+                merged.append((tag, hit["id"]))
+                lines.append(f"🔗 {tag} — covered by entry #{hit['id']}")
+            else:
+                lines.append(f"✅ {tag} — entry #{hit['id']}")
+        elif day < today:
+            missed.append(tag)
+            lines.append(f"❌ {tag} — <b>no clock-in</b>")
+        else:
+            lines.append(f"▫️ {tag} — still to come")
+
+    extra = [e for e in entries if not e["slot_id"]]
+    for e in extra:
+        a = datetime.fromisoformat(e["clock_in"])
+        lines.append(f"❓ {a.strftime('%a %-d %b %H:%M')} — clocked in unrostered "
+                     f"(#{e['id']})")
+
+    t = timesheet(who["user_id"], first, last)
+    lines += [
+        "",
+        f"<b>Rostered: {len(rostered)} slot(s)</b>",
+        f"<b>Clocked:  {len(t['shifts'])} entry(s) · {hhmm(t['minutes'])} · "
+        + ("salaried" if is_salaried(who["user_id"]) else money(t["cents"])) + "</b>",
+    ]
+    if merged:
+        lines.append(
+            f"\n🔗 {len(merged)} slot(s) were covered by a back-to-back clock-in, "
+            "so they count as one entry. The hours are still right."
+        )
+    if missed:
+        lines.append(
+            f"\n❌ {len(missed)} slot(s) have no clock-in at all — these are "
+            "<b>not</b> in the hours above."
+        )
+        lines.append("<i>Add one with</i> <code>/fixtime</code> <i>after they "
+                     "clock in, or ask them to tell you the times.</i>")
+
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode=constants.ParseMode.HTML
+    )
+
+
 async def cmd_timesheet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Everyone's hours for a month, or one agent's shifts with entry numbers."""
     if not is_admin(update.effective_user.id):

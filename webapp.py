@@ -1,4 +1,4 @@
-"""The Mini App: web server, agent view and team view.
+"""The Mini App: web server, home, hours and team views.
 
 Part of the LC avails bot. Shared helpers live in core.py.
 """
@@ -188,6 +188,147 @@ def team_payload(first: date, mode: str = "month") -> dict:
     }
 
 
+def home_payload(user_id: int) -> dict:
+    """What an agent needs to see mid-shift."""
+    conn = sqlite3.connect(DB_PATH, timeout=5)
+    conn.row_factory = sqlite3.Row
+    try:
+        a = conn.execute(
+            "SELECT display_name, name FROM agents WHERE user_id=?", (user_id,)
+        ).fetchone()
+        name = (a["display_name"] or a["name"]) if a else "You"
+    finally:
+        conn.close()
+
+    today = now().date()
+    openrow = q1(
+        "SELECT * FROM time_entries WHERE agent_id=? AND clock_out IS NULL "
+        "ORDER BY id DESC LIMIT 1",
+        (user_id,),
+    )
+    on_shift = bool(openrow)
+    since = label = ""
+    elapsed = ""
+    if openrow:
+        started = datetime.fromisoformat(openrow["clock_in"])
+        since = started.strftime("%H:%M")
+        label = openrow["shift_label"] or ""
+        if not label and openrow["slot_id"]:
+            r = q1("SELECT label FROM slots WHERE id=?", (openrow["slot_id"],))
+            label = r["label"] if r else ""
+        elapsed = hhmm(int((now() - started).total_seconds() // 60))
+
+    # next rostered shift from now on
+    nxt = q1(
+        """SELECT s.label, s.start_min, d.name AS day_name, d.the_date
+           FROM signups su JOIN slots s ON s.id = su.slot_id
+           JOIN days d ON d.id = s.day_id
+           WHERE su.user_id=? AND d.the_date >= ?
+           ORDER BY d.the_date, s.start_min LIMIT 1""",
+        (user_id, today.isoformat()),
+    )
+    next_shift = ""
+    if nxt:
+        d = date.fromisoformat(nxt["the_date"])
+        when = "Today" if d == today else (
+            "Tomorrow" if d == today + timedelta(days=1)
+            else d.strftime("%a %-d %b")
+        )
+        next_shift = f"{when} · {nxt['label']}"
+
+    first, last = week_bounds(today)
+    t = timesheet(user_id, first, last)
+    cases = open_cases()
+
+    return {
+        "name": name,
+        "today": today.strftime("%A %-d %B"),
+        "onShift": on_shift,
+        "since": since,
+        "elapsed": elapsed,
+        "shiftLabel": label,
+        "nextShift": next_shift,
+        "weekHours": hhmm(t["minutes"]),
+        "weekShifts": len(t["shifts"]),
+        "openCases": len(cases),
+        "caseNames": [f"{c['prio']} {c['username']}" for c in cases[:4]],
+        "support": support_for(user_id, name),
+    }
+
+
+def web_clock_in(user_id: int, label: str = "") -> dict:
+    """Clock in from the app. Mirrors /clockin, minus the chat conversation."""
+    if q1("SELECT 1 FROM time_entries WHERE agent_id=? AND clock_out IS NULL",
+          (user_id,)):
+        return {"ok": False, "error": "You're already clocked in."}
+
+    when = now()
+    slot = None
+    if label:
+        d = day_row_for(when.date().isoformat())
+        slot = q1(
+            "SELECT id, label FROM slots WHERE day_id=? AND lower(label)=lower(?)",
+            (d["id"], label),
+        ) if d else None
+    else:
+        slot = current_slot_for(user_id, when)
+
+    shown = (slot["label"] if slot else label) or ""
+    run(
+        "INSERT INTO time_entries (agent_id, slot_id, the_date, clock_in, status,"
+        " shift_label, opening_posted) VALUES (?,?,?,?,'open',?,?)",
+        (user_id, slot["id"] if slot else None, when.date().isoformat(),
+         when.isoformat(), shown, 1 if shown else 0),
+    )
+
+    posted = False
+    if shown:
+        nice = display_name_of(user_id, "")
+        block = opening_block(user_id, nice, shown)
+        posted = bool(on_bot_loop(post_ops(bot_ref(), block)))
+
+    return {
+        "ok": True, "at": when.strftime("%H:%M"),
+        "shift": shown, "posted": posted,
+        "needLabel": not shown,
+    }
+
+
+def web_clock_out(user_id: int) -> dict:
+    """Clock out from the app."""
+    row = q1(
+        "SELECT * FROM time_entries WHERE agent_id=? AND clock_out IS NULL "
+        "ORDER BY id DESC LIMIT 1",
+        (user_id,),
+    )
+    if not row:
+        return {"ok": False, "error": "You're not clocked in."}
+
+    when = now()
+    run("UPDATE time_entries SET clock_out=?, status='closed' WHERE id=?",
+        (when.isoformat(), row["id"]))
+    fresh = q1("SELECT * FROM time_entries WHERE id=?", (row["id"],))
+    base, ot = entry_split(fresh)
+    cents = round((base + ot) / 60 * rate_for(user_id, date.fromisoformat(row["the_date"])))
+
+    return {
+        "ok": True, "at": when.strftime("%H:%M"),
+        "shift": hhmm(base), "ot": hhmm(ot) if ot else "",
+        "total": hhmm(base + ot),
+        "pay": money(cents) if cents else "",
+        "salaried": is_salaried(user_id),
+    }
+
+
+def todays_slots(user_id: int) -> list:
+    """Slot labels for today, to pick from when the roster can't be matched."""
+    d = day_row_for(now().date().isoformat())
+    if not d:
+        return []
+    return [r["label"] for r in
+            q("SELECT label FROM slots WHERE day_id=? ORDER BY idx", (d["id"],))]
+
+
 def web_has_access(user_id: int) -> bool:
     if user_id in ADMIN_IDS:
         return True
@@ -231,6 +372,27 @@ class MiniAppHandler(BaseHTTPRequestHandler):
             return
         if path == "/health":
             self._send(200, b'{"ok":true}')
+            return
+        if path == "/api/home":
+            try:
+                user = verify_init_data(self.headers.get("X-Init-Data", ""))
+                if not user or "id" not in user:
+                    self._send(401, b'{"error":"unverified"}')
+                    return
+                uid = int(user["id"])
+                if not web_has_access(uid):
+                    self._send(403, b'{"error":"no access"}')
+                    return
+                data = home_payload(uid)
+                data["slotsToday"] = todays_slots(uid)
+                data["isAdmin"] = is_admin(uid)
+                self._send(200, json.dumps(data).encode())
+            except Exception as e:
+                log.warning("Home view failed: %s", e)
+                try:
+                    self._send(500, b'{"error":"server"}')
+                except Exception:
+                    pass
             return
         if path == "/api/team":
             try:
@@ -278,11 +440,49 @@ class MiniAppHandler(BaseHTTPRequestHandler):
             return
         self._send(404, b'{"error":"not found"}')
 
+    def do_POST(self):
+        try:
+            self._post()
+        except Exception as e:
+            log.warning("Mini App POST failed: %s", e)
+            try:
+                self._send(500, b'{"error":"server"}')
+            except Exception:
+                pass
+
+    def _post(self):
+        path = urllib.parse.urlparse(self.path).path
+        user = verify_init_data(self.headers.get("X-Init-Data", ""))
+        if not user or "id" not in user:
+            self._send(401, b'{"error":"unverified"}')
+            return
+        uid = int(user["id"])
+        if not web_has_access(uid):
+            self._send(403, b'{"error":"no access"}')
+            return
+
+        length = int(self.headers.get("Content-Length") or 0)
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except json.JSONDecodeError:
+            body = {}
+
+        if path == "/api/clockin":
+            out = web_clock_in(uid, str(body.get("label", "")).strip())
+        elif path == "/api/clockout":
+            out = web_clock_out(uid)
+        else:
+            self._send(404, b'{"error":"not found"}')
+            return
+        self._send(200, json.dumps(out).encode())
+
     def log_message(self, *a):
         pass
 
 
-def start_web_server() -> None:
+def start_web_server(app=None) -> None:
+    if app is not None:
+        set_bot_handle(app)
     try:
         srv = ThreadingHTTPServer(("0.0.0.0", WEB_PORT), MiniAppHandler)
     except Exception as e:

@@ -1929,6 +1929,8 @@ ADMIN_GROUPS = [
         ("fixtime", "Correct a time entry"),
         ("week", "The week at a glance — or /week W36"),
         ("timesheet", "Hours — add @handle, week or W37"),
+        ("audit", "Rostered vs actually clocked"),
+        ("addtime", "Record a missed shift"),
         ("addreview", "Credit a Google review"),
         ("reviews", "Reviews credited this month"),
     ]),
@@ -2056,6 +2058,29 @@ MINIAPP_HTML = """<!DOCTYPE html>
   .fill { height:100%; background: var(--tg-theme-link-color,#2a7); }
   .warn { background:#fff6e5; color:#8a5a00; padding:11px 13px;
           border-radius:11px; font-size:13px; margin-bottom:16px; }
+  body { padding-bottom: 84px; }
+  .nav-bar { position:fixed; left:0; right:0; bottom:0; display:flex;
+    background: var(--tg-theme-bg-color,#fff);
+    border-top:1px solid var(--tg-theme-secondary-bg-color,#eee);
+    padding:8px 4px calc(8px + env(safe-area-inset-bottom)); z-index:10; }
+  .nav-bar div { flex:1; text-align:center; font-size:11px; padding:4px 0;
+    color: var(--tg-theme-hint-color,#888); cursor:pointer; }
+  .nav-bar div span { display:block; font-size:19px; line-height:1.3; }
+  .nav-bar div.on { color: var(--tg-theme-link-color,#2a7); font-weight:600; }
+  .hero { border-radius:18px; padding:20px; margin-bottom:18px;
+          background: var(--tg-theme-secondary-bg-color,#f4f4f5); }
+  .hero.live { background: var(--tg-theme-link-color,#2a7); color:#fff; }
+  .hero .k { font-size:13px; opacity:.75; }
+  .hero .v { font-size:26px; font-weight:650; letter-spacing:-.02em; margin-top:2px; }
+  .big { width:100%; border:0; border-radius:14px; padding:16px;
+         font-size:17px; font-weight:650; cursor:pointer; margin-top:14px;
+         background: var(--tg-theme-link-color,#2a7); color:#fff; }
+  .big.stop { background:#c0392b; }
+  .big[disabled] { opacity:.5; }
+  .chips { display:flex; flex-wrap:wrap; gap:8px; margin-top:12px; }
+  .chips button { border:0; border-radius:10px; padding:9px 14px; font-size:14px;
+    background: var(--tg-theme-secondary-bg-color,#f4f4f5);
+    color: var(--tg-theme-text-color,#111); cursor:pointer; }
   .seg { display:inline-flex; gap:2px; padding:3px; border-radius:9px;
          background: var(--tg-theme-secondary-bg-color,#f4f4f5); margin-bottom:14px; }
   .seg div { padding:5px 16px; border-radius:7px; font-size:13px; font-weight:600;
@@ -2068,20 +2093,109 @@ MINIAPP_HTML = """<!DOCTYPE html>
 <script>
 const tg = window.Telegram?.WebApp;
 if (tg) { tg.ready(); tg.expand(); }
-let VIEW = 'me', MODE = 'week', START = '', IS_ADMIN = false;
+let VIEW = 'home', MODE = 'week', START = '', IS_ADMIN = false;
 const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 
-function tabs() {
-  if (!IS_ADMIN) return '';
-  return '<div class="tabs">'
-    + `<div class="tab ${VIEW === 'me' ? 'on' : ''}" data-v="me">My hours</div>`
-    + `<div class="tab ${VIEW === 'team' ? 'on' : ''}" data-v="team">Team</div>`
+function navBar() {
+  const items = [['home','🏠','Home'], ['me','🕐','Hours']];
+  if (IS_ADMIN) items.push(['team','👥','Team']);
+  return '<div class="nav-bar">'
+    + items.map(([v, i, t]) =>
+        `<div class="${VIEW === v ? 'on' : ''}" data-v="${v}"><span>${i}</span>${t}</div>`
+      ).join('')
     + '</div>';
 }
 
+function tabs() { return ''; }
+
+async function post(url, payload) {
+  const r = await fetch(url, {
+    method: 'POST',
+    headers: { 'X-Init-Data': tg?.initData || '', 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload || {})
+  });
+  return r.json();
+}
+
+async function loadHome() {
+  const app = document.getElementById('app');
+  const r = await fetch('/api/home', { headers: { 'X-Init-Data': tg?.initData || '' } });
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  const d = await r.json();
+  IS_ADMIN = !!d.isAdmin;
+
+  let h = `<h1>${esc(d.name)}</h1><div class="sub">${esc(d.today)}</div>`;
+
+  if (d.onShift) {
+    h += '<div class="hero live">';
+    h += `<div class="k">On shift${d.shiftLabel ? ' · ' + esc(d.shiftLabel) : ''}</div>`;
+    h += `<div class="v">since ${esc(d.since)} · ${esc(d.elapsed)}</div></div>`;
+    h += '<button class="big stop" id="act">Clock out</button>';
+  } else {
+    h += '<div class="hero">';
+    h += `<div class="k">${d.nextShift ? 'Next shift' : 'No upcoming shift'}</div>`;
+    h += `<div class="v">${esc(d.nextShift || '—')}</div></div>`;
+    h += '<button class="big" id="act">Clock in</button>';
+  }
+
+  h += '<div class="cards" style="margin-top:20px">';
+  h += `<div class="card"><div class="n">${esc(d.weekHours)}</div><div class="l">This week</div></div>`;
+  h += `<div class="card"><div class="n">${d.weekShifts}</div><div class="l">Shifts</div></div>`;
+  h += '</div>';
+
+  if (d.openCases) {
+    h += '<h2>Open cases</h2>';
+    for (const c of d.caseNames) h += `<div class="p"><div class="pn">${esc(c)}</div></div>`;
+    h += `<div class="note">${d.openCases} case(s) still open — they'll carry into your handover.</div>`;
+  }
+
+  app.innerHTML = h + navBar();
+  wire();
+  const btn = document.getElementById('act');
+  if (btn) btn.onclick = () => d.onShift ? doClockOut(btn) : doClockIn(btn, d.slotsToday);
+}
+
+async function doClockIn(btn, slots) {
+  btn.disabled = true; btn.textContent = 'Clocking in…';
+  const out = await post('/api/clockin');
+  if (out.needLabel && slots && slots.length) {
+    const app = document.getElementById('app');
+    let h = `<h1>Clocked in at ${esc(out.at)}</h1>`;
+    h += '<div class="sub">Which shift is this?</div><div class="chips">';
+    for (const s of slots) h += `<button data-s="${esc(s)}">${esc(s)}</button>`;
+    h += '</div>';
+    app.innerHTML = h + navBar();
+    wire();
+    document.querySelectorAll('.chips button').forEach(b => {
+      b.onclick = async () => { await post('/api/clockin', { label: b.dataset.s }); render(); };
+    });
+    return;
+  }
+  render();
+}
+
+async function doClockOut(btn) {
+  btn.disabled = true; btn.textContent = 'Clocking out…';
+  const out = await post('/api/clockout');
+  const app = document.getElementById('app');
+  if (!out.ok) { render(); return; }
+  let h = `<h1>Clocked out</h1><div class="sub">at ${esc(out.at)}</div>`;
+  h += '<div class="cards">';
+  h += `<div class="card"><div class="n">${esc(out.total)}</div><div class="l">Worked</div></div>`;
+  if (out.ot) h += `<div class="card"><div class="n">+${esc(out.ot)}</div><div class="l">Overtime</div></div>`;
+  if (out.pay) h += `<div class="card pay wide"><div class="n">${esc(out.pay)}</div><div class="l">This shift</div></div>`;
+  h += '</div>';
+  h += '<div class="note">Do your handover in Telegram — the bot will ask.</div>';
+  app.innerHTML = h + navBar();
+  wire();
+}
+
 function wire() {
+  document.querySelectorAll('.nav-bar div').forEach(el => {
+    el.onclick = () => { VIEW = el.dataset.v; START = ''; render(); };
+  });
   document.querySelectorAll('.tab').forEach(el => {
-    el.onclick = () => { VIEW = el.dataset.v; MONTH = ''; render(); };
+    el.onclick = () => { VIEW = el.dataset.v; START = ''; render(); };
   });
   const p = document.getElementById('prev'), n = document.getElementById('next');
   if (p) p.onclick = () => { START = p.dataset.m; render(); };
@@ -2137,11 +2251,19 @@ async function loadTeam() {
   } else {
     h += `<div class="empty">Nothing logged this ${MODE}.</div>`;
   }
-  app.innerHTML = tabs() + h;
+  app.innerHTML = h + navBar();
   wire();
 }
 
 async function render() {
+  if (VIEW === 'home') {
+    try { await loadHome(); }
+    catch (e) {
+      document.getElementById('app').innerHTML =
+        '<div class="err">Could not load. Try again shortly.</div>';
+    }
+    return;
+  }
   if (VIEW === 'team') {
     try { await loadTeam(); }
     catch (e) {
@@ -2202,7 +2324,7 @@ async function load() {
     if (d.openShift) {
       h += '<div class="note">⏱ You are clocked in right now — this shift is not counted yet.</div>';
     }
-    app.innerHTML = tabs() + h;
+    app.innerHTML = h + navBar();
     wire();
   } catch (e) {
     const why = e.name === 'AbortError' ? 'The server did not answer in time.' : esc(e.message || e);
@@ -2212,3 +2334,35 @@ async function load() {
 render();
 </script>
 </body></html>"""
+
+
+# The web server runs on its own thread. Telegram work has to be handed back to
+# the bot's event loop. Held in a dict rather than plain globals so every module
+# sees the same handle — `global` only rebinds within one module.
+_BOT_HANDLE: dict = {"loop": None, "bot": None}
+
+
+def set_bot_handle(app) -> None:
+    try:
+        _BOT_HANDLE["loop"] = asyncio.get_running_loop()
+        _BOT_HANDLE["bot"] = app.bot
+    except RuntimeError:
+        pass
+
+
+def bot_ref():
+    return _BOT_HANDLE["bot"]
+
+
+def on_bot_loop(coro, timeout: float = 8.0):
+    """Run a bot coroutine from the web thread and wait for it."""
+    loop = _BOT_HANDLE["loop"]
+    if loop is None:
+        log.warning("No bot loop yet — skipping a call from the app")
+        coro.close()
+        return None
+    try:
+        return asyncio.run_coroutine_threadsafe(coro, loop).result(timeout)
+    except Exception as e:
+        log.warning("Bot call from the app failed: %s", e)
+        return None
