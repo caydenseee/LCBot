@@ -558,6 +558,33 @@ def short_label(label: str) -> str:
     return f"{parts[0].replace('am', '').replace('pm', '')}-{parts[1].replace('am', '').replace('pm', '')}"
 
 
+def week_number_start(n: int, year: int | None = None) -> date | None:
+    """Monday of the week your team calls W<n>.
+
+    Your labels run one behind ISO (WEEK_NUM_OFFSET), so undo that first.
+    With no year given, pick the most recent W<n> that has actually started —
+    so asking for W52 in January means last December, not eleven months away.
+    """
+    iso = n - WEEK_NUM_OFFSET
+    if not 1 <= iso <= 53:
+        return None
+
+    def monday(y):
+        try:
+            return date.fromisocalendar(y, iso, 1)
+        except ValueError:
+            return None
+
+    if year:
+        return monday(year)
+
+    today = now().date()
+    this_year = monday(today.year)
+    if this_year and this_year <= today:
+        return this_year
+    return monday(today.year - 1) or this_year
+
+
 def quarter_week(d: date) -> str:
     return f"Q{(d.month - 1) // 3 + 1} W{d.isocalendar().week + WEEK_NUM_OFFSET}"
 
@@ -1900,8 +1927,8 @@ ADMIN_GROUPS = [
         ("openshifts", "Who's clocked in now"),
         ("clockoutfor", "Close a forgotten shift"),
         ("fixtime", "Correct a time entry"),
-        ("week", "This week at a glance"),
-        ("timesheet", "Hours — add @handle or 'week'"),
+        ("week", "The week at a glance — or /week W36"),
+        ("timesheet", "Hours — add @handle, week or W37"),
         ("addreview", "Credit a Google review"),
         ("reviews", "Reviews credited this month"),
     ]),

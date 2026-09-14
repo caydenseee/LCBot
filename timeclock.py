@@ -643,14 +643,20 @@ async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     target = now().date()
     if context.args:
-        try:
-            target = date.fromisoformat(context.args[0])
-        except ValueError:
-            await update.message.reply_text(
-                "Usage: <code>/week</code> or <code>/week 2026-09-07</code>",
-                parse_mode=constants.ParseMode.HTML,
-            )
-            return
+        a = context.args[0]
+        m = re.fullmatch(r"[wW]?(\d{1,2})", a)
+        if m and week_number_start(int(m.group(1))):
+            target = week_number_start(int(m.group(1)))
+        else:
+            try:
+                target = date.fromisoformat(a)
+            except ValueError:
+                await update.message.reply_text(
+                    "Usage: <code>/week</code>, <code>/week W36</code> "
+                    "or <code>/week 2026-09-07</code>",
+                    parse_mode=constants.ParseMode.HTML,
+                )
+                return
     first, last = week_bounds(target)
     await update.message.reply_text(
         week_report(first, last), parse_mode=constants.ParseMode.HTML
@@ -681,7 +687,12 @@ async def cmd_timesheet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     # "week" anywhere in the command switches to the current week
     args = list(context.args)
-    weekly = any(a.lower() in ("week", "w") for a in args)
+    # "week", or a week number like W37, both mean the weekly view
+    weekly = any(a.lower() in ("week", "w") for a in args) or any(
+        re.fullmatch(r"[wW]\d{1,2}", a) for a in args
+    )
+    if weekly:
+        args = [a for a in args if not re.fullmatch(r"\d{4}-\d{2}", a)]
     args = [a for a in args if a.lower() not in ("week", "w")]
 
     # /timesheet @handle — that person's shifts, with the numbers /fixtime needs
@@ -697,14 +708,25 @@ async def cmd_timesheet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     if weekly:
         anchor = now().date()
+        year = None
         for a in rest:
+            if re.fullmatch(r"20\d{2}", a):
+                year = int(a)
+        for a in rest:
+            m = re.fullmatch(r"[wW]?(\d{1,2})", a)
+            if m:
+                start = week_number_start(int(m.group(1)), year)
+                if start:
+                    anchor = start
+                continue
             try:
                 anchor = date.fromisoformat(a)
             except ValueError:
                 pass
         first, last = week_bounds(anchor)
+        yr = f" {first.year}" if first.year != now().year else ""
         span = (f"{quarter_week(first)} · "
-                f"{first.strftime('%-d %b')} – {last.strftime('%-d %b')}")
+                f"{first.strftime('%-d %b')} – {last.strftime('%-d %b')}{yr}")
     else:
         first = parse_month(rest)
         _, last = month_bounds(first)
