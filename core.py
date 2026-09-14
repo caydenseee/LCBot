@@ -1866,6 +1866,9 @@ ADMIN_GROUPS = [
     ]),
     ("Slots", [
         ("capacity", "How many agents a slot takes"),
+        ("events", "Fix the Key Events lines"),
+        ("addslot", "Add a slot to the live week"),
+        ("delslot", "Remove a slot from the live week"),
         ("whohas", "Who is on a slot"),
         ("dropslot", "Free one slot from someone"),
         ("fixed", "Slots someone always works"),

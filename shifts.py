@@ -1064,6 +1064,156 @@ async def cmd_applyfixed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
 
 
+async def cmd_addslot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/addslot MON 6pm-8pm — put a slot back on a day of the live week."""
+    if not is_admin(update.effective_user.id):
+        return
+    w = open_week() or latest_week()
+    if not w:
+        await update.message.reply_text("No week has been posted yet.")
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Usage: <code>/addslot MON 6pm-8pm</code>\n\n"
+            "Adds that slot to the live week. Use it to undo a holiday or "
+            "campaign day that was set by mistake.\n"
+            "Several at once: <code>/addslot MON 6pm-8pm, 8pm-10pm</code>",
+            parse_mode=constants.ParseMode.HTML,
+        )
+        return
+
+    day = norm_day(context.args[0])
+    if not day:
+        await update.message.reply_text(f"Use one of: {', '.join(DAY_NAMES)}")
+        return
+    labels = [x.strip() for x in " ".join(context.args[1:]).split(",") if x.strip()]
+
+    d = q1(
+        "SELECT * FROM days WHERE week_id=? AND name=?", (w["id"], day)
+    )
+    if not d:
+        await update.message.reply_text(
+            f"{day} isn't part of {esc(w['label'])}.",
+            parse_mode=constants.ParseMode.HTML,
+        )
+        return
+
+    added, skipped = [], []
+    async with write_lock:
+        for label in labels:
+            try:
+                start = slot_start_minutes(label)
+            except ValueError:
+                skipped.append(f"{label} (not a time)")
+                continue
+            dupe = q1(
+                "SELECT 1 FROM slots WHERE day_id=? AND lower(label)=lower(?)",
+                (d["id"], label),
+            )
+            if dupe:
+                skipped.append(f"{label} (already there)")
+                continue
+            run(
+                "INSERT INTO slots (day_id, idx, label, start_min) VALUES (?,?,?,?)",
+                (d["id"], 999, label, start),
+            )
+            added.append(label)
+        # keep the day in time order
+        for i, row in enumerate(
+            q("SELECT id FROM slots WHERE day_id=? ORDER BY start_min, id", (d["id"],))
+        ):
+            run("UPDATE slots SET idx=? WHERE id=?", (i, row["id"]))
+
+    msg = []
+    if added:
+        msg.append(f"✅ Added to <b>{day}</b>: {esc(', '.join(added))}")
+    if skipped:
+        msg.append(f"Skipped: {esc(', '.join(skipped))}")
+    if added:
+        msg.append("\n<i>Agents can claim it if the week is still open. "
+                   "If it's closed, they can ask with /pickup.</i>")
+    await update.message.reply_text(
+        "\n".join(msg), parse_mode=constants.ParseMode.HTML
+    )
+    if added:
+        await refresh_group(context, w["id"], d["id"])
+
+
+async def cmd_delslot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/delslot MON 6pm-8pm — take a slot off the live week."""
+    if not is_admin(update.effective_user.id):
+        return
+    w = open_week() or latest_week()
+    if not w:
+        await update.message.reply_text("No week has been posted yet.")
+        return
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "Usage: <code>/delslot MON 6pm-8pm</code>\n\n"
+            "Removes that slot from the live week. If someone's on it, "
+            "I'll ask you to confirm.",
+            parse_mode=constants.ParseMode.HTML,
+        )
+        return
+
+    args = [a for a in context.args if a.upper() != "CONFIRM"]
+    forced = len(args) != len(context.args)
+    day = norm_day(args[0])
+    if not day:
+        await update.message.reply_text(f"Use one of: {', '.join(DAY_NAMES)}")
+        return
+    label = " ".join(args[1:]).strip()
+
+    slot = q1(
+        """SELECT s.id, s.label, d.id AS day_id FROM slots s
+           JOIN days d ON d.id = s.day_id
+           WHERE d.week_id=? AND d.name=? AND lower(s.label)=lower(?)""",
+        (w["id"], day, label),
+    )
+    if not slot:
+        await update.message.reply_text(
+            f"No {label!r} slot on {day} this week. Check the board's wording."
+        )
+        return
+
+    holders = slot_holders(slot["id"])
+    if holders and not forced:
+        who = ", ".join(h["name"] for h in holders)
+        await update.message.reply_text(
+            f"⚠️ <b>{day} {esc(slot['label'])}</b> is held by "
+            f"<b>{esc(who)}</b>.\n\n"
+            "Removing it takes them off the shift and tells them.\n\n"
+            f"To go ahead: <code>/delslot {day} {slot['label']} CONFIRM</code>",
+            parse_mode=constants.ParseMode.HTML,
+        )
+        return
+
+    async with write_lock:
+        run("DELETE FROM signups WHERE slot_id=?", (slot["id"],))
+        run("DELETE FROM slots WHERE id=?", (slot["id"],))
+        for i, row in enumerate(
+            q("SELECT id FROM slots WHERE day_id=? ORDER BY start_min, id",
+              (slot["day_id"],))
+        ):
+            run("UPDATE slots SET idx=? WHERE id=?", (i, row["id"]))
+
+    note = f"🗑 Removed <b>{day} {esc(slot['label'])}</b>."
+    if holders:
+        note += f"\n{len(holders)} agent(s) taken off it and told."
+    await update.message.reply_text(note, parse_mode=constants.ParseMode.HTML)
+
+    for h in holders:
+        try:
+            await context.bot.send_message(
+                h["user_id"],
+                f"{day} {slot['label']} has been removed from the schedule, "
+                "so you're no longer on it.\n\nCheck /myshifts.",
+            )
+        except Exception:
+            pass
+    await refresh_group(context, w["id"], slot["day_id"])
+
+
 async def cmd_capacity(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """/capacity 10am-12pm 2 — how many agents a slot takes this week."""
     if not is_admin(update.effective_user.id):

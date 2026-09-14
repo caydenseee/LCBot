@@ -643,6 +643,70 @@ async def cmd_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text("Week closed.")
 
 
+async def cmd_events(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/events — fix the Key Events lines on the week that's already posted."""
+    if not is_admin(update.effective_user.id):
+        return
+    w = open_week() or latest_week()
+    if not w:
+        await update.message.reply_text("No week has been posted yet.")
+        return
+
+    current = (w["key_events"] or "").strip()
+
+    if not context.args:
+        shown = current or "<i>none</i>"
+        await update.message.reply_text(
+            f"<b>Key Events — {esc(w['label'])}</b>\n\n{esc(current) if current else shown}"
+            "\n\n<code>/events add 🎌 Hari Raya (MY): THU</code>\n"
+            "<code>/events del 2</code> — remove line 2\n"
+            "<code>/events set ...</code> — replace them all\n"
+            "<code>/events clear</code> — remove them all",
+            parse_mode=constants.ParseMode.HTML,
+        )
+        return
+
+    mode = context.args[0].lower()
+    rest = " ".join(context.args[1:]).strip()
+    lines = [l for l in current.split("\n") if l.strip()]
+
+    if mode == "add":
+        if not rest:
+            await update.message.reply_text("Give me the line to add.")
+            return
+        lines.append(rest)
+    elif mode == "del":
+        if not rest.isdigit() or not 1 <= int(rest) <= len(lines):
+            nums = "\n".join(f"{i+1}. {esc(l)}" for i, l in enumerate(lines))
+            await update.message.reply_text(
+                f"Which line?\n\n{nums}" if lines else "There are no lines yet.",
+                parse_mode=constants.ParseMode.HTML,
+            )
+            return
+        lines.pop(int(rest) - 1)
+    elif mode == "set":
+        if not rest:
+            await update.message.reply_text("Give me the text to set.")
+            return
+        lines = [l for l in rest.split("\\n") if l.strip()]
+    elif mode == "clear":
+        lines = []
+    else:
+        # no keyword — treat the whole thing as a replacement
+        lines = [l for l in " ".join(context.args).split("\\n") if l.strip()]
+
+    new = "\n".join(lines)
+    async with write_lock:
+        run("UPDATE weeks SET key_events=? WHERE id=?", (new or None, w["id"]))
+
+    body = esc(new) if new else "<i>none</i>"
+    await update.message.reply_text(
+        f"✅ <b>Key Events — {esc(w['label'])}</b>\n\n{body}",
+        parse_mode=constants.ParseMode.HTML,
+    )
+    await refresh_group(context, w["id"])
+
+
 def schedule_week_jobs(app: Application, week_id: int) -> None:
     w = q1("SELECT * FROM weeks WHERE id=?", (week_id,))
     if not w or w["status"] != "open":
