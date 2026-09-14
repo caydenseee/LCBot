@@ -678,10 +678,15 @@ async def cmd_timesheet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not is_admin(update.effective_user.id):
         return
 
+    # "week" anywhere in the command switches to the current week
+    args = list(context.args)
+    weekly = any(a.lower() in ("week", "w") for a in args)
+    args = [a for a in args if a.lower() not in ("week", "w")]
+
     # /timesheet @handle — that person's shifts, with the numbers /fixtime needs
     who = None
     rest = []
-    for a in context.args:
+    for a in args:
         if who is None and not re.fullmatch(r"\d{4}-\d{2}", a):
             cand = find_agent(a)
             if cand:
@@ -689,13 +694,25 @@ async def cmd_timesheet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 continue
         rest.append(a)
 
-    if who:
+    if weekly:
+        anchor = now().date()
+        for a in rest:
+            try:
+                anchor = date.fromisoformat(a)
+            except ValueError:
+                pass
+        first, last = week_bounds(anchor)
+        span = f"{first.strftime('%-d %b')} – {last.strftime('%-d %b')}"
+    else:
         first = parse_month(rest)
         _, last = month_bounds(first)
+        span = first.strftime("%B %Y")
+
+    if who:
         t = timesheet(who["user_id"], first, last)
         nm = who["display_name"] or who["name"]
         lines = [
-            f"🕐 <b>{esc(nm)} — {first.strftime('%B %Y')}</b>", ""
+            f"🕐 <b>{esc(nm)} — {esc(span)}</b>", ""
         ]
         if not t["shifts"] and not t["open"]:
             lines.append("Nothing logged.")
@@ -730,16 +747,15 @@ async def cmd_timesheet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             "",
             "<code>/fixtime 42 11:00 17:30</code> to correct one",
             "<code>/fixtime 42 delete</code> to remove it",
+            f"<code>/timesheet {esc(context.args[0] if context.args else '@handle')}"
+            + ("</code> for the month" if weekly else " week</code> for this week"),
         ]
         await update.message.reply_text(
             "\n".join(lines), parse_mode=constants.ParseMode.HTML
         )
         return
 
-    first = parse_month(context.args)
-    _, last = month_bounds(first)
-
-    lines = [f"🕐 <b>Team hours — {first.strftime('%B %Y')}</b>", ""]
+    lines = [f"🕐 <b>Team hours — {esc(span)}</b>", ""]
     total_min = total_cents = 0
     any_rows = False
     for a in q("SELECT * FROM agents WHERE status='active' ORDER BY name"):

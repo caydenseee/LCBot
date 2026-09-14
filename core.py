@@ -1901,7 +1901,7 @@ ADMIN_GROUPS = [
         ("clockoutfor", "Close a forgotten shift"),
         ("fixtime", "Correct a time entry"),
         ("week", "This week at a glance"),
-        ("timesheet", "Team hours — or /timesheet @handle"),
+        ("timesheet", "Hours — add @handle or 'week'"),
         ("addreview", "Credit a Google review"),
         ("reviews", "Reviews credited this month"),
     ]),
