@@ -436,6 +436,42 @@ def run(sql: str, args: tuple = ()) -> sqlite3.Cursor:
 # --------------------------------------------------------------------------
 
 
+TG_LIMIT = 3900  # Telegram caps a message at 4096; leave room for entities
+
+
+def split_message(text: str, limit: int = TG_LIMIT) -> list:
+    """Break a long report on line boundaries so nothing is lost."""
+    if len(text) <= limit:
+        return [text]
+    parts, cur = [], ""
+    for line in text.split("\n"):
+        if len(line) > limit:                      # one enormous line
+            if cur:
+                parts.append(cur); cur = ""
+            for i in range(0, len(line), limit):
+                parts.append(line[i:i + limit])
+            continue
+        if len(cur) + len(line) + 1 > limit:
+            parts.append(cur); cur = line
+        else:
+            cur = f"{cur}\n{line}" if cur else line
+    if cur:
+        parts.append(cur)
+    return parts
+
+
+async def reply_long(message, text: str, **kw):
+    """reply_text, but split into several messages when it's too long."""
+    chunks = split_message(text)
+    last = None
+    for i, chunk in enumerate(chunks):
+        tail = dict(kw)
+        if i < len(chunks) - 1:
+            tail.pop("reply_markup", None)          # markup only on the last one
+        last = await message.reply_text(chunk, **tail)
+    return last
+
+
 def esc(text: str) -> str:
     """Names go into HTML messages, so & < > must be escaped."""
     return html.escape(text or "", quote=False)

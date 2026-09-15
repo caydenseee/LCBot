@@ -817,7 +817,7 @@ async def cmd_dropreqs(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         ]])
         icon = ("🔄 swap" if r["kind"] == "swap"
                 else "🙌 wants" if r["kind"] == "pickup" else "🙋 can't work")
-        await update.message.reply_text(
+        await reply_long(update.message, 
             f"{icon} — <b>{esc(nm)}</b>, {esc(where)}\n"
             + (f"<i>{esc(r['reason'])}</i>" if r["reason"] else ""),
             reply_markup=kb, parse_mode=constants.ParseMode.HTML,
@@ -851,7 +851,7 @@ async def cmd_myshifts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             else "\n<i>/myshifts for this week</i>"
         )
     if not rows:
-        await update.message.reply_text(
+        await reply_long(update.message, 
             f"You haven't claimed anything for {esc(w['label'])} yet." + hint,
             parse_mode=constants.ParseMode.HTML,
         )
@@ -861,7 +861,7 @@ async def cmd_myshifts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         for r in rows
     ]
     lines.append(f"\n{len(rows)} slot(s)")
-    await update.message.reply_text(
+    await reply_long(update.message, 
         "\n".join(lines) + hint, parse_mode=constants.ParseMode.HTML
     )
 
@@ -893,7 +893,7 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if BOARD_MODE == "single":
         text, _ = render_board(w["id"])
-        await update.message.reply_text(
+        await reply_long(update.message, 
             text + tail, parse_mode=constants.ParseMode.HTML
         )
         return
@@ -902,7 +902,7 @@ async def cmd_summary(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         day_text, _ = render_day(d["id"])
         lines.append(day_text)
         lines.append("")
-    await update.message.reply_text(
+    await reply_long(update.message, 
         "\n".join(lines), parse_mode=constants.ParseMode.HTML
     )
 
@@ -1001,7 +1001,7 @@ async def cmd_whohas(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("No week posted yet.")
         return
     if len(context.args) < 2:
-        await update.message.reply_text(
+        await reply_long(update.message, 
             "Usage: <code>/whohas MON 10am-12pm</code>",
             parse_mode=constants.ParseMode.HTML,
         )
@@ -1022,7 +1022,7 @@ async def cmd_whohas(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     holders = slot_holders(slot["id"])
     cap = slot["capacity"] or SLOT_CAPACITY
     if not holders:
-        await update.message.reply_text(
+        await reply_long(update.message, 
             f"<b>{day} {esc(slot['label'])}</b> — nobody yet (0/{cap})",
             parse_mode=constants.ParseMode.HTML,
         )
@@ -1035,7 +1035,7 @@ async def cmd_whohas(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     lines.append(
         f"\n<code>/dropslot @handle {day} {slot['label']}</code> to free one"
     )
-    await update.message.reply_text(
+    await reply_long(update.message, 
         "\n".join(lines), parse_mode=constants.ParseMode.HTML
     )
 
@@ -1333,7 +1333,7 @@ async def cmd_fixed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "",
             "<i>These fill in automatically when a week is posted.</i>",
         ]
-        await update.message.reply_text(
+        await reply_long(update.message, 
             "\n".join(lines), parse_mode=constants.ParseMode.HTML
         )
         return
@@ -1349,7 +1349,7 @@ async def cmd_fixed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "SELECT day_name, label FROM fixed_slots WHERE user_id=?", (row["user_id"],)
         )
         if not slots:
-            await update.message.reply_text(
+            await reply_long(update.message, 
                 f"<b>{esc(nm)}</b> has no fixed slots.\n\n"
                 f"Add one: <code>/fixed {context.args[0]} MON 10am-12pm</code>",
                 parse_mode=constants.ParseMode.HTML,
@@ -1364,7 +1364,7 @@ async def cmd_fixed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 lines.append(
                     f"{d}: {', '.join(sorted(by_day[d], key=slot_start_minutes))}"
                 )
-        await update.message.reply_text(
+        await reply_long(update.message, 
             "\n".join(lines), parse_mode=constants.ParseMode.HTML
         )
         return
@@ -1372,14 +1372,14 @@ async def cmd_fixed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if context.args[1].lower() == "clear":
         async with write_lock:
             run("DELETE FROM fixed_slots WHERE user_id=?", (row["user_id"],))
-        await update.message.reply_text(
+        await reply_long(update.message, 
             f"Cleared the fixed roster for <b>{esc(nm)}</b>.",
             parse_mode=constants.ParseMode.HTML,
         )
         return
 
     if len(context.args) < 3:
-        await update.message.reply_text(
+        await reply_long(update.message, 
             "Usage: <code>/fixed @handle MON 10am-12pm</code>",
             parse_mode=constants.ParseMode.HTML,
         )
@@ -1417,7 +1417,7 @@ async def cmd_fixed(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     total = q1(
         "SELECT COUNT(*) c FROM fixed_slots WHERE user_id=?", (row["user_id"],)
     )["c"]
-    await update.message.reply_text(
+    await reply_long(update.message, 
         f"{verb} <b>{day} {esc(label)}</b> for <b>{esc(nm)}</b>. "
         f"They now have {total} fixed slot(s).\n\n"
         "<i>Applies automatically to the next week you post. "

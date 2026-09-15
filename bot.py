@@ -296,30 +296,55 @@ async def cmd_export(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Point at the buttons and the app first, commands second."""
     if update.effective_chat.type != constants.ChatType.PRIVATE:
         await update.message.reply_text("Use /schedule here, or message me directly.")
         return
 
-    role = role_of(update.effective_user.id)
-    lines = ["<b>What I can do</b>", ""]
-    lines += [f"/{c} — {d}" for c, d in AGENT_COMMANDS if c != "help"]
+    user = update.effective_user
+    role = role_of(user.id)
+    lines = ["<b>How to use me</b>", ""]
+
+    lines += [
+        "<b>The buttons below the message box</b>",
+        "  ⏱ Clock in / ✅ Clock out — whichever you need",
+        "  🕐 My hours · 📋 My shifts",
+        "",
+    ]
+    if PUBLIC_URL:
+        lines += [
+            "<b>The app</b> — tap <b>My hours</b> by the 📎 paperclip",
+            "  Your shift, hours, pay and reviews in one place",
+            "",
+        ]
+
+    lines += [
+        "<b>When something changes</b>",
+        "  /plan — fill in next week",
+        "  /dropshift — ask to come off a shift",
+        "  /pickup — ask for one that's open",
+        "  /swap — hand one to a colleague",
+        "",
+        "<b>Anything else</b>",
+        "  /summary — this week's board · /summary next",
+        "  /handover — post a closing handover",
+        "  /support — who you list as Support",
+    ]
 
     if role in ("admin", "owner"):
+        lines += ["", "━━━━━━━━━━━━━━", "<b>ADMIN</b>"]
         for title, group in ADMIN_GROUPS:
             lines += ["", f"<b>{title}</b>"]
-            lines += [f"/{c} — {d}" for c, d in group]
+            lines += [f"  /{c} — {d}" for c, d in group]
     if role == "owner":
         lines += ["", "<b>Owner</b>"]
-        lines += [f"/{c} — {d}" for c, d in OWNER_EXTRA]
+        lines += [f"  /{c} — {d}" for c, d in OWNER_EXTRA]
 
-    text = "\n".join(lines)
-    # Telegram caps a message at 4096 characters.
-    if len(text) > 3900:
-        cut = text.rfind("\n\n<b>", 0, 3900)
-        await update.message.reply_text(text[:cut], parse_mode=constants.ParseMode.HTML)
-        await update.message.reply_text(text[cut:], parse_mode=constants.ParseMode.HTML)
-        return
-    await update.message.reply_text(text, parse_mode=constants.ParseMode.HTML)
+    await reply_long(
+        update.message, "\n".join(lines),
+        parse_mode=constants.ParseMode.HTML,
+        reply_markup=agent_keyboard(user.id),
+    )
 
 
 async def job_shift_call(context: ContextTypes.DEFAULT_TYPE) -> None:

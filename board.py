@@ -521,7 +521,7 @@ async def cmd_presets(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "\nSave the current week's timings as a preset with "
         "<code>/savepreset name</code>"
     )
-    await update.message.reply_text("\n".join(lines), parse_mode=constants.ParseMode.HTML)
+    await reply_long(update.message, "\n".join(lines), parse_mode=constants.ParseMode.HTML)
 
 
 async def cmd_savepreset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -618,7 +618,7 @@ async def cmd_gaps(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"{g['name']} {fmt_day(date.fromisoformat(g['the_date']))}: {g['label']}"
         for g in st["gaps"]
     ]
-    await update.message.reply_text("\n".join(lines), parse_mode=constants.ParseMode.HTML)
+    await reply_long(update.message, "\n".join(lines), parse_mode=constants.ParseMode.HTML)
 
 
 async def cmd_remind(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

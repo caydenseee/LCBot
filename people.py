@@ -281,7 +281,7 @@ async def cmd_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             lines.append(f"{verb} by <b>{esc(who)}</b> on {when}")
         else:
             lines.append("<i>No decision recorded — joined before approvals existed.</i>")
-        await update.message.reply_text(
+        await reply_long(update.message, 
             "\n".join(lines), parse_mode=constants.ParseMode.HTML
         )
         return
@@ -318,7 +318,7 @@ async def cmd_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if pending:
         lines += ["", f"⏳ {pending} waiting now — see /pending"]
     lines.append("\n<code>/access @handle</code> for one person's history.")
-    await update.message.reply_text(
+    await reply_long(update.message, 
         "\n".join(lines), parse_mode=constants.ParseMode.HTML
     )
 
@@ -343,7 +343,7 @@ async def cmd_pending(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 ]
             ]
         )
-        await update.message.reply_text(
+        await reply_long(update.message, 
             f"<b>{esc(r['display_name'] or r['name'])}</b>\n"
             f"{handle} · <code>{r['user_id']}</code>",
             reply_markup=kb,
@@ -359,7 +359,7 @@ async def cmd_roster(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     rows = q("SELECT * FROM agents WHERE status='active' ORDER BY name")
     waiting = q1("SELECT COUNT(*) c FROM agents WHERE status='pending'")["c"]
     if not rows:
-        await update.message.reply_text(
+        await reply_long(update.message, 
             "Roster is empty. Agents join it by tapping a slot, or by sending me /start."
         )
         return
@@ -406,7 +406,7 @@ async def cmd_roster(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
     if waiting:
         lines.append(f"\n⏳ {waiting} waiting for approval — see /pending")
-    await update.message.reply_text("\n".join(lines), parse_mode=constants.ParseMode.HTML)
+    await reply_long(update.message, "\n".join(lines), parse_mode=constants.ParseMode.HTML)
 
 
 async def _set_role(update, context, new_role: str) -> None:
@@ -529,14 +529,14 @@ async def cmd_salaried(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "<i>Salaried agents still appear on the board, still clock in "
             "and out, and their hours are still recorded.</i>",
         ]
-        await update.message.reply_text(
+        await reply_long(update.message, 
             "\n".join(lines), parse_mode=constants.ParseMode.HTML
         )
         return
 
     mode = context.args[0].lower()
     if mode not in ("on", "off") or len(context.args) < 2:
-        await update.message.reply_text(
+        await reply_long(update.message, 
             "Usage: <code>/salaried on @handle</code> or "
             "<code>/salaried off @handle</code>",
             parse_mode=constants.ParseMode.HTML,
@@ -580,14 +580,14 @@ async def cmd_avails(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             "<code>/avails off @handle</code> — stop tagging them",
             "<code>/avails on @handle</code> — put them back",
         ]
-        await update.message.reply_text(
+        await reply_long(update.message, 
             "\n".join(lines), parse_mode=constants.ParseMode.HTML
         )
         return
 
     mode = context.args[0].lower()
     if mode not in ("on", "off") or len(context.args) < 2:
-        await update.message.reply_text(
+        await reply_long(update.message, 
             "Usage: <code>/avails off @handle</code> or <code>/avails on @handle</code>",
             parse_mode=constants.ParseMode.HTML,
         )

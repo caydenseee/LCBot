@@ -457,6 +457,6 @@ async def cmd_handovers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         when = datetime.fromisoformat(r["created_at"]).strftime("%-d %b %H:%M")
         state = "nothing outstanding" if not r["body"] else "open cases"
         lines.append(f"{when} — <b>{esc(nm)}</b>, {state}")
-    await update.message.reply_text(
+    await reply_long(update.message, 
         "\n".join(lines), parse_mode=constants.ParseMode.HTML
     )

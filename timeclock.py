@@ -437,7 +437,7 @@ async def cmd_reviews(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if total:
         lines += ["", f"<b>{total} review(s) · {money(total * REVIEW_RATE_CENTS)}</b>"]
     lines.append("\n<code>/addreview @handle</code> to credit one.")
-    await update.message.reply_text(
+    await reply_long(update.message, 
         "\n".join(lines), parse_mode=constants.ParseMode.HTML
     )
 
@@ -488,7 +488,7 @@ async def cmd_mytime(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         lines.append(f"<b>Total: {money(t['cents'] + rc)}</b>")
     if t["open"]:
         lines.append("\n⏱ You have a shift still clocked in.")
-    await update.message.reply_text(
+    await reply_long(update.message, 
         "\n".join(lines), parse_mode=constants.ParseMode.HTML
     )
 
@@ -675,14 +675,14 @@ async def cmd_week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             try:
                 target = date.fromisoformat(a)
             except ValueError:
-                await update.message.reply_text(
+                await reply_long(update.message, 
                     "Usage: <code>/week</code>, <code>/week W36</code> "
                     "or <code>/week 2026-09-07</code>",
                     parse_mode=constants.ParseMode.HTML,
                 )
                 return
     first, last = week_bounds(target)
-    await update.message.reply_text(
+    await reply_long(update.message, 
         week_report(first, last), parse_mode=constants.ParseMode.HTML
     )
 
@@ -818,7 +818,7 @@ async def cmd_audit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(update.effective_user.id):
         return
     if not context.args:
-        await update.message.reply_text(
+        await reply_long(update.message, 
             "Usage: <code>/audit @handle</code> or <code>/audit @handle W36</code>\n\n"
             "Lists every shift they were rostered for and whether it was clocked, "
             "so you can see what's missing.",
@@ -932,7 +932,7 @@ async def cmd_audit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         lines.append("<i>Add one with</i> <code>/fixtime</code> <i>after they "
                      "clock in, or ask them to tell you the times.</i>")
 
-    await update.message.reply_text(
+    await reply_long(update.message, 
         "\n".join(lines), parse_mode=constants.ParseMode.HTML
     )
 
@@ -1031,7 +1031,7 @@ async def cmd_timesheet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             f"<code>/timesheet {esc(context.args[0] if context.args else '@handle')}"
             + ("</code> for the month" if weekly else " week</code> for this week"),
         ]
-        await update.message.reply_text(
+        await reply_long(update.message, 
             "\n".join(lines), parse_mode=constants.ParseMode.HTML
         )
         return
@@ -1063,7 +1063,7 @@ async def cmd_timesheet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             lines.append(f"<b>Estimated cost: {money(total_cents)}</b>")
         lines.append("\n<i>Estimates only — not payroll figures.</i>")
     lines.append("\n/payroll for a CSV of every shift.")
-    await update.message.reply_text(
+    await reply_long(update.message, 
         "\n".join(lines), parse_mode=constants.ParseMode.HTML
     )
 
