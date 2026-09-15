@@ -27,7 +27,8 @@ async def cmd_clockin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             await update.message.reply_text(
                 f"You're already clocked in since {started.strftime('%-d %b, %H:%M')}"
                 + (f" on {shown}" if shown else "")
-                + ".\nYour [OPENING] has been posted. Send /clockout when you finish."
+                + ".\nYour [OPENING] has been posted. Tap Clock out when you finish.",
+                reply_markup=agent_keyboard(user.id),
             )
             return
         if given:
@@ -68,7 +69,8 @@ async def cmd_clockin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             return
         await update.message.reply_text(
             f"You're already clocked in since {started.strftime('%-d %b, %H:%M')}.\n"
-            "Send /clockout when you finish."
+            "Tap Clock out when you finish.",
+            reply_markup=agent_keyboard(user.id),
         )
         return
 
@@ -130,12 +132,17 @@ async def cmd_clockin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
                 parse_mode=constants.ParseMode.HTML,
                 reply_markup=InlineKeyboardMarkup(rows),
             )
+            await update.message.reply_text(
+                "You're clocked in — pick the shift above.",
+                reply_markup=agent_keyboard(user.id),
+            )
         else:
             await update.message.reply_text(
                 f"⏱ Clocked in at <b>{when.strftime('%H:%M')}</b>\n\n"
                 "There's no roster for today, so tell me the shift and I'll post "
                 "your [OPENING]:\n\n<code>/clockin 4pm-6pm</code>",
                 parse_mode=constants.ParseMode.HTML,
+                reply_markup=agent_keyboard(user.id),
             )
         return
 
@@ -190,16 +197,20 @@ async def cmd_clockin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "Your [OPENING] has been posted ✅\n"
             if posted else "Tap the message above to copy it.\n"
         )
-        note += "Send /clockout when you finish."
-        await update.message.reply_text(note, parse_mode=constants.ParseMode.HTML)
+        note += "Tap Clock out when you finish."
+        await update.message.reply_text(
+            note, parse_mode=constants.ParseMode.HTML,
+            reply_markup=agent_keyboard(user.id),
+        )
     else:
         await update.message.reply_text(
             f"⏱ Clocked in at <b>{when.strftime('%H:%M')}</b>\n\n"
             "⚠️ I couldn't find a shift for you around now, so this is logged as "
             "unrostered. If you're covering a specific block, clock out and use "
             "<code>/clockin 6pm-8pm</code>.\n\n"
-            "Send /clockout when you finish.",
+            "Tap Clock out when you finish.",
             parse_mode=constants.ParseMode.HTML,
+            reply_markup=agent_keyboard(user.id),
         )
 
 
@@ -249,9 +260,17 @@ async def on_clockin_slot(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await query.edit_message_text(
         f"\u23f1 Clocked in \u2014 <b>{esc(slot['label'])}</b>\n"
         f"Support: {esc(support_for(user.id, nice_name))}\n\n"
-        f"{tail}\nSend /clockout when you finish.",
+        f"{tail}\nTap Clock out when you finish.",
         parse_mode=constants.ParseMode.HTML,
     )
+    try:
+        await query.message.reply_text(
+            f"You're on <b>{esc(slot['label'])}</b>. Tap Clock out when you finish.",
+            parse_mode=constants.ParseMode.HTML,
+            reply_markup=agent_keyboard(user.id),
+        )
+    except Exception:
+        pass
 
 
 async def cmd_clockout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -270,7 +289,8 @@ async def cmd_clockout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
     if not open_row:
         await update.message.reply_text(
-            "You're not clocked in. Send /clockin when you start a shift."
+            "You're not clocked in. Tap Clock in when you start a shift.",
+            reply_markup=agent_keyboard(user.id),
         )
         return
 
