@@ -161,8 +161,11 @@ async def cmd_clockin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             "Your [OPENING] has been posted ✅\n"
             if posted else "Tap the message above to copy it.\n"
         )
-        note += "Send /clockout when you finish."
-        await update.message.reply_text(note, parse_mode=constants.ParseMode.HTML)
+        note += "Tap Clock out when you finish."
+        await update.message.reply_text(
+            note, parse_mode=constants.ParseMode.HTML,
+            reply_markup=agent_keyboard(user.id),
+        )
     elif override:
         has_roster = day_row_for(when.date().isoformat())
         note = (
@@ -294,9 +297,10 @@ async def cmd_clockout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         msg.append(f"Worked: <b>{hhmm(mins)}</b>")
     if pay:
         msg.append(f"Approx: {money(pay)}")
-    msg.append("\n/mytime — your hours this month")
+    msg.append("\n🕐 My hours — for the month so far")
     await update.message.reply_text(
-        "\n".join(msg), parse_mode=constants.ParseMode.HTML
+        "\n".join(msg), parse_mode=constants.ParseMode.HTML,
+        reply_markup=agent_keyboard(user.id),
     )
 
     running = open_cases()

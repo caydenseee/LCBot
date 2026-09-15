@@ -8,6 +8,20 @@ from timeclock import *  # noqa: F401,F403
 from handover import *  # noqa: F401,F403
 from webapp import *  # noqa: F401,F403
 
+async def on_keyboard_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Route a tap on the persistent keyboard to the right command."""
+    text = (update.message.text or "").strip()
+    context.args = []
+    if text == BTN_IN:
+        await cmd_clockin(update, context)
+    elif text == BTN_OUT:
+        await cmd_clockout(update, context)
+    elif text == BTN_HOURS:
+        await cmd_mytime(update, context)
+    elif text == BTN_SHIFTS:
+        await cmd_myshifts(update, context)
+
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     context.user_data.pop("draft", None)
     await update.message.reply_text("Cancelled.")
@@ -453,6 +467,13 @@ def main() -> None:
         )
     )
     app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND
+            & filters.Regex(f"^({BTN_IN}|{BTN_OUT}|{BTN_HOURS}|{BTN_SHIFTS})$"),
+            on_keyboard_button,
+        )
+    )
     app.add_handler(CommandHandler("chatid", cmd_chatid))
     app.add_handler(CommandHandler("pending", cmd_pending))
     app.add_handler(CommandHandler("access", cmd_access))

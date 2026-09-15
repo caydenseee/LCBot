@@ -50,7 +50,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if status == "active":
         touch_agent(user, dm_ok=1)
         await update.message.reply_text(
-            "👋 <b>You're in!</b>\n\n"
+            reply_markup=agent_keyboard(update.effective_user.id),
+            text="👋 <b>You're in!</b>\n\n"
             "/plan — pick your slots for the week\n"
             "/clockin — start your shift\n"
             "/clockout — end your shift\n"
@@ -229,7 +230,8 @@ async def on_access_decision(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if approve:
             await context.bot.send_message(
                 target_id,
-                "👋 <b>You're in!</b>\n\n"
+                reply_markup=agent_keyboard(target_id),
+                text="👋 <b>You're in!</b>\n\n"
             "/plan — pick your slots for the week\n"
             "/clockin — start your shift\n"
             "/clockout — end your shift\n"

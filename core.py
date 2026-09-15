@@ -33,6 +33,8 @@ from zoneinfo import ZoneInfo
 
 from telegram import (
     BotCommand,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
     MenuButtonWebApp,
     WebAppInfo,
     BotCommandScopeAllGroupChats,
@@ -808,6 +810,31 @@ def support_for(user_id: int, fallback: str = "") -> str:
     if row and row["support_name"]:
         return row["support_name"]
     return setting("support_name", "") or fallback
+
+
+BTN_IN = "⏱ Clock in"
+BTN_OUT = "✅ Clock out"
+BTN_HOURS = "🕐 My hours"
+BTN_SHIFTS = "📋 My shifts"
+
+
+def agent_keyboard(user_id: int) -> ReplyKeyboardMarkup:
+    """The buttons that sit under the message box, so nothing is typed.
+
+    Shows Clock out while they're on shift, Clock in otherwise.
+    """
+    on_shift = bool(q1(
+        "SELECT 1 FROM time_entries WHERE agent_id=? AND clock_out IS NULL",
+        (user_id,),
+    ))
+    rows = [
+        [KeyboardButton(BTN_OUT if on_shift else BTN_IN)],
+        [KeyboardButton(BTN_HOURS), KeyboardButton(BTN_SHIFTS)],
+    ]
+    return ReplyKeyboardMarkup(
+        rows, resize_keyboard=True, is_persistent=True,
+        input_field_placeholder="Tap a button, or type a command",
+    )
 
 
 def opening_block(user_id: int, name: str, slot_label: str) -> str:
