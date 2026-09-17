@@ -1,6 +1,7 @@
 """Entry point: starts the bot, schedules jobs, wires the commands up."""
 
 from core import *  # noqa: F401,F403
+from core import db  # noqa: F401  (restore overwrites it in place)
 from board import *  # noqa: F401,F403
 from people import *  # noqa: F401,F403
 from shifts import *  # noqa: F401,F403
@@ -107,6 +108,203 @@ def backup_caption(counts: dict) -> str:
         f"{counts['agents']} agents · {counts['weeks']} weeks · "
         f"{counts['signups']} signups · {counts['time_entries']} shifts\n\n"
         "Keep this somewhere safe. It's the only copy outside the server."
+    )
+
+
+async def cmd_restore(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Put a backup file back. Owner only, and it asks twice."""
+    if not is_owner(update.effective_user.id):
+        return ConversationHandler.END
+    if update.effective_chat.type != constants.ChatType.PRIVATE:
+        return ConversationHandler.END
+
+    cur = inspect_db(DB_PATH)
+    lines = [
+        "♻️ <b>Restore from a backup</b>",
+        "",
+        "<b>What's live right now</b>",
+    ]
+    if cur["ok"]:
+        lines += [
+            f"  {cur['counts']['agents']} agents · "
+            f"{cur['counts']['weeks']} weeks · "
+            f"{cur['counts']['time_entries']} time entries",
+            f"  newest shift: {cur['newest'] or '—'}",
+        ]
+    lines += [
+        "",
+        "Send me the <code>.db</code> file to restore.",
+        "",
+        "<i>I'll check it, show you what's inside, and send you a copy of the "
+        "current database before anything is replaced. /cancel to stop.</i>",
+    ]
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode=constants.ParseMode.HTML
+    )
+    return RESTORE_FILE
+
+
+async def got_restore_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    doc = update.message.document
+    if not doc:
+        await update.message.reply_text("Send the .db file, or /cancel.")
+        return RESTORE_FILE
+    if doc.file_size and doc.file_size > 40 * 1024 * 1024:
+        await update.message.reply_text("That's too big to be our database.")
+        return RESTORE_FILE
+
+    tmp = f"{DB_PATH}.incoming"
+    try:
+        f = await context.bot.get_file(doc.file_id)
+        await f.download_to_drive(tmp)
+    except Exception as e:
+        await update.message.reply_text(f"Couldn't download it: {e}")
+        return ConversationHandler.END
+
+    info = inspect_db(tmp)
+    if not info["ok"]:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        await update.message.reply_text(
+            f"❌ {info.get('error', 'That file looks wrong.')}\n\n"
+            "Nothing has changed. Send another file, or /cancel."
+        )
+        return RESTORE_FILE
+
+    cur = inspect_db(DB_PATH)
+    context.user_data["restore_path"] = tmp
+    c, n = info["counts"], cur["counts"] if cur["ok"] else {}
+
+    def cmp(k, label):
+        was = n.get(k, 0)
+        now = c.get(k, 0)
+        arrow = "→"
+        note = ""
+        if now < was:
+            note = f"  ⚠️ {was - now} fewer"
+        return f"  {label}: {was} {arrow} <b>{now}</b>{note}"
+
+    lines = [
+        "📋 <b>That file contains</b>", "",
+        cmp("agents", "Agents"),
+        cmp("weeks", "Weeks"),
+        cmp("time_entries", "Time entries"),
+        cmp("signups", "Signups"),
+        cmp("handovers", "Handovers"),
+        cmp("reviews", "Reviews"),
+        "",
+        f"  Newest shift in it: <b>{info['newest'] or '—'}</b>",
+        f"  Newest shift live now: {cur.get('newest') or '—'}",
+        "",
+        "<b>This replaces everything.</b> Anything recorded since that backup "
+        "will be gone.",
+    ]
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("♻️ Replace the database", callback_data="rs:go")],
+        [InlineKeyboardButton("Cancel", callback_data="rs:no")],
+    ])
+    await update.message.reply_text(
+        "\n".join(lines), parse_mode=constants.ParseMode.HTML, reply_markup=kb
+    )
+    return RESTORE_OK
+
+
+async def on_restore_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    tmp = context.user_data.pop("restore_path", None)
+    if query.data.endswith(":no") or not tmp:
+        await query.answer()
+        await query.edit_message_text("Cancelled — nothing was changed.")
+        if tmp:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        return ConversationHandler.END
+
+    await query.answer("Restoring…")
+    stamp = now().strftime("%Y%m%d-%H%M")
+
+    # send the current database back first, so there's always a way out
+    safety = f"{DB_PATH}.before-restore-{stamp}"
+    try:
+        async with write_lock:
+            snap = sqlite3.connect(safety)
+            db.backup(snap)
+            snap.close()
+        with open(safety, "rb") as fh:
+            await query.message.reply_document(
+                document=fh, filename=f"before-restore-{stamp}.db",
+                caption="The database as it was a moment ago. Keep this.",
+            )
+    except Exception as e:
+        log.warning("Couldn't send the safety copy: %s", e)
+        await query.message.reply_text(
+            "⚠️ I couldn't send a safety copy, so I've stopped. Nothing changed."
+        )
+        return ConversationHandler.END
+
+    # overwrite in place through the existing connection, so every module
+    # keeps working against the same handle
+    try:
+        async with write_lock:
+            src = sqlite3.connect(tmp)
+            src.backup(db)
+            src.close()
+            db.commit()
+    except Exception as e:
+        log.warning("Restore failed: %s", e)
+        await query.message.reply_text(
+            f"❌ The restore failed: {e}\n\nThe database is unchanged."
+        )
+        return ConversationHandler.END
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+    after = inspect_db(DB_PATH)
+    await query.edit_message_text(
+        "✅ <b>Restored.</b>\n\n"
+        f"{after['counts'].get('agents', 0)} agents · "
+        f"{after['counts'].get('weeks', 0)} weeks · "
+        f"{after['counts'].get('time_entries', 0)} time entries\n"
+        f"Newest shift: {after.get('newest') or '—'}\n\n"
+        "<i>Check /roster and /timesheet, then redeploy if anything looks odd.</i>",
+        parse_mode=constants.ParseMode.HTML,
+    )
+    log.info("Database restored by %s", query.from_user.id)
+    return ConversationHandler.END
+
+
+async def cmd_dbinfo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """What's in the database right now."""
+    if not is_admin(update.effective_user.id):
+        return
+    info = inspect_db(DB_PATH)
+    if not info["ok"]:
+        await update.message.reply_text(info.get("error", "Couldn't read it."))
+        return
+    try:
+        size = os.path.getsize(DB_PATH) / 1024
+    except OSError:
+        size = 0
+    c = info["counts"]
+    await update.message.reply_text(
+        "🗄 <b>Database</b>\n\n"
+        f"  {c['agents']} agents\n"
+        f"  {c['weeks']} weeks\n"
+        f"  {c['signups']} signups\n"
+        f"  {c['time_entries']} time entries\n"
+        f"  {c['handovers']} handovers\n"
+        f"  {c['reviews']} reviews\n\n"
+        f"  Newest shift: <b>{info['newest'] or '—'}</b>\n"
+        f"  File size: {size:.0f} KB\n"
+        f"  Path: <code>{esc(DB_PATH)}</code>",
+        parse_mode=constants.ParseMode.HTML,
     )
 
 
@@ -567,6 +765,21 @@ def main() -> None:
     app.add_handler(CommandHandler("clockoutfor", cmd_clockoutfor))
     app.add_handler(CommandHandler("fixtime", cmd_fixtime))
     app.add_handler(CommandHandler("backup", cmd_backup))
+    app.add_handler(CommandHandler("dbinfo", cmd_dbinfo))
+    app.add_handler(
+        ConversationHandler(
+            entry_points=[CommandHandler("restore", cmd_restore)],
+            states={
+                RESTORE_FILE: [
+                    MessageHandler(filters.Document.ALL, got_restore_file)
+                ],
+                RESTORE_OK: [
+                    CallbackQueryHandler(on_restore_confirm, pattern=r"^rs:")
+                ],
+            },
+            fallbacks=[CommandHandler("cancel", cancel)],
+        )
+    )
     app.add_handler(CommandHandler("reset", cmd_reset))
     app.add_handler(CommandHandler("tidy", cmd_tidy))
     app.add_handler(CommandHandler("removeagent", cmd_removeagent))

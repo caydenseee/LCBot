@@ -1577,6 +1577,7 @@ PICKUP_PICK, PICKUP_REASON = 210, 211
 HANDOVER_TEXT = 220
 HO_SECTION, HO_PRIO, HO_PLATFORM, HO_STORE, HO_BODY, HO_MORE = range(221, 227)
 REVIEW_PHOTO = 230
+RESTORE_FILE, RESTORE_OK = 250, 251
 HO_PICK = 231
 SWAP_PICK, SWAP_WHO, SWAP_REASON = 240, 241, 242
 
@@ -1814,6 +1815,49 @@ def at_time_on(the_date: str, hhmm_text: str) -> datetime | None:
     return datetime.combine(d, time(mins // 60, mins % 60), TZ)
 
 
+EXPECTED_TABLES = {
+    "agents", "weeks", "days", "slots", "signups", "time_entries",
+    "pay_rates", "handovers", "ho_cases", "reviews", "drop_requests",
+}
+
+
+def inspect_db(path: str) -> dict:
+    """Read a database file without touching the live one."""
+    out = {"ok": False, "tables": set(), "counts": {}, "newest": None}
+    try:
+        con = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+        con.row_factory = sqlite3.Row
+    except Exception as e:
+        out["error"] = f"Can't open it: {e}"
+        return out
+    try:
+        names = {
+            r["name"] for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        out["tables"] = names
+        missing = EXPECTED_TABLES - names
+        if missing:
+            out["error"] = "Not an avails database — missing " + ", ".join(
+                sorted(missing)[:4]
+            )
+            return out
+        for t in ("agents", "weeks", "time_entries", "signups", "handovers",
+                  "reviews"):
+            out["counts"][t] = con.execute(f"SELECT COUNT(*) c FROM {t}").fetchone()["c"]
+        r = con.execute(
+            "SELECT MAX(the_date) d FROM time_entries"
+        ).fetchone()
+        out["newest"] = r["d"] if r else None
+        out["ok"] = True
+    except Exception as e:
+        out["error"] = f"Couldn't read it: {e}"
+    finally:
+        con.close()
+    return out
+
+
 # --------------------------------------------------------------------------
 # Scheduled jobs
 # --------------------------------------------------------------------------
@@ -2005,6 +2049,8 @@ OWNER_EXTRA = [
     ("payroll", "Export shifts as CSV"),
     ("export", "This week's board as CSV"),
     ("backup", "Download a copy of the data"),
+    ("restore", "Put a backup back"),
+    ("dbinfo", "What's in the database"),
     ("chatid", "Show this chat's ID"),
     ("tidy", "Clear old closed weeks only"),
     ("reset", "Clear EVERYTHING except people"),
