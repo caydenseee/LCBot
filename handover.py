@@ -309,9 +309,29 @@ async def on_ho_prio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def on_ho_platform(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Duoke needs a store; Livechat doesn't, so skip that step for it."""
     query = update.callback_query
     await query.answer()
-    context.user_data["ho_draft"]["platform"] = query.data.split(":")[1]
+    d = context.user_data["ho_draft"]
+    d["platform"] = query.data.split(":")[1]
+
+    if d["platform"] != "DUOKE":
+        d["flag"], d["store"] = "", ""
+        await query.edit_message_text(
+            f"{d['prio']} ▫️{d['platform']}\n\n"
+            "<b>Now send the case.</b>\n"
+            "First line = the customer's username. Then the rest as you'd "
+            "write it:\n\n"
+            "<code>jasmine_wq\n"
+            "260908QQ1183KD\n"
+            "Sonos Era 100\n\n"
+            "• what happened\n"
+            "• what you did\n\n"
+            "‼️Need Help: what's needed next</code>",
+            parse_mode=constants.ParseMode.HTML,
+        )
+        return HO_BODY
+
     rows = [
         [InlineKeyboardButton(f"{flag}{store}", callback_data=f"hb:{i}")]
         for i, (flag, store) in enumerate(STORES)

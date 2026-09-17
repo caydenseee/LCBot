@@ -1674,8 +1674,9 @@ def next_working_day(from_date: date) -> date:
 
 
 def render_case(c: dict) -> str:
-    lines = [f"▫️{c['platform']}", f"{c['prio']} {c['username']}",
-             f"{c['flag']}{c['store']}"]
+    lines = [f"▫️{c['platform']}", f"{c['prio']} {c['username']}"]
+    if c.get("store"):                       # Duoke only — Livechat has no brands
+        lines.append(f"{c.get('flag', '')}{c['store']}")
     return "\n".join(lines) + "\n" + c["body"].strip()
 
 
@@ -1700,7 +1701,11 @@ def render_handover(cases: list, who: str, the_date: date,
         out += ["", f"🔸{the_date.strftime('%-d %b %Y')} — no open cases"]
     if closed:
         out += ["", "✔️ Closed this shift"]
-        out += [f"  {c['prio']} {c['username']} — {c['store']}" for c in closed]
+        out += [
+            f"  {c['prio']} {c['username']}"
+            + (f" — {c['store']}" if c.get("store") else f" — {c['platform']}")
+            for c in closed
+        ]
     out += ["", f"— {who}"]
     return "\n".join(out)
 
