@@ -517,14 +517,16 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         ]
 
     lines += [
+        "<b>The app</b> — everything about your week",
+        "  📅 Week — take a slot, or let one go",
+        "  🕐 Hours — what you've worked and earned",
+        "",
         "<b>When something changes</b>",
-        "  /plan — fill in next week",
         "  /dropshift — ask to come off a shift",
         "  /pickup — ask for one that's open",
         "  /swap — hand one to a colleague",
         "",
         "<b>Anything else</b>",
-        "  /summary — this week's board · /summary next",
         "  /handover — post a closing handover",
         "  /support — who you list as Support",
     ]

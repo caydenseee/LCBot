@@ -1978,18 +1978,15 @@ async def job_shift_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 AGENT_COMMANDS = [
-    ("plan", "Fill in my week"),
     ("clockin", "Start my shift — or /clockin 2pm-4pm"),
     ("clockout", "End my shift"),
     ("mytime", "My hours this month"),
     ("payslip", "My hours and pay"),
-    ("myshifts", "My shifts — or /myshifts next"),
     ("dropshift", "Ask to drop a shift"),
     ("pickup", "Ask to take an open shift"),
     ("swap", "Hand a shift to someone"),
     ("support", "Who I list as support"),
     ("handover", "Post a closing handover"),
-    ("summary", "This week's board — or /summary next"),
     ("help", "List commands"),
 ]
 GROUP_COMMANDS = [
@@ -2198,6 +2195,12 @@ MINIAPP_HTML = """<!DOCTYPE html>
   .slot { display:flex; align-items:center; justify-content:space-between;
      padding:11px 14px; border-radius:11px; margin-bottom:7px; font-size:14px;
      background: var(--tg-theme-secondary-bg-color,#f4f4f5); }
+  .slot.tappable { cursor:pointer; -webkit-tap-highlight-color:transparent; }
+  .slot.tappable:active { transform:scale(.985); }
+  .slot.busy { opacity:.5; }
+  .toast { position:fixed; left:16px; right:16px; bottom:96px; z-index:20;
+     background:#333; color:#fff; padding:12px 16px; border-radius:11px;
+     font-size:13px; text-align:center; }
   .slot .who { font-size:12px; color: var(--tg-theme-hint-color,#888);
      text-align:right; }
   .slot.mine { background: var(--tg-theme-link-color,#2a7); color:#fff; }
@@ -2372,7 +2375,10 @@ async function loadWeek() {
       else if (!s.taken) who = s.past ? 'nobody' : 'free';
       else who = esc(s.names.join(', '));
       const cap = s.cap > 1 ? ` <span class="cap">${s.taken}/${s.cap}</span>` : '';
-      h += `<div class="${cls}"><div>${esc(s.label)}${cap}</div>`;
+      const can = d.open && !s.past && (s.mine || !s.full);
+      if (can) cls += ' tappable';
+      const attr = can ? ` data-slot="${s.id}" data-want="${s.mine ? '0' : '1'}"` : '';
+      h += `<div class="${cls}"${attr}><div>${esc(s.label)}${cap}</div>`;
       h += `<div class="who">${who}</div></div>`;
     }
     h += '</div>';
@@ -2381,13 +2387,52 @@ async function loadWeek() {
   if (d.gaps) {
     h += `<div class="note">${d.gaps} slot(s) still open this week.</div>`;
   }
-  h += '<div class="note">Claiming from here is coming — use /plan for now.</div>';
+  if (d.open) {
+    h += '<div class="note">Tap a slot to take it. Tap yours again to let it go.</div>';
+  } else {
+    h += '<div class="note">This week is closed — use /pickup to ask for a shift.</div>';
+  }
 
   app.innerHTML = h + navBar();
   wire();
   document.querySelectorAll('.seg div[data-w]').forEach(el => {
     el.onclick = () => { WHICH = el.dataset.w; render(); };
   });
+  document.querySelectorAll('.slot.tappable').forEach(el => {
+    el.onclick = () => claim(el);
+  });
+}
+
+function toast(msg) {
+  const old = document.querySelector('.toast');
+  if (old) old.remove();
+  const t = document.createElement('div');
+  t.className = 'toast';
+  t.textContent = msg;
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), 2600);
+}
+
+async function claim(el) {
+  if (el.classList.contains('busy')) return;
+  el.classList.add('busy');
+  const want = el.dataset.want === '1';
+  try {
+    const out = await post('/api/claim', { slot: Number(el.dataset.slot), want });
+    if (!out.ok) {
+      toast(out.error || 'Could not change that.');
+      await loadWeek();
+      return;
+    }
+    if (tg?.HapticFeedback) tg.HapticFeedback.impactOccurred('light');
+    if (!out.quiet && out.label) {
+      toast(want ? 'You\'re on ' + out.label : 'Released ' + out.label);
+    }
+    await loadWeek();
+  } catch (e) {
+    toast('Something went wrong.');
+    el.classList.remove('busy');
+  }
 }
 
 async function loadTeam() {
@@ -2527,6 +2572,21 @@ async function load() {
 render();
 </script>
 </body></html>"""
+
+
+async def refresh_group_for(week_id: int, day_id: int) -> None:
+    """Redraw the pinned board after a change made in the app."""
+    bot = bot_ref()
+    if not bot:
+        return
+    try:
+        if BOARD_MODE == "single":
+            await refresh_board(bot, week_id)
+        else:
+            await refresh_day(bot, day_id)
+            await refresh_header(bot, week_id)
+    except Exception as e:
+        log.info("Board refresh after an app change failed: %s", e)
 
 
 # The web server runs on its own thread. Telegram work has to be handed back to

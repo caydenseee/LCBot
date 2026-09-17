@@ -398,6 +398,63 @@ def week_payload(user_id: int, which: str = "now") -> dict:
     }
 
 
+def web_claim(user_id: int, slot_id: int, want: bool) -> dict:
+    """Take or release a slot from the app.
+
+    The server decides, not the screen — two people tapping the same free slot
+    can't both win.
+    """
+    slot = q1(
+        """SELECT s.id, s.label, s.capacity, d.id AS day_id, d.name AS day_name,
+                  d.the_date, w.id AS week_id, w.status
+           FROM slots s JOIN days d ON d.id = s.day_id
+           JOIN weeks w ON w.id = d.week_id WHERE s.id=?""",
+        (slot_id,),
+    )
+    if not slot:
+        return {"ok": False, "error": "That slot no longer exists."}
+    if slot["status"] != "open":
+        return {"ok": False, "error":
+                "That week is closed. Use /pickup to ask for a shift."}
+    if date.fromisoformat(slot["the_date"]) < now().date():
+        return {"ok": False, "error": "That day has already passed."}
+    if is_locked(slot["week_id"], user_id):
+        return {"ok": False, "error":
+                "You've confirmed your week. Unlock it in /plan to change it."}
+
+    holders = slot_holders(slot["id"])
+    mine = any(h["user_id"] == user_id for h in holders)
+    cap = slot["capacity"] or SLOT_CAPACITY
+
+    if want and mine:
+        return {"ok": True, "state": "mine", "quiet": True}
+    if want and len(holders) >= cap:
+        who = ", ".join(h["name"] for h in holders)
+        return {"ok": False, "error": f"{who} got there first.", "refresh": True}
+    if not want and not mine:
+        return {"ok": True, "state": "free", "quiet": True}
+
+    name = display_name_of(user_id, "")
+    if want:
+        run(
+            "INSERT OR IGNORE INTO signups (slot_id, user_id, name, ts) "
+            "VALUES (?,?,?,?)",
+            (slot["id"], user_id, name, now().isoformat()),
+        )
+    else:
+        run("DELETE FROM signups WHERE slot_id=? AND user_id=?",
+            (slot["id"], user_id))
+
+    # redraw the group board through the bot
+    on_bot_loop(refresh_group_for(slot["week_id"], slot["day_id"]))
+
+    return {
+        "ok": True,
+        "state": "mine" if want else "free",
+        "label": f"{slot['day_name']} {slot['label']}",
+    }
+
+
 def web_has_access(user_id: int) -> bool:
     if user_id in ADMIN_IDS:
         return True
@@ -556,7 +613,15 @@ class MiniAppHandler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             body = {}
 
-        if path == "/api/clockin":
+        if path == "/api/claim":
+            try:
+                sid = int(body.get("slot", 0))
+            except (TypeError, ValueError):
+                sid = 0
+            async_safe = bool(body.get("want", True))
+            out = web_claim(uid, sid, async_safe) if sid else {
+                "ok": False, "error": "No slot given."}
+        elif path == "/api/clockin":
             out = web_clock_in(uid, str(body.get("label", "")).strip())
         elif path == "/api/clockout":
             out = web_clock_out(uid)
