@@ -2190,6 +2190,24 @@ MINIAPP_HTML = """<!DOCTYPE html>
   .chips button { border:0; border-radius:10px; padding:9px 14px; font-size:14px;
     background: var(--tg-theme-secondary-bg-color,#f4f4f5);
     color: var(--tg-theme-text-color,#111); cursor:pointer; }
+  .day { margin-top:20px; }
+  .day h3 { font-size:12px; font-weight:700; letter-spacing:.06em;
+     text-transform:uppercase; color: var(--tg-theme-hint-color,#888);
+     margin:0 0 8px; display:flex; justify-content:space-between; }
+  .day.is-today h3 { color: var(--tg-theme-link-color,#2a7); }
+  .slot { display:flex; align-items:center; justify-content:space-between;
+     padding:11px 14px; border-radius:11px; margin-bottom:7px; font-size:14px;
+     background: var(--tg-theme-secondary-bg-color,#f4f4f5); }
+  .slot .who { font-size:12px; color: var(--tg-theme-hint-color,#888);
+     text-align:right; }
+  .slot.mine { background: var(--tg-theme-link-color,#2a7); color:#fff; }
+  .slot.mine .who { color:#dff1e9; }
+  .slot.free { background:transparent;
+     border:1px dashed var(--tg-theme-hint-color,#c9c9cf); }
+  .slot.free .who { color: var(--tg-theme-link-color,#2a7); }
+  .slot.part { background:#fff6e5; }
+  .slot.past { opacity:.45; }
+  .cap { font-variant-numeric:tabular-nums; }
   .seg { display:inline-flex; gap:2px; padding:3px; border-radius:9px;
          background: var(--tg-theme-secondary-bg-color,#f4f4f5); margin-bottom:14px; }
   .seg div { padding:5px 16px; border-radius:7px; font-size:13px; font-weight:600;
@@ -2202,11 +2220,11 @@ MINIAPP_HTML = """<!DOCTYPE html>
 <script>
 const tg = window.Telegram?.WebApp;
 if (tg) { tg.ready(); tg.expand(); }
-let VIEW = 'home', MODE = 'week', START = '', IS_ADMIN = false;
+let VIEW = 'home', MODE = 'week', START = '', WHICH = 'now', IS_ADMIN = false;
 const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 
 function navBar() {
-  const items = [['home','🏠','Home'], ['me','🕐','Hours']];
+  const items = [['home','🏠','Home'], ['week','📅','Week'], ['me','🕐','Hours']];
   if (IS_ADMIN) items.push(['team','👥','Team']);
   return '<div class="nav-bar">'
     + items.map(([v, i, t]) =>
@@ -2314,6 +2332,64 @@ function wire() {
   });
 }
 
+async function loadWeek() {
+  const app = document.getElementById('app');
+  const r = await fetch('/api/week?which=' + WHICH,
+    { headers: { 'X-Init-Data': tg?.initData || '' } });
+  if (!r.ok) throw new Error('HTTP ' + r.status);
+  const d = await r.json();
+
+  if (d.empty) {
+    app.innerHTML = '<h1>Week</h1><div class="empty">No week has been posted yet.</div>' + navBar();
+    wire(); return;
+  }
+
+  let h = `<h1>${esc(d.label)}</h1>`;
+  const bits = [];
+  if (d.mine) bits.push(d.mine + ' shift' + (d.mine === 1 ? '' : 's') + ' yours');
+  if (d.open && d.deadline) bits.push('closes ' + esc(d.deadline));
+  else if (!d.open) bits.push('closed');
+  h += `<div class="sub">${bits.join(' · ')}</div>`;
+
+  if (d.other) {
+    h += '<div class="seg" style="margin-top:14px">'
+      + `<div data-w="now" class="${WHICH === 'now' ? 'on' : ''}">This week</div>`
+      + `<div data-w="next" class="${WHICH === 'next' ? 'on' : ''}">${esc(d.otherLabel)}</div>`
+      + '</div>';
+  }
+
+  for (const day of d.days) {
+    h += `<div class="day${day.today ? ' is-today' : ''}">`;
+    h += `<h3><span>${esc(day.name)} ${esc(day.date)}${day.today ? ' · today' : ''}</span></h3>`;
+    for (const s of day.slots) {
+      let cls = 'slot';
+      if (s.mine) cls += ' mine';
+      else if (!s.taken) cls += ' free';
+      else if (!s.full) cls += ' part';
+      if (s.past) cls += ' past';
+      let who;
+      if (s.mine) who = s.names.length > 1 ? 'you +' + (s.names.length - 1) : 'you';
+      else if (!s.taken) who = s.past ? 'nobody' : 'free';
+      else who = esc(s.names.join(', '));
+      const cap = s.cap > 1 ? ` <span class="cap">${s.taken}/${s.cap}</span>` : '';
+      h += `<div class="${cls}"><div>${esc(s.label)}${cap}</div>`;
+      h += `<div class="who">${who}</div></div>`;
+    }
+    h += '</div>';
+  }
+
+  if (d.gaps) {
+    h += `<div class="note">${d.gaps} slot(s) still open this week.</div>`;
+  }
+  h += '<div class="note">Claiming from here is coming — use /plan for now.</div>';
+
+  app.innerHTML = h + navBar();
+  wire();
+  document.querySelectorAll('.seg div[data-w]').forEach(el => {
+    el.onclick = () => { WHICH = el.dataset.w; render(); };
+  });
+}
+
 async function loadTeam() {
   const app = document.getElementById('app');
   const qs = '?mode=' + MODE + (START ? '&start=' + START : '');
@@ -2370,6 +2446,14 @@ async function render() {
     catch (e) {
       document.getElementById('app').innerHTML =
         '<div class="err">Could not load. Try again shortly.</div>';
+    }
+    return;
+  }
+  if (VIEW === 'week') {
+    try { await loadWeek(); }
+    catch (e) {
+      document.getElementById('app').innerHTML =
+        '<div class="err">Could not load the week.</div>';
     }
     return;
   }

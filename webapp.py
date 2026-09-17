@@ -1,4 +1,4 @@
-"""The Mini App: web server, home, hours and team views.
+"""The Mini App: web server, home, week, hours and team views.
 
 Part of the LC avails bot. Shared helpers live in core.py.
 """
@@ -329,6 +329,75 @@ def todays_slots(user_id: int) -> list:
             q("SELECT label FROM slots WHERE day_id=? ORDER BY idx", (d["id"],))]
 
 
+def week_payload(user_id: int, which: str = "now") -> dict:
+    """The board as data: every day, every slot, who's on it."""
+    here = this_week()
+    nxt = open_week()
+    w = nxt if (which == "next" and nxt) else here
+    if not w:
+        return {"empty": True, "label": "", "days": []}
+
+    # only offer the toggle when the two are actually different weeks
+    other = None
+    if nxt and here and nxt["id"] != here["id"]:
+        other = "next" if which != "next" else "now"
+
+    today = now().date()
+    days = []
+    for d in q("SELECT * FROM days WHERE week_id=? ORDER BY idx", (w["id"],)):
+        the_date = date.fromisoformat(d["the_date"])
+        slots = []
+        for sl in q("SELECT * FROM slots WHERE day_id=? ORDER BY idx", (d["id"],)):
+            holders = slot_holders(sl["id"])
+            cap = sl["capacity"] or SLOT_CAPACITY
+            mine = any(h["user_id"] == user_id for h in holders)
+            names = [h["name"] for h in holders]
+            slots.append({
+                "id": sl["id"],
+                "label": sl["label"],
+                "mine": mine,
+                "names": names,
+                "taken": len(holders),
+                "cap": cap,
+                "full": len(holders) >= cap,
+                "past": the_date < today,
+            })
+        days.append({
+            "name": d["name"],
+            "date": the_date.strftime("%-d %b"),
+            "today": the_date == today,
+            "past": the_date < today,
+            "slots": slots,
+        })
+
+    mine_count = sum(
+        1 for d in days for sl in d["slots"] if sl["mine"]
+    )
+    gaps = sum(1 for d in days for sl in d["slots"]
+               if not sl["full"] and not sl["past"])
+
+    deadline = ""
+    if w["deadline"]:
+        try:
+            deadline = datetime.fromisoformat(w["deadline"]).strftime("%a %H:%M")
+        except ValueError:
+            deadline = ""
+
+    return {
+        "empty": False,
+        "label": w["label"],
+        "open": w["status"] == "open",
+        "deadline": deadline,
+        "which": which,
+        "other": other,
+        "otherLabel": (nxt["label"] if other == "next" else
+                       (here["label"] if other == "now" else "")),
+        "days": days,
+        "mine": mine_count,
+        "gaps": gaps,
+    }
+
+
 def web_has_access(user_id: int) -> bool:
     if user_id in ADMIN_IDS:
         return True
@@ -372,6 +441,26 @@ class MiniAppHandler(BaseHTTPRequestHandler):
             return
         if path == "/health":
             self._send(200, b'{"ok":true}')
+            return
+        if path == "/api/week":
+            try:
+                qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                user = verify_init_data(self.headers.get("X-Init-Data", ""))
+                if not user or "id" not in user:
+                    self._send(401, b'{"error":"unverified"}')
+                    return
+                uid = int(user["id"])
+                if not web_has_access(uid):
+                    self._send(403, b'{"error":"no access"}')
+                    return
+                which = (qs.get("which") or ["now"])[0]
+                self._send(200, json.dumps(week_payload(uid, which)).encode())
+            except Exception as e:
+                log.warning("Week view failed: %s", e)
+                try:
+                    self._send(500, b'{"error":"server"}')
+                except Exception:
+                    pass
             return
         if path == "/api/home":
             try:
