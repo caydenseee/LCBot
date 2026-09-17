@@ -155,6 +155,7 @@ def case_picker(keep: set) -> InlineKeyboardMarkup:
         rows.append([InlineKeyboardButton(label[:60], callback_data=f"hk:{c['id']}")])
     rows.append([InlineKeyboardButton("➕ Add a new case", callback_data="hk:new")])
     rows.append([InlineKeyboardButton("📤 Post handover", callback_data="hk:post")])
+    rows.append([InlineKeyboardButton("✖️ Cancel", callback_data="hk:cancel")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -162,22 +163,22 @@ async def on_handover_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     """Tick which of the running cases are still live."""
     query = update.callback_query
     choice = query.data.split(":", 1)[1]
+    if choice == "cancel":
+        await query.answer()
+        for k in ("ho_cases", "ho_draft", "ho_keep"):
+            context.user_data.pop(k, None)
+        await query.edit_message_text(
+            "Handover cancelled — nothing was posted.\n\n"
+            "/handover to start again."
+        )
+        return ConversationHandler.END
     keep = context.user_data.setdefault(
         "ho_keep", {c["id"] for c in open_cases()}
     )
 
     if choice == "new":
         await query.answer()
-        await query.edit_message_text(
-            "<b>New case</b>\n\nIs this open now, or for the next working day?",
-            parse_mode=constants.ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔸 Open now", callback_data="hs:open")],
-                [InlineKeyboardButton("🔹 Follow up next working day",
-                                      callback_data="hs:follow")],
-            ]),
-        )
-        return HO_SECTION
+        return await show_section(query, context, 0)
 
     if choice == "post":
         await query.answer()
@@ -266,76 +267,69 @@ async def on_handover_add(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return HO_PICK
 
     context.user_data["ho_keep"] = set()
+    return await show_section(query, context, 1)
+
+
+async def show_section(query, context, n: int = 0) -> int:
+    """Step 1 — open now, or follow up."""
+    running = open_cases()
+    rows = [
+        [InlineKeyboardButton("🔸 Open now", callback_data="hs:open")],
+        [InlineKeyboardButton("🔹 Follow up next working day",
+                              callback_data="hs:follow")],
+    ]
+    if running:
+        rows.append([InlineKeyboardButton("◀️ Back to the case list",
+                                          callback_data="hs:back")])
+    rows.append([InlineKeyboardButton("✖️ Cancel", callback_data="hs:cancel")])
+    title = f"<b>Case {n}</b>" if n else "<b>New case</b>"
     await query.edit_message_text(
-        "<b>Case 1</b>\n\nIs this open now, or for the next working day?",
+        f"{title}\n\nIs this open now, or for the next working day?",
         parse_mode=constants.ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔸 Open now", callback_data="hs:open")],
-            [InlineKeyboardButton("🔹 Follow up next working day",
-                                  callback_data="hs:follow")],
-        ]),
+        reply_markup=InlineKeyboardMarkup(rows),
     )
     return HO_SECTION
 
 
-async def on_ho_section(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    context.user_data["ho_draft"] = {"section": query.data.split(":")[1]}
+async def show_prio(query, context) -> int:
+    """Step 2 — how urgent."""
     await query.edit_message_text(
         "<b>How urgent?</b>",
         parse_mode=constants.ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton(f"{e} {n}", callback_data=f"hp:{e}")
-            for e, n in PRIORITIES
-        ]]),
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"{e} {n}", callback_data=f"hp:{e}")
+             for e, n in PRIORITIES],
+            [InlineKeyboardButton("◀️ Back", callback_data="hp:back"),
+             InlineKeyboardButton("✖️ Cancel", callback_data="hp:cancel")],
+        ]),
     )
     return HO_PRIO
 
 
-async def on_ho_prio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    context.user_data["ho_draft"]["prio"] = query.data.split(":")[1]
+async def show_platform(query, context) -> int:
+    """Step 3 — where it came in."""
+    d = context.user_data.get("ho_draft", {})
     await query.edit_message_text(
-        "<b>Where did it come in?</b>",
+        f"{d.get('prio', '')}  <b>Where did it come in?</b>",
         parse_mode=constants.ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"▫️{p}", callback_data=f"hf:{p}")]
-            for p in PLATFORMS
-        ]),
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton(f"▫️{p}", callback_data=f"hf:{p}")]
+             for p in PLATFORMS]
+            + [[InlineKeyboardButton("◀️ Back", callback_data="hf:back"),
+                InlineKeyboardButton("✖️ Cancel", callback_data="hf:cancel")]]
+        ),
     )
     return HO_PLATFORM
 
 
-async def on_ho_platform(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Duoke needs a store; Livechat doesn't, so skip that step for it."""
-    query = update.callback_query
-    await query.answer()
-    d = context.user_data["ho_draft"]
-    d["platform"] = query.data.split(":")[1]
-
-    if d["platform"] != "DUOKE":
-        d["flag"], d["store"] = "", ""
-        await query.edit_message_text(
-            f"{d['prio']} ▫️{d['platform']}\n\n"
-            "<b>Now send the case.</b>\n"
-            "First line = the customer's username. Then the rest as you'd "
-            "write it:\n\n"
-            "<code>jasmine_wq\n"
-            "260908QQ1183KD\n"
-            "Sonos Era 100\n\n"
-            "• what happened\n"
-            "• what you did\n\n"
-            "‼️Need Help: what's needed next</code>",
-            parse_mode=constants.ParseMode.HTML,
-        )
-        return HO_BODY
-
+async def show_store(query, context) -> int:
+    """Step 4 — Duoke stores only."""
     rows = [
         [InlineKeyboardButton(f"{flag}{store}", callback_data=f"hb:{i}")]
         for i, (flag, store) in enumerate(STORES)
     ]
+    rows.append([InlineKeyboardButton("◀️ Back", callback_data="hb:back"),
+                 InlineKeyboardButton("✖️ Cancel", callback_data="hb:cancel")])
     await query.edit_message_text(
         "<b>Which store?</b>",
         parse_mode=constants.ParseMode.HTML,
@@ -344,23 +338,112 @@ async def on_ho_platform(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     return HO_STORE
 
 
-async def on_ho_store(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    query = update.callback_query
-    await query.answer()
-    flag, store = STORES[int(query.data.split(":")[1])]
+async def ask_for_case(query, context) -> int:
+    """The last step — they type the case itself."""
     d = context.user_data["ho_draft"]
-    d["flag"], d["store"] = flag, store
+    head = f"{d['prio']} ▫️{d['platform']}"
+    if d.get("store"):
+        head += f" · {d['flag']}{d['store']}"
     await query.edit_message_text(
-        f"{d['prio']} {flag}{store} · ▫️{d['platform']}\n\n"
+        f"{head}\n\n"
         "<b>Now send the case.</b>\n"
-        "First line = the customer's username. Then the rest as you'd write it:\n\n"
-        "<code>kiemmengkoo\n"
+        "First line = the customer's username. Then the rest as you'd write it:"
+        "\n\n<code>kiemmengkoo\n"
         "2609046GFY4T9B\n"
         "Sonos Move Gen 2\n\n"
         "• what happened\n"
         "• what you did\n\n"
-        "‼️Need Help: what's needed next</code>",
+        "‼️Need Help: what's needed next</code>\n\n"
+        "<i>/back to change the last answer · /cancel to stop</i>",
         parse_mode=constants.ParseMode.HTML,
+    )
+    return HO_BODY
+
+
+async def cancel_handover(query, context) -> int:
+    for k in ("ho_cases", "ho_draft", "ho_keep"):
+        context.user_data.pop(k, None)
+    await query.edit_message_text(
+        "Handover cancelled — nothing was posted.\n\n/handover to start again."
+    )
+    return ConversationHandler.END
+
+
+async def on_ho_section(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    choice = query.data.split(":", 1)[1]
+    if choice == "cancel":
+        return await cancel_handover(query, context)
+    if choice == "back":
+        keep = context.user_data.setdefault(
+            "ho_keep", {c["id"] for c in open_cases()})
+        await query.edit_message_text(
+            PICKER_HELP, parse_mode=constants.ParseMode.HTML,
+            reply_markup=case_picker(keep),
+        )
+        return HO_PICK
+    context.user_data["ho_draft"] = {"section": choice}
+    return await show_prio(query, context)
+
+
+async def on_ho_prio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    choice = query.data.split(":", 1)[1]
+    if choice == "cancel":
+        return await cancel_handover(query, context)
+    if choice == "back":
+        n = len(context.user_data.get("ho_cases", [])) + 1
+        return await show_section(query, context, n)
+    context.user_data["ho_draft"]["prio"] = choice
+    return await show_platform(query, context)
+
+
+async def on_ho_platform(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Duoke needs a store; Livechat doesn't, so skip that step for it."""
+    query = update.callback_query
+    await query.answer()
+    choice = query.data.split(":", 1)[1]
+    if choice == "cancel":
+        return await cancel_handover(query, context)
+    if choice == "back":
+        return await show_prio(query, context)
+
+    d = context.user_data["ho_draft"]
+    d["platform"] = choice
+    if choice != "DUOKE":
+        d["flag"], d["store"] = "", ""
+        return await ask_for_case(query, context)
+    return await show_store(query, context)
+
+
+async def on_ho_store(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    await query.answer()
+    choice = query.data.split(":", 1)[1]
+    if choice == "cancel":
+        return await cancel_handover(query, context)
+    if choice == "back":
+        return await show_platform(query, context)
+
+    flag, store = STORES[int(choice)]
+    d = context.user_data["ho_draft"]
+    d["flag"], d["store"] = flag, store
+    return await ask_for_case(query, context)
+
+
+async def on_ho_back_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """/back while typing the case — return to the step before it."""
+    d = context.user_data.get("ho_draft", {})
+    rows = [[InlineKeyboardButton("◀️ Yes, change it", callback_data="hf:back")],
+            [InlineKeyboardButton("✖️ Cancel the handover",
+                                  callback_data="hf:cancel")]]
+    if d.get("platform") == "DUOKE":
+        rows[0] = [InlineKeyboardButton("◀️ Pick a different store",
+                                        callback_data="hb:back")]
+    await update.message.reply_text(
+        "Go back a step?", reply_markup=InlineKeyboardMarkup(rows)
     )
     return HO_BODY
 
@@ -386,6 +469,7 @@ async def on_ho_body(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Add another case", callback_data="hm:more")],
             [InlineKeyboardButton("📤 Post handover", callback_data="hm:post")],
+            [InlineKeyboardButton("✖️ Cancel", callback_data="hm:cancel")],
         ]),
     )
     return HO_MORE
@@ -394,19 +478,19 @@ async def on_ho_body(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 async def on_ho_more(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     choice = query.data.split(":")[1]
+    if choice == "cancel":
+        await query.answer()
+        for k in ("ho_cases", "ho_draft", "ho_keep"):
+            context.user_data.pop(k, None)
+        await query.edit_message_text(
+            "Handover cancelled — nothing was posted.\n\n"
+            "/handover to start again."
+        )
+        return ConversationHandler.END
     if choice == "more":
         await query.answer()
         n = len(context.user_data.get("ho_cases", [])) + 1
-        await query.edit_message_text(
-            f"<b>Case {n}</b>\n\nIs this open now, or for the next working day?",
-            parse_mode=constants.ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔸 Open now", callback_data="hs:open")],
-                [InlineKeyboardButton("🔹 Follow up next working day",
-                                      callback_data="hs:follow")],
-            ]),
-        )
-        return HO_SECTION
+        return await show_section(query, context, n)
     await query.answer()
     return await finish_handover(update, context)
 

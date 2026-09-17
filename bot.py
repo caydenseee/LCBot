@@ -724,6 +724,8 @@ def main() -> None:
                 ],
             },
             fallbacks=[CommandHandler("cancel", cancel)],
+            allow_reentry=True,
+            conversation_timeout=1800,
         )
     )
     app.add_handler(
@@ -736,6 +738,8 @@ def main() -> None:
                 ],
             },
             fallbacks=[CommandHandler("cancel", cancel)],
+            allow_reentry=True,
+            conversation_timeout=1800,
         )
     )
     app.add_handler(
@@ -749,6 +753,8 @@ def main() -> None:
                 ],
             },
             fallbacks=[CommandHandler("cancel", cancel)],
+            allow_reentry=True,
+            conversation_timeout=1800,
         )
     )
     app.add_handler(CommandHandler("dropreqs", cmd_dropreqs))
@@ -780,6 +786,8 @@ def main() -> None:
                 ],
             },
             fallbacks=[CommandHandler("cancel", cancel)],
+            allow_reentry=True,
+            conversation_timeout=1800,
         )
     )
     app.add_handler(CommandHandler("reset", cmd_reset))
@@ -820,12 +828,20 @@ def main() -> None:
                 HO_PLATFORM: [CallbackQueryHandler(on_ho_platform, pattern=r"^hf:")],
                 HO_STORE: [CallbackQueryHandler(on_ho_store, pattern=r"^hb:")],
                 HO_BODY: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, on_ho_body)
+                    CommandHandler("back", on_ho_back_cmd),
+                    CallbackQueryHandler(on_ho_platform, pattern=r"^hf:"),
+                    CallbackQueryHandler(on_ho_store, pattern=r"^hb:"),
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, on_ho_body),
                 ],
                 HO_MORE: [CallbackQueryHandler(on_ho_more, pattern=r"^hm:")],
                 HO_PICK: [CallbackQueryHandler(on_handover_pick, pattern=r"^hk:")],
             },
-            fallbacks=[CommandHandler("cancel", cancel)],
+            fallbacks=[
+                CommandHandler("cancel", cancel),
+                CommandHandler("handover", cmd_handover),
+            ],
+            allow_reentry=True,
+            conversation_timeout=1800,
         )
     )
     app.add_handler(CommandHandler("handover", cmd_handover))
@@ -842,6 +858,8 @@ def main() -> None:
                 ]
             },
             fallbacks=[CommandHandler("cancel", cancel)],
+            allow_reentry=True,
+            conversation_timeout=1800,
         )
     )
     app.add_handler(CommandHandler("reviews", cmd_reviews))
