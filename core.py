@@ -2180,6 +2180,10 @@ MINIAPP_HTML = """<!DOCTYPE html>
   .nav .m { font-weight:650; }
   .p { padding:12px 0; border-bottom:1px solid var(--tg-theme-secondary-bg-color,#eee); }
   .p:last-child { border-bottom:0; }
+  .p.tappable { cursor:pointer; -webkit-tap-highlight-color:transparent; }
+  .p.tappable:active { opacity:.6; }
+  .p.tappable { cursor:pointer; -webkit-tap-highlight-color:transparent; }
+  .p.tappable:active { opacity:.6; }
   .ptop { display:flex; justify-content:space-between; align-items:baseline; }
   .pn { font-weight:600; }
   .pp { font-variant-numeric:tabular-nums; font-weight:600; }
@@ -2367,14 +2371,40 @@ async function loadHome() {
 
   if (d.openCases) {
     h += '<h2>Open cases</h2>';
-    for (const c of d.caseNames) h += `<div class="p"><div class="pn">${esc(c)}</div></div>`;
-    h += `<div class="note">${d.openCases} case(s) still open — they'll carry into your handover.</div>`;
+    for (const c of d.cases) {
+      const bits = [];
+      if (c.platform) bits.push('▫️' + esc(c.platform));
+      if (c.store) bits.push(esc(c.flag) + esc(c.store));
+      if (c.from) bits.push('from ' + esc(c.from));
+      if (c.age) bits.push(c.age + 'd' + (c.age >= 3 ? ' ⏳' : ''));
+      h += `<div class="p tappable" data-case="${c.id}">`;
+      h += '<div class="ptop">';
+      h += `<div class="pn">${esc(c.prio)} ${esc(c.username)}</div>`;
+      h += '<div class="t">›</div></div>';
+      h += `<div class="t">${bits.join(' · ')}</div></div>`;
+    }
+    h += `<div class="note">Tap a case to read it. ${d.openCases} will carry `
+       + 'into your handover.</div>';
   }
 
   app.innerHTML = h + navBar();
   wire();
   const btn = document.getElementById('act');
   if (btn) btn.onclick = () => d.onShift ? doClockOut(btn) : doClockIn(btn, d.slotsToday);
+  document.querySelectorAll('[data-case]').forEach(el => {
+    el.onclick = () => {
+      HO_SHOWN[el.dataset.case] = true;   // open it already expanded
+      VIEW = 'ho';
+      render();
+    };
+  });
+  document.querySelectorAll('[data-case]').forEach(el => {
+    el.onclick = () => {
+      HO_SHOWN[el.dataset.case] = true;
+      VIEW = 'ho';
+      render();
+    };
+  });
 }
 
 async function doClockIn(btn, slots) {

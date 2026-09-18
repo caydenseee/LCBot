@@ -251,7 +251,19 @@ def home_payload(user_id: int) -> dict:
         "weekHours": hhmm(t["minutes"]),
         "weekShifts": len(t["shifts"]),
         "openCases": len(cases),
-        "caseNames": [f"{c['prio']} {c['username']}" for c in cases[:4]],
+        "cases": [
+            {
+                "id": c["id"],
+                "prio": c["prio"] or "",
+                "username": c["username"] or "",
+                "platform": c["platform"] or "",
+                "store": c["store"] or "",
+                "flag": c["flag"] or "",
+                "from": display_name_of(c["agent_id"], ""),
+                "age": (today - date.fromisoformat(c["the_date"])).days,
+            }
+            for c in cases[:5]
+        ],
         "support": support_for(user_id, name),
     }
 
