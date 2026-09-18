@@ -2004,13 +2004,11 @@ async def job_shift_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
 AGENT_COMMANDS = [
     ("clockin", "Start my shift — or /clockin 2pm-4pm"),
     ("clockout", "End my shift"),
-    ("mytime", "My hours this month"),
     ("payslip", "My hours and pay"),
     ("dropshift", "Ask to drop a shift"),
     ("pickup", "Ask to take an open shift"),
     ("swap", "Hand a shift to someone"),
     ("support", "Who I list as support"),
-    ("handover", "Post a closing handover"),
     ("help", "List commands"),
 ]
 GROUP_COMMANDS = [

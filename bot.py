@@ -516,24 +516,23 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ]
     if PUBLIC_URL:
         lines += [
-            "<b>The app</b> — tap <b>My hours</b> by the 📎 paperclip",
-            "  Your shift, hours, pay and reviews in one place",
-            "",
+        "<b>The app</b> — tap <b>My hours</b> by the 📎",
+        "  🏠 Home — your shift and any open cases",
+        "  📅 Week — take a slot, or let one go",
+        "  🕐 Hours — what you've worked and earned",
+        "  📝 Handover — close cases and post it",
+        "",
         ]
 
     lines += [
-        "<b>The app</b> — everything about your week",
-        "  📅 Week — take a slot, or let one go",
-        "  🕐 Hours — what you've worked and earned",
-        "",
         "<b>When something changes</b>",
         "  /dropshift — ask to come off a shift",
         "  /pickup — ask for one that's open",
         "  /swap — hand one to a colleague",
         "",
         "<b>Anything else</b>",
-        "  /handover — post a closing handover",
         "  /support — who you list as Support",
+        "  /payslip — open the app",
     ]
 
     if role in ("admin", "owner"):
