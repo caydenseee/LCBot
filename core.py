@@ -357,6 +357,15 @@ CREATE TABLE IF NOT EXISTS confirmations (
 
 db = sqlite3.connect(DB_PATH, check_same_thread=False)
 db.row_factory = sqlite3.Row
+# The web server runs on its own thread and shares this connection. Without
+# these two settings a read from the web thread can sit waiting behind a write
+# on the bot's thread, which shows up as the Mini App spinning forever.
+try:
+    db.execute("PRAGMA journal_mode=WAL")      # readers don't block on writers
+    db.execute("PRAGMA busy_timeout=8000")     # wait 8s, then fail loudly
+    db.commit()
+except Exception as _e:                        # a volume that can't do WAL
+    log.warning("Couldn't set WAL mode: %s", _e)
 db.executescript(SCHEMA)
 # Days used to be stored as THURS. Bring old rows in line with the new THU.
 for _tbl, _col in (("days", "name"), ("fixed_slots", "day_name")):

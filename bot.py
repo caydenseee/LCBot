@@ -250,9 +250,13 @@ async def on_restore_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # keeps working against the same handle
     try:
         async with write_lock:
+            db.rollback()                      # nothing half-finished
             src = sqlite3.connect(tmp)
             src.backup(db)
             src.close()
+            db.commit()
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("PRAGMA busy_timeout=8000")
             db.commit()
     except Exception as e:
         log.warning("Restore failed: %s", e)
@@ -273,7 +277,8 @@ async def on_restore_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"{after['counts'].get('weeks', 0)} weeks · "
         f"{after['counts'].get('time_entries', 0)} time entries\n"
         f"Newest shift: {after.get('newest') or '—'}\n\n"
-        "<i>Check /roster and /timesheet, then redeploy if anything looks odd.</i>",
+        "<i>Check /roster and /timesheet. Then redeploy on Railway — it "
+        "reopens the database cleanly, and the Mini App needs that.</i>",
         parse_mode=constants.ParseMode.HTML,
     )
     log.info("Database restored by %s", query.from_user.id)
