@@ -2222,6 +2222,40 @@ MINIAPP_HTML = """<!DOCTYPE html>
   .slot.tappable { cursor:pointer; -webkit-tap-highlight-color:transparent; }
   .slot.tappable:active { transform:scale(.985); }
   .slot.busy { opacity:.5; }
+  .case { border-radius:12px; padding:12px 14px; margin-bottom:8px;
+     background: var(--tg-theme-secondary-bg-color,#f4f4f5); }
+  .case.gone { opacity:.55; }
+  .case .top { display:flex; align-items:flex-start; gap:10px; }
+  .case .tick { width:22px; height:22px; border-radius:6px; flex:0 0 auto;
+     border:2px solid var(--tg-theme-hint-color,#bbb); margin-top:1px;
+     display:flex; align-items:center; justify-content:center; font-size:13px;
+     cursor:pointer; }
+  .case .tick.on { background: var(--tg-theme-link-color,#2a7); border-color:transparent;
+     color:#fff; }
+  .case .nm { font-weight:600; font-size:14px; }
+  .case .meta { font-size:11px; color: var(--tg-theme-hint-color,#888);
+     margin-top:2px; }
+  .case .body { font-size:12px; white-space:pre-wrap; margin-top:8px;
+     padding-top:8px; border-top:1px solid rgba(0,0,0,.07);
+     color: var(--tg-theme-text-color,#111); }
+  .case .more { font-size:11px; color: var(--tg-theme-link-color,#2a7);
+     margin-top:6px; cursor:pointer; }
+  .stale { color:#b26a00; }
+  .fld { margin-bottom:14px; }
+  .fld label { display:block; font-size:11px; font-weight:700; letter-spacing:.05em;
+     text-transform:uppercase; color: var(--tg-theme-hint-color,#888);
+     margin-bottom:6px; }
+  .fld input, .fld textarea, .fld select { width:100%; box-sizing:border-box;
+     border:1px solid var(--tg-theme-secondary-bg-color,#e5e5e7); border-radius:10px;
+     padding:11px 12px; font-size:15px; font-family:inherit;
+     background: var(--tg-theme-bg-color,#fff); color: var(--tg-theme-text-color,#111); }
+  .fld textarea { min-height:150px; resize:vertical; }
+  .pick { display:flex; gap:6px; flex-wrap:wrap; }
+  .pick button { border:1px solid var(--tg-theme-secondary-bg-color,#e5e5e7);
+     background: var(--tg-theme-bg-color,#fff); border-radius:10px; padding:9px 13px;
+     font-size:14px; cursor:pointer; color: var(--tg-theme-text-color,#111); }
+  .pick button.on { background: var(--tg-theme-link-color,#2a7); color:#fff;
+     border-color:transparent; font-weight:600; }
   .toast { position:fixed; left:16px; right:16px; bottom:96px; z-index:20;
      background:#333; color:#fff; padding:12px 16px; border-radius:11px;
      font-size:13px; text-align:center; }
@@ -2265,7 +2299,8 @@ let VIEW = 'home', MODE = 'week', START = '', WHICH = 'now', IS_ADMIN = false;
 const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 
 function navBar() {
-  const items = [['home','🏠','Home'], ['week','📅','Week'], ['me','🕐','Hours']];
+  const items = [['home','🏠','Home'], ['week','📅','Week'],
+                 ['me','🕐','Hours'], ['ho','📝','Handover']];
   if (IS_ADMIN) items.push(['team','👥','Team']);
   return '<div class="nav-bar">'
     + items.map(([v, i, t]) =>
@@ -2390,6 +2425,183 @@ function wire() {
   document.querySelectorAll('.seg div').forEach(el => {
     el.onclick = () => { MODE = el.dataset.p; START = ''; render(); };
   });
+}
+
+let HO = null, HO_FORM = null, HO_SHOWN = {};
+
+function caseCard(c, closed) {
+  let h = `<div class="case${closed ? ' gone' : ''}">`;
+  h += '<div class="top">';
+  h += `<div class="tick${closed ? '' : ' on'}" data-id="${c.id}" `
+     + `data-close="${closed ? '0' : '1'}">${closed ? '' : '✓'}</div>`;
+  h += '<div style="flex:1">';
+  h += `<div class="nm">${esc(c.prio)} ${esc(c.username)}</div>`;
+  const bits = [];
+  if (c.platform) bits.push('▫️' + esc(c.platform));
+  if (c.store) bits.push(esc(c.flag) + esc(c.store));
+  if (c.from) bits.push('from ' + esc(c.from));
+  if (closed && c.closedBy) bits.push('closed by ' + esc(c.closedBy));
+  if (closed && c.closedWhen) bits.push(esc(c.closedWhen));
+  else if (c.age) bits.push(`<span class="${c.stale ? 'stale' : ''}">${c.age}d${c.stale ? ' ⏳' : ''}</span>`);
+  if (c.section === 'follow') bits.push('follow up');
+  h += `<div class="meta">${bits.join(' · ')}</div>`;
+  h += '</div></div>';
+  if (HO_SHOWN[c.id]) {
+    h += `<div class="body">${esc(c.body)}</div>`;
+    h += `<div class="more" data-hide="${c.id}">Hide</div>`;
+  } else {
+    h += `<div class="more" data-show="${c.id}">Show the case</div>`;
+  }
+  h += '</div>';
+  return h;
+}
+
+function caseForm(d) {
+  const f = HO_FORM;
+  let h = '<h2>New case</h2>';
+  h += '<div class="fld"><label>When</label><div class="pick">'
+    + `<button data-f="section" data-v="open" class="${f.section === 'open' ? 'on' : ''}">🔸 Open now</button>`
+    + `<button data-f="section" data-v="follow" class="${f.section === 'follow' ? 'on' : ''}">🔹 ${esc(d.nextWorking)}</button>`
+    + '</div></div>';
+  h += '<div class="fld"><label>How urgent</label><div class="pick">'
+    + d.priorities.map(p =>
+        `<button data-f="prio" data-v="${p.emoji}" class="${f.prio === p.emoji ? 'on' : ''}">${p.emoji} ${esc(p.name)}</button>`
+      ).join('') + '</div></div>';
+  h += '<div class="fld"><label>Where from</label><div class="pick">'
+    + d.platforms.map(p =>
+        `<button data-f="platform" data-v="${p}" class="${f.platform === p ? 'on' : ''}">▫️${esc(p)}</button>`
+      ).join('') + '</div></div>';
+  if (f.platform === 'DUOKE') {
+    h += '<div class="fld"><label>Store</label><select id="store">'
+      + '<option value="">Pick one…</option>'
+      + d.stores.map(s =>
+          `<option value="${esc(s.store)}"${f.store === s.store ? ' selected' : ''}>${esc(s.flag)}${esc(s.store)}</option>`
+        ).join('') + '</select></div>';
+  }
+  h += `<div class="fld"><label>Customer username</label>`
+    + `<input id="username" value="${esc(f.username || '')}" placeholder="kiemmengkoo"></div>`;
+  h += '<div class="fld"><label>The case</label>'
+    + `<textarea id="body" placeholder="2609046GFY4T9B\nSonos Move Gen 2\n\n• what happened\n• what you did\n\n‼️Need Help: what's needed next">${esc(f.body || '')}</textarea></div>`;
+  h += '<button class="big" id="saveCase">Save this case</button>';
+  h += '<button class="big" id="cancelCase" style="background:var(--tg-theme-secondary-bg-color,#eee);color:var(--tg-theme-text-color,#111);margin-top:8px">Cancel</button>';
+  return h;
+}
+
+async function loadHandover() {
+  const app = document.getElementById('app');
+  const d = await getJSON('/api/handover');
+  HO = d;
+
+  let h = '<h1>Handover</h1>';
+  const n = d.openCases.length;
+  h += `<div class="sub">${n ? n + ' case' + (n === 1 ? '' : 's') + ' open' : 'Nothing open'}</div>`;
+
+  if (HO_FORM) {
+    app.innerHTML = caseForm(d) + navBar();
+    wireHandover();
+    return;
+  }
+
+  if (n) {
+    h += '<h2>Still open</h2>';
+    h += '<div class="note" style="margin-top:0">Untick a case to close it.</div>';
+    for (const c of d.openCases) h += caseCard(c, false);
+  }
+
+  h += '<button class="big" id="newCase" style="margin-top:14px">+  Add a case</button>';
+  if (n) {
+    h += '<button class="big" id="postHo" style="margin-top:8px">📤  Post handover</button>';
+  } else {
+    h += '<button class="big" id="postHo" style="margin-top:8px">📤  Post "nothing open"</button>';
+  }
+
+  if (d.closedCases.length) {
+    h += '<h2>Closed recently</h2>';
+    h += '<div class="note" style="margin-top:0">Tick one to reopen it.</div>';
+    for (const c of d.closedCases) h += caseCard(c, true);
+  }
+
+  app.innerHTML = h + navBar();
+  wireHandover();
+}
+
+function wireHandover() {
+  wire();
+  document.querySelectorAll('.tick').forEach(el => {
+    el.onclick = async () => {
+      const out = await post('/api/case/toggle',
+        { id: Number(el.dataset.id), close: el.dataset.close === '1' });
+      if (!out.ok) { toast(out.error || 'Could not change that.'); return; }
+      toast(out.closed ? 'Closed ' + out.username : 'Reopened ' + out.username);
+      await loadHandover();
+    };
+  });
+  document.querySelectorAll('[data-show]').forEach(el => {
+    el.onclick = () => { HO_SHOWN[el.dataset.show] = true; loadHandover(); };
+  });
+  document.querySelectorAll('[data-hide]').forEach(el => {
+    el.onclick = () => { delete HO_SHOWN[el.dataset.hide]; loadHandover(); };
+  });
+
+  const nc = document.getElementById('newCase');
+  if (nc) nc.onclick = () => {
+    HO_FORM = { section: 'open', prio: '', platform: '', store: '', username: '', body: '' };
+    loadHandover();
+  };
+  const cc = document.getElementById('cancelCase');
+  if (cc) cc.onclick = () => { HO_FORM = null; loadHandover(); };
+
+  document.querySelectorAll('[data-f]').forEach(el => {
+    el.onclick = () => {
+      keepForm();
+      HO_FORM[el.dataset.f] = el.dataset.v;
+      if (el.dataset.f === 'platform' && el.dataset.v !== 'DUOKE') HO_FORM.store = '';
+      loadHandover();
+    };
+  });
+
+  const save = document.getElementById('saveCase');
+  if (save) save.onclick = async () => {
+    keepForm();
+    save.disabled = true; save.textContent = 'Saving…';
+    const out = await post('/api/case', HO_FORM);
+    save.disabled = false; save.textContent = 'Save this case';
+    if (!out.ok) { toast(out.error || 'Could not save that.'); return; }
+    toast('Added ' + out.username);
+    HO_FORM = null;
+    await loadHandover();
+  };
+
+  const pb = document.getElementById('postHo');
+  if (pb) pb.onclick = async () => {
+    pb.disabled = true; pb.textContent = 'Posting…';
+    const out = await post('/api/handover/post', {});
+    if (!out.ok) { toast('Could not post that.'); pb.disabled = false; return; }
+    const app = document.getElementById('app');
+    let h = '<h1>Posted</h1>';
+    h += `<div class="sub">${out.open} open · ${out.closed} closed by you today</div>`;
+    if (!out.posted) {
+      h += '<div class="note">I could not reach TC Online, so here it is to copy:</div>';
+      h += `<div class="case"><div class="body">${esc(out.text)}</div></div>`;
+    } else {
+      h += '<div class="note">It is in TC Online now.</div>';
+    }
+    h += '<button class="big" id="backHo" style="margin-top:14px">Back to handover</button>';
+    app.innerHTML = h + navBar();
+    wire();
+    const b = document.getElementById('backHo');
+    if (b) b.onclick = () => loadHandover();
+  };
+}
+
+function keepForm() {
+  if (!HO_FORM) return;
+  const u = document.getElementById('username');
+  const b = document.getElementById('body');
+  const st = document.getElementById('store');
+  if (u) HO_FORM.username = u.value;
+  if (b) HO_FORM.body = b.value;
+  if (st) HO_FORM.store = st.value;
 }
 
 async function loadWeek() {
@@ -2551,6 +2763,11 @@ async function render() {
   if (VIEW === 'week') {
     try { await loadWeek(); }
     catch (e) { showFatal('The week would not load', e.message || e); }
+    return;
+  }
+  if (VIEW === 'ho') {
+    try { await loadHandover(); }
+    catch (e) { showFatal('The handover would not load', e.message || e); }
     return;
   }
   if (VIEW === 'team') {

@@ -1,4 +1,4 @@
-"""The closing handover flow.
+"""The closing handover flow in chat.
 
 Part of the LC avails bot. Shared helpers live in core.py.
 """

@@ -1,4 +1,4 @@
-"""The Mini App: web server, home, week, hours and team views.
+"""The Mini App: home, week, hours, handover and team.
 
 Part of the LC avails bot. Shared helpers live in core.py.
 """
@@ -455,6 +455,122 @@ def web_claim(user_id: int, slot_id: int, want: bool) -> dict:
     }
 
 
+def handover_payload(user_id: int) -> dict:
+    """Open cases, recently closed ones, and the pickers for a new case."""
+    today = now().date()
+    open_rows = q("SELECT * FROM ho_cases WHERE closed=0 ORDER BY id")
+    closed_rows = q(
+        "SELECT * FROM ho_cases WHERE closed=1 ORDER BY closed_at DESC LIMIT 12"
+    )
+
+    def shape(r, closed=False):
+        age = (today - date.fromisoformat(r["the_date"])).days
+        out = {
+            "id": r["id"],
+            "prio": r["prio"] or "",
+            "username": r["username"] or "",
+            "platform": r["platform"] or "",
+            "store": r["store"] or "",
+            "flag": r["flag"] or "",
+            "section": r["section"] or "open",
+            "body": r["body"] or "",
+            "from": display_name_of(r["agent_id"], ""),
+            "age": age,
+            "stale": age >= 3,
+        }
+        if closed:
+            out["closedBy"] = display_name_of(r["closed_by"], "") if r["closed_by"] else ""
+            when = r["closed_at"]
+            out["closedWhen"] = (
+                datetime.fromisoformat(when).strftime("%-d %b %H:%M") if when else ""
+            )
+        return out
+
+    return {
+        "openCases": [shape(r) for r in open_rows],
+        "closedCases": [shape(r, True) for r in closed_rows],
+        "stores": [{"flag": f, "store": st} for f, st in STORES],
+        "platforms": PLATFORMS,
+        "priorities": [{"emoji": e, "name": n} for e, n in PRIORITIES],
+        "nextWorking": next_working_day(today).strftime("%A %-d %b"),
+        "support": support_for(user_id, display_name_of(user_id, "")),
+    }
+
+
+def web_case_toggle(user_id: int, case_id: int, close: bool) -> dict:
+    row = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    if not row:
+        return {"ok": False, "error": "That case is gone."}
+    if close:
+        run("UPDATE ho_cases SET closed=1, closed_by=?, closed_at=? WHERE id=?",
+            (user_id, now().isoformat(), case_id))
+    else:
+        run("UPDATE ho_cases SET closed=0, closed_by=NULL, closed_at=NULL "
+            "WHERE id=?", (case_id,))
+    return {"ok": True, "closed": close, "username": row["username"]}
+
+
+def web_case_add(user_id: int, c: dict) -> dict:
+    username = str(c.get("username", "")).strip()
+    body = str(c.get("body", "")).strip()
+    if not username:
+        return {"ok": False, "error": "Who's the customer?"}
+    if len(body) < 5:
+        return {"ok": False, "error": "Add a bit more detail to the case."}
+
+    platform = str(c.get("platform", "")).strip().upper()
+    if platform not in PLATFORMS:
+        return {"ok": False, "error": "Pick Duoke or Livechat."}
+    prio = str(c.get("prio", "")).strip()
+    if prio not in [e for e, _ in PRIORITIES]:
+        return {"ok": False, "error": "Pick how urgent it is."}
+    section = "follow" if c.get("section") == "follow" else "open"
+
+    flag = store = ""
+    if platform == "DUOKE":
+        want = str(c.get("store", "")).strip()
+        match = [(f, st) for f, st in STORES if st == want]
+        if not match:
+            return {"ok": False, "error": "Pick a store."}
+        flag, store = match[0]
+
+    run(
+        "INSERT INTO ho_cases (agent_id, the_date, section, prio, platform, flag,"
+        " store, username, body, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
+        (user_id, now().date().isoformat(), section, prio, platform, flag,
+         store, username, body, now().isoformat()),
+    )
+    return {"ok": True, "username": username}
+
+
+def web_handover_post(user_id: int) -> dict:
+    """Post whatever is open, noting what this person closed today."""
+    today = now().date()
+    cases = [case_row_to_dict(r) for r in
+             q("SELECT * FROM ho_cases WHERE closed=0 ORDER BY id")]
+    closed = [
+        case_row_to_dict(r) for r in q(
+            "SELECT * FROM ho_cases WHERE closed=1 AND closed_by=? "
+            "AND closed_at >= ? ORDER BY closed_at",
+            (user_id, today.isoformat()),
+        )
+    ]
+    who = display_name_of(user_id, "")
+    text = render_handover(cases, who, today, closed)
+
+    run(
+        "INSERT INTO handovers (agent_id, the_date, body, created_at) "
+        "VALUES (?,?,?,?)",
+        (user_id, today.isoformat(),
+         "\n\n".join(render_case(c) for c in cases), now().isoformat()),
+    )
+    posted = bool(on_bot_loop(post_ops(bot_ref(), text)))
+    return {
+        "ok": True, "posted": posted, "open": len(cases), "closed": len(closed),
+        "text": text if not posted else "",
+    }
+
+
 def web_has_access(user_id: int) -> bool:
     if user_id in ADMIN_IDS:
         return True
@@ -498,6 +614,24 @@ class MiniAppHandler(BaseHTTPRequestHandler):
             return
         if path == "/health":
             self._send(200, b'{"ok":true}')
+            return
+        if path == "/api/handover":
+            try:
+                user = verify_init_data(self.headers.get("X-Init-Data", ""))
+                if not user or "id" not in user:
+                    self._send(401, b'{"error":"unverified"}')
+                    return
+                uid = int(user["id"])
+                if not web_has_access(uid):
+                    self._send(403, b'{"error":"no access"}')
+                    return
+                self._send(200, json.dumps(handover_payload(uid)).encode())
+            except Exception as e:
+                log.warning("Handover view failed: %s", e)
+                try:
+                    self._send(500, b'{"error":"server"}')
+                except Exception:
+                    pass
             return
         if path == "/api/week":
             try:
@@ -613,7 +747,18 @@ class MiniAppHandler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             body = {}
 
-        if path == "/api/claim":
+        if path == "/api/case":
+            out = web_case_add(uid, body if isinstance(body, dict) else {})
+        elif path == "/api/case/toggle":
+            try:
+                cid = int(body.get("id", 0))
+            except (TypeError, ValueError):
+                cid = 0
+            out = (web_case_toggle(uid, cid, bool(body.get("close", True)))
+                   if cid else {"ok": False, "error": "No case given."})
+        elif path == "/api/handover/post":
+            out = web_handover_post(uid)
+        elif path == "/api/claim":
             try:
                 sid = int(body.get("slot", 0))
             except (TypeError, ValueError):
