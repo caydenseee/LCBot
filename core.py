@@ -2473,7 +2473,7 @@ async function claim(el) {
     }
     if (tg?.HapticFeedback) tg.HapticFeedback.impactOccurred('light');
     if (!out.quiet && out.label) {
-      toast(want ? 'You\'re on ' + out.label : 'Released ' + out.label);
+      toast(want ? "You're on " + out.label : "Released " + out.label);
     }
     await loadWeek();
   } catch (e) {
