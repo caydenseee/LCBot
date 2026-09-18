@@ -2004,7 +2004,7 @@ async def job_shift_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
 AGENT_COMMANDS = [
     ("clockin", "Start my shift — or /clockin 2pm-4pm"),
     ("clockout", "End my shift"),
-    ("payslip", "My hours and pay"),
+    ("payslip", "Open the app"),
     ("dropshift", "Ask to drop a shift"),
     ("pickup", "Ask to take an open shift"),
     ("swap", "Hand a shift to someone"),
@@ -2134,7 +2134,7 @@ MINIAPP_HTML = """<!DOCTYPE html>
 <html><head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<title>My hours</title>
+<title>LC Bot</title>
 <script src="https://telegram.org/js/telegram-web-app.js"></script>
 <style>
   :root { color-scheme: light dark; }

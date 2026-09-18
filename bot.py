@@ -516,7 +516,7 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ]
     if PUBLIC_URL:
         lines += [
-        "<b>The app</b> — tap <b>My hours</b> by the 📎",
+        "<b>The app</b> — tap <b>App</b> by the 📎",
         "  🏠 Home — your shift and any open cases",
         "  📅 Week — take a slot, or let one go",
         "  🕐 Hours — what you've worked and earned",
@@ -610,7 +610,7 @@ async def post_init(app: Application) -> None:
         try:
             await app.bot.set_chat_menu_button(
                 menu_button=MenuButtonWebApp(
-                    text="My hours", web_app=WebAppInfo(url=app_url())
+                    text="App", web_app=WebAppInfo(url=app_url())
                 )
             )
             log.info("Mini App button set to %s", app_url())
