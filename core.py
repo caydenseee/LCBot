@@ -153,6 +153,16 @@ OPS_CHAT_ID = env_int("OPS_CHAT_ID")
 OPS_THREAD_ID = env_int("OPS_THREAD_ID") or None
 # Mini App. PUBLIC_URL comes from Railway once you generate a domain.
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "").strip().rstrip("/")
+# Telegram's webview caches a Mini App per URL, so a bad page can survive a
+# deploy. Stamping the URL on startup makes every deploy a fresh address.
+BUILD_STAMP = datetime.now().strftime("%Y%m%d%H%M%S")
+
+
+def app_url() -> str:
+    if not PUBLIC_URL:
+        return ""
+    sep = "&" if "?" in PUBLIC_URL else "?"
+    return f"{PUBLIC_URL}{sep}v={BUILD_STAMP}"
 WEB_PORT = env_int("PORT", 8080)
 # Where the daily on-duty tags go. Defaults to the avails group; set it to the
 # TC Online id to send them there instead. "ops" is shorthand for OPS_CHAT_ID.

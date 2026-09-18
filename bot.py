@@ -611,10 +611,10 @@ async def post_init(app: Application) -> None:
         try:
             await app.bot.set_chat_menu_button(
                 menu_button=MenuButtonWebApp(
-                    text="My hours", web_app=WebAppInfo(url=PUBLIC_URL)
+                    text="My hours", web_app=WebAppInfo(url=app_url())
                 )
             )
-            log.info("Mini App button set to %s", PUBLIC_URL)
+            log.info("Mini App button set to %s", app_url())
         except Exception as e:
             log.info("Couldn't set the menu button: %s", e)
     await publish_command_menus(app)

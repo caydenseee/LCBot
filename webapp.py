@@ -18,7 +18,7 @@ async def cmd_payslip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     kb = InlineKeyboardMarkup(
         [[InlineKeyboardButton(
-            "📊 Open my hours", web_app=WebAppInfo(url=PUBLIC_URL)
+            "📊 Open my hours", web_app=WebAppInfo(url=app_url())
         )]]
     )
     await update.message.reply_text(
