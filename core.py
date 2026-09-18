@@ -2235,6 +2235,20 @@ MINIAPP_HTML = """<!DOCTYPE html>
 </head><body>
 <div id="app"><div class="empty">Loading…</div></div>
 <script>
+// Show problems on screen — a webview gives us no console to read.
+function showFatal(what, detail) {
+  const app = document.getElementById('app');
+  if (!app) return;
+  app.innerHTML = '<div class="err"><b>' + what + '</b><br><br>'
+    + '<code style="font-size:11px;word-break:break-word">'
+    + String(detail).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))
+    + '</code><br><br>Screenshot this and send it on.</div>';
+}
+window.onerror = (m, src, line, col) =>
+  showFatal('Something broke', m + '  (line ' + line + ':' + col + ')');
+window.addEventListener('unhandledrejection', e =>
+  showFatal('A request failed', e.reason && e.reason.message || e.reason));
+
 const tg = window.Telegram?.WebApp;
 if (tg) { tg.ready(); tg.expand(); }
 let VIEW = 'home', MODE = 'week', START = '', WHICH = 'now', IS_ADMIN = false;
@@ -2261,10 +2275,29 @@ async function post(url, payload) {
   return r.json();
 }
 
+async function getJSON(url) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 12000);
+  try {
+    const r = await fetch(url, {
+      headers: { 'X-Init-Data': tg?.initData || '' },
+      signal: ctl.signal,
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status + ' from ' + url);
+    return await r.json();
+  } catch (e) {
+    if (e.name === 'AbortError') {
+      throw new Error('No answer from the server after 12s (' + url + ')');
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 async function loadHome() {
   const app = document.getElementById('app');
-  const r = await fetch('/api/home', { headers: { 'X-Init-Data': tg?.initData || '' } });
-  if (!r.ok) throw new Error('HTTP ' + r.status);
+  const r = { ok: true, json: () => getJSON('/api/home') };
   const d = await r.json();
   IS_ADMIN = !!d.isAdmin;
 
@@ -2502,26 +2535,17 @@ async function loadTeam() {
 async function render() {
   if (VIEW === 'home') {
     try { await loadHome(); }
-    catch (e) {
-      document.getElementById('app').innerHTML =
-        '<div class="err">Could not load. Try again shortly.</div>';
-    }
+    catch (e) { showFatal('Home would not load', e.message || e); }
     return;
   }
   if (VIEW === 'week') {
     try { await loadWeek(); }
-    catch (e) {
-      document.getElementById('app').innerHTML =
-        '<div class="err">Could not load the week.</div>';
-    }
+    catch (e) { showFatal('The week would not load', e.message || e); }
     return;
   }
   if (VIEW === 'team') {
     try { await loadTeam(); }
-    catch (e) {
-      document.getElementById('app').innerHTML =
-        '<div class="err">Could not load the team view.</div>';
-    }
+    catch (e) { showFatal('The team view would not load', e.message || e); }
     return;
   }
   await load();
