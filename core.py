@@ -2445,6 +2445,9 @@ async function doClockOut(btn) {
 }
 
 function wire() {
+  document.querySelectorAll('[data-agent]').forEach(el => {
+    el.onclick = () => { AGENT = Number(el.dataset.agent); START = ''; render(); };
+  });
   document.querySelectorAll('.nav-bar div').forEach(el => {
     el.onclick = () => { VIEW = el.dataset.v; START = ''; AGENT = null; render(); };
   });
