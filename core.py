@@ -2161,6 +2161,8 @@ MINIAPP_HTML = """<!DOCTYPE html>
   .t { font-size:12px; color: var(--tg-theme-hint-color,#777); margin-top:1px; }
   .h { font-variant-numeric: tabular-nums; text-align:right; }
   .flag { font-size:11px; color:#c60; }
+  .ref { float:right; font-variant-numeric:tabular-nums; opacity:.45;
+         font-size:11px; }
   .empty { text-align:center; padding:40px 20px; color: var(--tg-theme-hint-color,#777); }
   .note { margin-top:22px; font-size:12px; color: var(--tg-theme-hint-color,#777); }
   .err { background:#fee; color:#900; padding:14px; border-radius:12px; }
@@ -2844,7 +2846,10 @@ async function load() {
       for (const s of d.shifts) {
         h += '<div class="row"><div>';
         h += `<div class="d">${esc(s.date)}</div>`;
-        h += `<div class="t">${esc(s.times)}${s.ot ? ' · +' + esc(s.ot) + ' OT' : ''}${s.flagged ? ' <span class="flag">· auto-closed</span>' : ''}</div>`;
+        h += `<div class="t">${esc(s.times)}${s.ot ? ' · +' + esc(s.ot) + ' OT' : ''}`
+           + `${s.flagged ? ' <span class="flag">· auto-closed</span>' : ''}`
+           + `${s.edited ? ' <span class="flag">· corrected</span>' : ''}`
+           + `<span class="ref">#${s.id}</span></div>`;
         h += `</div><div class="h"><div>${esc(s.hours)}</div>`;
         h += s.pay ? `<div class="t">${esc(s.pay)}</div>` : '';
         h += `</div></div>`;

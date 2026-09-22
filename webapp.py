@@ -83,12 +83,14 @@ def miniapp_payload(user_id: int) -> dict:
             total_cents += cents
             seen_days.add(day)
             shifts.append({
+                "id": r["id"],                      # what /fixtime needs
                 "date": day.strftime("%a %-d %b"),
                 "times": f"{a.strftime('%H:%M')}\u2013{b.strftime('%H:%M')}",
                 "hours": hhmm(mins),
                 "ot": hhmm(ot_min) if ot_min else "",
                 "pay": money(cents) if cents else "",
                 "flagged": r["status"] == "auto",
+                "edited": r["status"] == "edited",
             })
         rate = rate_on(today)
     finally:
