@@ -2161,6 +2161,8 @@ MINIAPP_HTML = """<!DOCTYPE html>
   .t { font-size:12px; color: var(--tg-theme-hint-color,#777); margin-top:1px; }
   .h { font-variant-numeric: tabular-nums; text-align:right; }
   .flag { font-size:11px; color:#c60; }
+  .back { font-size:13px; color: var(--tg-theme-link-color,#2a7);
+          cursor:pointer; margin-bottom:10px; }
   .ref { float:right; font-variant-numeric:tabular-nums; opacity:.45;
          font-size:11px; }
   .empty { text-align:center; padding:40px 20px; color: var(--tg-theme-hint-color,#777); }
@@ -2444,7 +2446,7 @@ async function doClockOut(btn) {
 
 function wire() {
   document.querySelectorAll('.nav-bar div').forEach(el => {
-    el.onclick = () => { VIEW = el.dataset.v; START = ''; render(); };
+    el.onclick = () => { VIEW = el.dataset.v; START = ''; AGENT = null; render(); };
   });
   document.querySelectorAll('.tab').forEach(el => {
     el.onclick = () => { VIEW = el.dataset.v; START = ''; render(); };
@@ -2458,6 +2460,7 @@ function wire() {
 }
 
 let HO = null, HO_FORM = null, HO_SHOWN = {};
+let AGENT = null;   // whose detail we're looking at
 
 function caseCard(c, closed) {
   let h = `<div class="case${closed ? ' gone' : ''}">`;
@@ -2734,6 +2737,66 @@ async function claim(el) {
   }
 }
 
+async function loadAgent() {
+  const app = document.getElementById('app');
+  const qs = '?id=' + AGENT + '&mode=' + MODE + (START ? '&start=' + START : '');
+  const d = await getJSON('/api/agent' + qs);
+
+  let h = `<div class="back" id="toTeam">‹ Back to the team</div>`;
+  h += `<h1>${esc(d.name)}</h1>`;
+
+  h += '<div class="seg">'
+    + `<div data-p="week" class="${MODE === 'week' ? 'on' : ''}">Week</div>`
+    + `<div data-p="month" class="${MODE === 'month' ? 'on' : ''}">Month</div>`
+    + '</div>';
+  h += '<div class="nav">'
+    + `<button id="prev" data-m="${d.prev}">‹</button>`
+    + `<div class="m">${esc(d.label)}</div>`
+    + `<button id="next" data-m="${d.next}" ${d.hasNext ? '' : 'disabled'}>›</button>`
+    + '</div>';
+
+  h += '<div class="cards">';
+  h += `<div class="card"><div class="n">${d.count}</div><div class="l">Shifts</div></div>`;
+  h += `<div class="card"><div class="n">${esc(d.hours)}</div><div class="l">Hours</div></div>`;
+  h += `<div class="card pay wide"><div class="n">${esc(d.pay)}</div>`;
+  const extra = [];
+  if (d.overtime) extra.push(esc(d.overtime) + ' OT');
+  if (d.reviews) extra.push(d.reviews + ' review' + (d.reviews === 1 ? '' : 's'));
+  h += `<div class="l">${extra.join(' · ') || 'for this period'}</div></div>`;
+  h += '</div>';
+
+  if (d.missed.length) {
+    h += `<div class="warn">🚫 Rostered but never clocked in: ${d.missed.map(esc).join(', ')}</div>`;
+  }
+  if (d.open) h += '<div class="note">⏱ Currently clocked in.</div>';
+
+  if (d.shifts.length) {
+    h += '<h2>Shifts</h2>';
+    for (const s of d.shifts) {
+      h += '<div class="p"><div class="ptop">';
+      h += `<div class="pn">${esc(s.date)}</div>`;
+      h += `<div class="pp">${esc(s.hours)}${s.pay ? '  ' + esc(s.pay) : ''}</div>`;
+      h += '</div>';
+      const marks = [];
+      if (s.ot) marks.push('+' + esc(s.ot) + ' OT');
+      if (s.flagged) marks.push('auto-closed');
+      if (s.edited) marks.push('corrected');
+      if (s.duplicate) marks.push('already paid');
+      h += `<div class="t">${esc(s.times)} · ${esc(s.slot)}`
+         + `${marks.length ? ' · ' + marks.join(' · ') : ''}`
+         + `<span class="ref">#${s.id}</span></div></div>`;
+    }
+    h += '<div class="note">Use <code>/fixtime 42 11:00 17:30</code> to correct one.</div>';
+  } else {
+    h += '<div class="empty">Nothing logged in this period.</div>';
+  }
+
+  app.innerHTML = h + navBar();
+  wire();
+  const back = document.getElementById('toTeam');
+  if (back) back.onclick = () => { AGENT = null; START = ''; render(); };
+}
+
 async function loadTeam() {
   const app = document.getElementById('app');
   const qs = '?mode=' + MODE + (START ? '&start=' + START : '');
@@ -2767,7 +2830,7 @@ async function loadTeam() {
   if (d.people.length) {
     h += '<h2>By agent</h2>';
     for (const p of d.people) {
-      h += '<div class="p"><div class="ptop">';
+      h += `<div class="p tappable" data-agent="${p.id}"><div class="ptop">`;
       h += `<div class="pn">${esc(p.name)}${p.flags ? ' <span class="flag">⚠️</span>' : ''}</div>`;
       h += `<div class="pp">${esc(p.pay)}</div></div>`;
       h += `<div class="t">${p.shifts} shift(s) · ${esc(p.hours)}`;
@@ -2801,7 +2864,7 @@ async function render() {
     return;
   }
   if (VIEW === 'team') {
-    try { await loadTeam(); }
+    try { AGENT ? await loadAgent() : await loadTeam(); }
     catch (e) { showFatal('The team view would not load', e.message || e); }
     return;
   }

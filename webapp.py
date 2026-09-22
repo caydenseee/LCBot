@@ -1,4 +1,4 @@
-"""The Mini App: home, week, hours, handover and team.
+"""The Mini App: home, week, hours, handover, team and agent views.
 
 Part of the LC avails bot. Shared helpers live in core.py.
 """
@@ -160,6 +160,7 @@ def team_payload(first: date, mode: str = "month") -> dict:
         tot_cents += t["cents"] + rc
         tot_rev += revs
         rows.append({
+            "id": a["user_id"],
             "name": a["display_name"] or a["name"],
             "shifts": len(t["shifts"]),
             "minutes": t["minutes"],
@@ -585,6 +586,84 @@ def web_handover_post(user_id: int) -> dict:
     }
 
 
+def agent_payload(agent_id: int, mode: str, first: date) -> dict:
+    """One agent's shifts in detail — the app's version of /timesheet @handle."""
+    if mode == "week":
+        first = first - timedelta(days=first.weekday())
+        last = first + timedelta(days=6)
+        label = (f"{quarter_week(first)} · {first.strftime('%-d %b')} – "
+                 f"{last.strftime('%-d %b')}")
+        prev_s = (first - timedelta(days=7)).isoformat()
+        next_s = (first + timedelta(days=7)).isoformat()
+    else:
+        first = first.replace(day=1)
+        last = (first + timedelta(days=32)).replace(day=1) - timedelta(days=1)
+        label = first.strftime("%B %Y")
+        prev_s = (first - timedelta(days=1)).replace(day=1).isoformat()
+        next_s = (last + timedelta(days=1)).isoformat()
+
+    t = timesheet(agent_id, first, last)
+    revs = len(reviews_for(agent_id, first, last))
+    rc = revs * REVIEW_RATE_CENTS
+    salaried = is_salaried(agent_id)
+
+    shifts = []
+    for sh in t["shifts"]:
+        r = sh["row"]
+        a_t = datetime.fromisoformat(r["clock_in"])
+        b_t = datetime.fromisoformat(r["clock_out"])
+        slot = q1("SELECT label FROM slots WHERE id=?", (r["slot_id"],)) \
+            if r["slot_id"] else None
+        shifts.append({
+            "id": r["id"],
+            "date": sh["date"].strftime("%a %-d %b"),
+            "times": f"{a_t.strftime('%H:%M')}\u2013{b_t.strftime('%H:%M')}",
+            "hours": hhmm(sh["minutes"]),
+            "ot": hhmm(sh["ot"]) if sh.get("ot") else "",
+            "pay": "" if salaried else (money(sh["cents"]) if sh["cents"] else ""),
+            "slot": slot["label"] if slot else "unrostered",
+            "flagged": r["status"] == "auto",
+            "edited": r["status"] == "edited",
+            "duplicate": bool(sh.get("duplicate")),
+        })
+
+    # anything rostered but never clocked
+    missed = []
+    today = now().date()
+    for row in q(
+        """SELECT s.label, d.name AS day_name, d.the_date
+           FROM signups su JOIN slots s ON s.id = su.slot_id
+           JOIN days d ON d.id = s.day_id
+           WHERE su.user_id=? AND d.the_date BETWEEN ? AND ? AND d.the_date < ?
+           ORDER BY d.the_date""",
+        (agent_id, first.isoformat(), last.isoformat(), today.isoformat()),
+    ):
+        if not q1(
+            "SELECT 1 FROM time_entries WHERE agent_id=? AND the_date=?",
+            (agent_id, row["the_date"]),
+        ):
+            missed.append(f"{row['day_name']} {row['label']}")
+
+    return {
+        "id": agent_id,
+        "name": display_name_of(agent_id, ""),
+        "mode": mode,
+        "label": label,
+        "prev": prev_s,
+        "next": next_s,
+        "hasNext": last < today,
+        "salaried": salaried,
+        "shifts": shifts,
+        "count": len(shifts),
+        "hours": hhmm(t["minutes"]),
+        "overtime": hhmm(t.get("overtime", 0)) if t.get("overtime") else "",
+        "reviews": revs,
+        "pay": "salaried" if salaried else money(t["cents"] + rc),
+        "missed": missed,
+        "open": t["open"],
+    }
+
+
 def web_has_access(user_id: int) -> bool:
     if user_id in ADMIN_IDS:
         return True
@@ -683,6 +762,37 @@ class MiniAppHandler(BaseHTTPRequestHandler):
                 self._send(200, json.dumps(data).encode())
             except Exception as e:
                 log.warning("Home view failed: %s", e)
+                try:
+                    self._send(500, b'{"error":"server"}')
+                except Exception:
+                    pass
+            return
+        if path == "/api/agent":
+            try:
+                qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                user = verify_init_data(self.headers.get("X-Init-Data", ""))
+                if not user or "id" not in user:
+                    self._send(401, b'{"error":"unverified"}')
+                    return
+                if not is_admin(int(user["id"])):
+                    self._send(403, b'{"error":"admins only"}')
+                    return
+                try:
+                    who = int((qs.get("id") or ["0"])[0])
+                except ValueError:
+                    who = 0
+                if not who:
+                    self._send(400, b'{"error":"no agent"}')
+                    return
+                mode = (qs.get("mode") or ["week"])[0]
+                mode = "week" if mode == "week" else "month"
+                try:
+                    first = date.fromisoformat((qs.get("start") or [""])[0])
+                except ValueError:
+                    first = now().date()
+                self._send(200, json.dumps(agent_payload(who, mode, first)).encode())
+            except Exception as e:
+                log.warning("Agent view failed: %s", e)
                 try:
                     self._send(500, b'{"error":"server"}')
                 except Exception:
