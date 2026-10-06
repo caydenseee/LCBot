@@ -311,30 +311,41 @@ async def got_shape_label(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     return ASK_DAYS
 
 
-def cap_keyboard(draft) -> InlineKeyboardMarkup:
-    """One button per slot on the chosen days — tap to cycle 1 → 2 → 3 → 1."""
+def cap_day_keyboard(draft) -> InlineKeyboardMarkup:
+    """The day list — how many slots on each take more than one agent."""
     caps = draft.setdefault("caps", {})
-    days = sorted(draft.get("cap_days", []), key=DAY_NAMES.index)
     cfg = draft.get("slots") or {}
     rows = []
-    for d in days:
-        for lbl in cfg.get(d, []):
-            n = caps.get(f"{d}|{lbl}", 1)
-            mark = "👥" if n > 1 else "　"
-            rows.append([InlineKeyboardButton(
-                f"{mark} {d} {lbl}  ·  {n} agent{'s' if n > 1 else ''}",
-                callback_data=f"cap:{d}|{lbl}",
-            )])
+    for d in sorted(draft.get("cap_days", []), key=DAY_NAMES.index):
+        n = sum(1 for lbl in cfg.get(d, []) if caps.get(f"{d}|{lbl}", 1) > 1)
+        tail = f"  ·  {n} doubled" if n else ""
+        rows.append([InlineKeyboardButton(f"{d}{tail}", callback_data=f"cap:d:{d}")])
     rows.append([InlineKeyboardButton("✓ Done", callback_data="cap:DONE")])
+    return InlineKeyboardMarkup(rows)
+
+
+def cap_slot_keyboard(draft, day: str) -> InlineKeyboardMarkup:
+    """One day's slots — tap to cycle 1 → 2 → 3 → 1."""
+    caps = draft.setdefault("caps", {})
+    rows = []
+    for lbl in (draft.get("slots") or {}).get(day, []):
+        n = caps.get(f"{day}|{lbl}", 1)
+        mark = "👥" if n > 1 else "　"
+        rows.append([InlineKeyboardButton(
+            f"{mark} {lbl}  ·  {n} agent{'s' if n > 1 else ''}",
+            callback_data=f"cap:s:{day}|{lbl}",
+        )])
+    rows.append([InlineKeyboardButton("◀️ Back to the days",
+                                      callback_data="cap:back")])
     return InlineKeyboardMarkup(rows)
 
 
 async def show_caps(query, draft) -> int:
     await query.edit_message_text(
-        "<b>How many agents per slot?</b>\n\n"
-        "Tap a slot to put two on it. Leave the rest at one.",
+        "<b>Any slots need more than one agent?</b>\n\n"
+        "Pick a day. Leave it if one each is fine.",
         parse_mode=constants.ParseMode.HTML,
-        reply_markup=cap_keyboard(draft),
+        reply_markup=cap_day_keyboard(draft),
     )
     return ASK_CAPS
 
@@ -346,13 +357,13 @@ async def on_week_caps(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         await query.answer("That setup has expired — send /newweek again.",
                            show_alert=True)
         return ConversationHandler.END
-    pick = query.data.split(":", 1)[1]
+    rest = query.data.split(":", 1)[1]
     caps = draft.setdefault("caps", {})
 
-    if pick == "DONE":
+    if rest == "DONE":
         await query.answer()
-        doubled = [k for k, v in caps.items() if v > 1]
-        line = (f"👥 {len(doubled)} slot(s) take more than one agent"
+        doubled = sum(1 for v in caps.values() if v > 1)
+        line = (f"👥 {doubled} slot(s) take more than one agent"
                 if doubled else "Every slot takes one agent")
         await query.edit_message_text(
             f"{esc(line)}\n\n{shape_summary(draft.get('slots') or {})}\n\n"
@@ -362,10 +373,29 @@ async def on_week_caps(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         )
         return ASK_SLOTS
 
-    caps[pick] = caps.get(pick, 1) % 3 + 1      # 1 → 2 → 3 → 1
+    if rest == "back":
+        await query.answer()
+        return await show_caps(query, draft)
+
+    kind, value = rest.split(":", 1)
+
+    if kind == "d":                                  # opened a day
+        await query.answer()
+        await query.edit_message_text(
+            f"<b>{esc(value)}</b>\n\nTap a slot to put two on it.",
+            parse_mode=constants.ParseMode.HTML,
+            reply_markup=cap_slot_keyboard(draft, value),
+        )
+        return ASK_CAPS
+
+    # tapped a slot
+    caps[value] = caps.get(value, 1) % 3 + 1         # 1 → 2 → 3 → 1
+    day = value.split("|", 1)[0]
     await query.answer()
     try:
-        await query.edit_message_reply_markup(reply_markup=cap_keyboard(draft))
+        await query.edit_message_reply_markup(
+            reply_markup=cap_slot_keyboard(draft, day)
+        )
     except BadRequest:
         pass
     return ASK_CAPS
