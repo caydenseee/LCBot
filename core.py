@@ -2837,7 +2837,7 @@ async function loadAgent() {
   h += sw('avails', 'Chased for avails',
           'Reminders and the not-yet-confirmed list', d.onAvails);
   h += sw('tag', 'Tagged in the 8pm post',
-          'Named when tomorrow\'s shifts go out', d.tagCalls);
+          "Named in the 8pm shift call", d.tagCalls);
   h += sw('hourly', 'Paid hourly',
           'Off means salaried — hours recorded, no hourly pay', !d.salaried);
 
