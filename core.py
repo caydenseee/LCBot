@@ -143,6 +143,11 @@ SLOT_GRACE_MIN = env_int("SLOT_GRACE_MIN", 15)
 OT_MIN_MINUTES = env_int("OT_MIN_MINUTES", 5)
 # Above this, admins get told — usually a forgotten clock-out rather than real OT.
 OT_ALERT_MINUTES = env_int("OT_ALERT_MINUTES", 60)
+# Overtime an agent claims the morning after. Up to this, it's applied straight
+# away; beyond it, an admin approves first.
+OT_SELF_LIMIT_MIN = env_int("OT_SELF_LIMIT_MIN", 120)
+# When to ask about yesterday's forgotten clock-outs.
+OT_ASK_TIME = os.environ.get("OT_ASK_TIME", "10:00").strip()
 # Forum topics. Leave blank for a normal group. Get the number by sending
 # /chatid inside the topic you want.
 GROUP_THREAD_ID = env_int("GROUP_THREAD_ID") or None
@@ -294,6 +299,18 @@ CREATE TABLE IF NOT EXISTS drop_requests (
     status       TEXT NOT NULL DEFAULT 'pending',
     decided_by   INTEGER,
     decided_at   TEXT
+);
+CREATE TABLE IF NOT EXISTS ot_claims (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    entry_id    INTEGER NOT NULL,
+    agent_id    INTEGER NOT NULL,
+    claimed_out TEXT NOT NULL,
+    ot_minutes  INTEGER NOT NULL DEFAULT 0,
+    status      TEXT NOT NULL DEFAULT 'pending',
+    asked_at    TEXT NOT NULL,
+    decided_by  INTEGER,
+    decided_at  TEXT,
+    notified    TEXT
 );
 CREATE TABLE IF NOT EXISTS reviews (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1335,6 +1352,7 @@ async def refresh_header(context: ContextTypes.DEFAULT_TYPE, week_id: int) -> No
 # --------------------------------------------------------------------------
 
 ASK_DATE, ASK_LABEL, ASK_EVENTS, ASK_SLOTS, ASK_SHAPE_LABEL, ASK_DAYS, ASK_DEADLINE, CONFIRM = range(8)
+ASK_CAPS = 8
 
 
 # --------------------------------------------------------------------------
@@ -1598,6 +1616,7 @@ HO_SECTION, HO_PRIO, HO_PLATFORM, HO_STORE, HO_BODY, HO_MORE = range(221, 227)
 REVIEW_PHOTO = 230
 RESTORE_FILE, RESTORE_OK = 250, 251
 HO_PICK = 231
+OT_WHEN = 260
 SWAP_PICK, SWAP_WHO, SWAP_REASON = 240, 241, 242
 
 

@@ -1,4 +1,4 @@
-"""Clocking in and out, pay, timesheets and reviews.
+"""Clocking in and out, pay, overtime claims, timesheets and reviews.
 
 Part of the LC avails bot. Shared helpers live in core.py.
 """
@@ -1132,6 +1132,235 @@ def log_edit(entry_id: int, by: int, before: dict, after: dict, reason: str) -> 
         (entry_id, by, json.dumps(before), json.dumps(after), reason,
          now().isoformat()),
     )
+
+
+async def job_ask_overtime(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Morning after: ask anyone whose shift was auto-closed whether that was right."""
+    yesterday = (now().date() - timedelta(days=1)).isoformat()
+    rows = q(
+        "SELECT * FROM time_entries WHERE status='auto' AND the_date=?",
+        (yesterday,),
+    )
+    asked = 0
+    for r in rows:
+        if q1("SELECT 1 FROM ot_claims WHERE entry_id=?", (r["id"],)):
+            continue                              # already asked about this one
+        out = datetime.fromisoformat(r["clock_out"])
+        slot = q1("SELECT label FROM slots WHERE id=?", (r["slot_id"],)) \
+            if r["slot_id"] else None
+        where = slot["label"] if slot else (r["shift_label"] or "your shift")
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton(f"✅ Yes, {out.strftime('%H:%M')}",
+                                  callback_data=f"ot:yes:{r['id']}")],
+            [InlineKeyboardButton("✏️ No, I finished later",
+                                  callback_data=f"ot:no:{r['id']}")],
+        ])
+        try:
+            await context.bot.send_message(
+                r["agent_id"],
+                f"🕐 You didn't clock out of <b>{esc(where)}</b> yesterday, so I "
+                f"closed it at <b>{out.strftime('%H:%M')}</b>.\n\n"
+                "Was that right?",
+                parse_mode=constants.ParseMode.HTML, reply_markup=kb,
+            )
+            asked += 1
+        except Exception as e:
+            log.info("Couldn't ask %s about overtime: %s", r["agent_id"], e)
+    if asked:
+        log.info("Asked %s agent(s) about yesterday's clock-out.", asked)
+
+
+async def on_ot_yes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    eid = int(query.data.split(":")[2])
+    await query.answer("Thanks")
+    async with write_lock:
+        run("INSERT INTO ot_claims (entry_id, agent_id, claimed_out, ot_minutes,"
+            " status, asked_at) VALUES (?,?,?,0,'confirmed',?)",
+            (eid, query.from_user.id, "", now().isoformat()))
+    await query.edit_message_text(
+        "👍 Thanks — nothing changed.\n\n"
+        "<i>Clocking out yourself is still best, it's how overtime gets paid.</i>",
+        parse_mode=constants.ParseMode.HTML,
+    )
+
+
+async def on_ot_no(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    eid = int(query.data.split(":")[2])
+    row = q1("SELECT * FROM time_entries WHERE id=?", (eid,))
+    if not row:
+        await query.answer()
+        await query.edit_message_text("That shift has gone.")
+        return ConversationHandler.END
+    await query.answer()
+    context.user_data["ot_entry"] = eid
+    was = datetime.fromisoformat(row["clock_out"]).strftime("%H:%M")
+    await query.edit_message_text(
+        f"What time did you actually finish?\n\n"
+        f"I have <b>{was}</b>. Send the real time, like <code>21:30</code>.\n\n"
+        "<i>/cancel to leave it as is.</i>",
+        parse_mode=constants.ParseMode.HTML,
+    )
+    return OT_WHEN
+
+
+async def got_ot_time(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    eid = context.user_data.pop("ot_entry", None)
+    if not eid:
+        await update.message.reply_text("That expired. Tell your manager instead.")
+        return ConversationHandler.END
+    row = q1("SELECT * FROM time_entries WHERE id=?", (eid,))
+    if not row:
+        await update.message.reply_text("That shift has gone.")
+        return ConversationHandler.END
+
+    new_out = at_time_on(row["the_date"], update.message.text.strip())
+    if not new_out:
+        await update.message.reply_text("Send a time like 21:30, or /cancel.")
+        context.user_data["ot_entry"] = eid
+        return OT_WHEN
+
+    old_out = datetime.fromisoformat(row["clock_out"])
+    if new_out <= old_out:
+        await update.message.reply_text(
+            f"That's not later than {old_out.strftime('%H:%M')}. "
+            "Send a later time, or /cancel."
+        )
+        context.user_data["ot_entry"] = eid
+        return OT_WHEN
+
+    extra = int((new_out - old_out).total_seconds() // 60)
+    user = update.effective_user
+    nm = display_name_of(user.id, user.full_name)
+
+    if extra <= OT_SELF_LIMIT_MIN:
+        async with write_lock:
+            before = dict(row)
+            run("UPDATE time_entries SET clock_out=?, status='edited' WHERE id=?",
+                (new_out.isoformat(), eid))
+            log_edit(eid, user.id, before, {"clock_out": new_out.isoformat()},
+                     "agent corrected a forgotten clock-out")
+            run("INSERT INTO ot_claims (entry_id, agent_id, claimed_out,"
+                " ot_minutes, status, asked_at) VALUES (?,?,?,?,'applied',?)",
+                (eid, user.id, new_out.isoformat(), extra, now().isoformat()))
+        fresh = q1("SELECT * FROM time_entries WHERE id=?", (eid,))
+        base, ot = entry_split(fresh)
+        await update.message.reply_text(
+            f"✅ Updated to <b>{new_out.strftime('%H:%M')}</b>.\n"
+            f"Shift {hhmm(base)}" + (f" · Overtime <b>+{hhmm(ot)}</b>" if ot else "")
+            + f"\n\n<code>#{eid}</code>",
+            parse_mode=constants.ParseMode.HTML,
+        )
+        await flag_to_admins(
+            context.bot,
+            f"✏️ <b>{esc(nm)}</b> corrected a forgotten clock-out to "
+            f"{new_out.strftime('%H:%M')} (+{hhmm(extra)}). "
+            f"<code>#{eid}</code>",
+        )
+        return ConversationHandler.END
+
+    # more than we let anyone claim for themselves
+    async with write_lock:
+        cur = run(
+            "INSERT INTO ot_claims (entry_id, agent_id, claimed_out, ot_minutes,"
+            " status, asked_at) VALUES (?,?,?,?,'pending',?)",
+            (eid, user.id, new_out.isoformat(), extra, now().isoformat()),
+        )
+        claim_id = cur.lastrowid
+
+    await update.message.reply_text(
+        f"That's <b>{hhmm(extra)}</b> past the end, so a manager needs to "
+        "approve it.\n\nI've sent it over — nothing changes until they do.",
+        parse_mode=constants.ParseMode.HTML,
+    )
+    text = (
+        "⏱ <b>Overtime claim</b>\n\n"
+        f"<b>{esc(nm)}</b> says they finished at "
+        f"<b>{new_out.strftime('%H:%M')}</b> on "
+        f"{date.fromisoformat(row['the_date']).strftime('%a %-d %b')}, not "
+        f"{old_out.strftime('%H:%M')}.\n"
+        f"That's <b>{hhmm(extra)}</b> of overtime. <code>#{eid}</code>"
+    )
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Approve", callback_data=f"oc:a:{claim_id}"),
+        InlineKeyboardButton("🚫 Decline", callback_data=f"oc:d:{claim_id}"),
+    ]])
+    sent = await notify_admins(context.bot, text, kb)
+    run("UPDATE ot_claims SET notified=? WHERE id=?",
+        (json.dumps(sent), claim_id))
+    return ConversationHandler.END
+
+
+async def on_ot_decision(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    _, action, raw = query.data.split(":")
+    claim = q1("SELECT * FROM ot_claims WHERE id=?", (int(raw),))
+    if not claim:
+        await query.answer("That claim has gone.", show_alert=True)
+        return
+    if claim["status"] != "pending":
+        await query.answer("Already handled.", show_alert=True)
+        return
+    if not is_admin(query.from_user.id):
+        await query.answer("Admins only.", show_alert=True)
+        return
+
+    approve = action == "a"
+    nm = display_name_of(claim["agent_id"], str(claim["agent_id"]))
+    row = q1("SELECT * FROM time_entries WHERE id=?", (claim["entry_id"],))
+
+    async with write_lock:
+        run("UPDATE ot_claims SET status=?, decided_by=?, decided_at=? WHERE id=?",
+            ("approved" if approve else "declined", query.from_user.id,
+             now().isoformat(), claim["id"]))
+        if approve and row:
+            before = dict(row)
+            run("UPDATE time_entries SET clock_out=?, status='edited' WHERE id=?",
+                (claim["claimed_out"], claim["entry_id"]))
+            log_edit(claim["entry_id"], query.from_user.id, before,
+                     {"clock_out": claim["claimed_out"]},
+                     "overtime claim approved")
+
+    when = datetime.fromisoformat(claim["claimed_out"]).strftime("%H:%M")
+    verdict = "approved ✅" if approve else "declined 🚫"
+    await query.answer(f"{nm} {verdict}")
+    settled = (
+        f"⏱ <b>Overtime claim</b>\n\n<b>{esc(nm)}</b> — finished {when}, "
+        f"{hhmm(claim['ot_minutes'])} overtime\n\n"
+        f"{verdict} by {esc(display_name_of(query.from_user.id, 'admin'))}"
+    )
+    try:
+        sent = json.loads(claim["notified"] or "[]")
+    except (json.JSONDecodeError, TypeError):
+        sent = []
+    if sent:
+        await settle_admin_messages(context.bot, sent, settled)
+    else:
+        try:
+            await query.edit_message_text(
+                settled, parse_mode=constants.ParseMode.HTML
+            )
+        except BadRequest:
+            pass
+
+    try:
+        if approve:
+            fresh = q1("SELECT * FROM time_entries WHERE id=?", (claim["entry_id"],))
+            base, ot = entry_split(fresh)
+            await context.bot.send_message(
+                claim["agent_id"],
+                f"✅ Your overtime was approved — finished {when}.\n"
+                f"Shift {hhmm(base)} · Overtime +{hhmm(ot)}",
+            )
+        else:
+            await context.bot.send_message(
+                claim["agent_id"],
+                f"Your overtime claim for {when} wasn't approved. "
+                "Speak to your manager if that's not right.",
+            )
+    except Exception:
+        pass
 
 
 async def cmd_openshifts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

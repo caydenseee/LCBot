@@ -639,6 +639,11 @@ async def post_init(app: Application) -> None:
     app.job_queue.run_daily(
         job_backup, time(bmins // 60, bmins % 60, tzinfo=TZ), name="backup",
     )
+    omins = parse_time_token(OT_ASK_TIME or "10:00")
+    app.job_queue.run_daily(
+        job_ask_overtime, time(omins // 60, omins % 60, tzinfo=TZ),
+        name="ask-overtime",
+    )
     dmins = parse_time_token(os.environ.get("DIGEST_TIME", "").strip() or "09:00")
     app.job_queue.run_daily(
         job_week_digest, time(dmins // 60, dmins % 60, tzinfo=TZ),
@@ -678,6 +683,7 @@ def main() -> None:
                     MessageHandler(filters.TEXT & ~filters.COMMAND, got_shape_label)
                 ],
                 ASK_DAYS: [CallbackQueryHandler(on_week_days, pattern=r"^wd:")],
+                ASK_CAPS: [CallbackQueryHandler(on_week_caps, pattern=r"^cap:")],
                 ASK_DEADLINE: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_deadline)],
                 CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, confirm)],
             },
@@ -773,6 +779,21 @@ def main() -> None:
     app.add_handler(CommandHandler("addtime", cmd_addtime))
     app.add_handler(CommandHandler("week", cmd_week))
     app.add_handler(CommandHandler("payroll", cmd_payroll))
+    app.add_handler(CallbackQueryHandler(on_ot_yes, pattern=r"^ot:yes:"))
+    app.add_handler(CallbackQueryHandler(on_ot_decision, pattern=r"^oc:"))
+    app.add_handler(
+        ConversationHandler(
+            entry_points=[CallbackQueryHandler(on_ot_no, pattern=r"^ot:no:")],
+            states={
+                OT_WHEN: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, got_ot_time)
+                ]
+            },
+            fallbacks=[CommandHandler("cancel", cancel)],
+            allow_reentry=True,
+            conversation_timeout=3600,
+        )
+    )
     app.add_handler(CommandHandler("openshifts", cmd_openshifts))
     app.add_handler(CommandHandler("clockoutfor", cmd_clockoutfor))
     app.add_handler(CommandHandler("fixtime", cmd_fixtime))

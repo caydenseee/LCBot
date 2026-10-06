@@ -311,6 +311,66 @@ async def got_shape_label(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     return ASK_DAYS
 
 
+def cap_keyboard(draft) -> InlineKeyboardMarkup:
+    """One button per slot on the chosen days — tap to cycle 1 → 2 → 3 → 1."""
+    caps = draft.setdefault("caps", {})
+    days = sorted(draft.get("cap_days", []), key=DAY_NAMES.index)
+    cfg = draft.get("slots") or {}
+    rows = []
+    for d in days:
+        for lbl in cfg.get(d, []):
+            n = caps.get(f"{d}|{lbl}", 1)
+            mark = "👥" if n > 1 else "　"
+            rows.append([InlineKeyboardButton(
+                f"{mark} {d} {lbl}  ·  {n} agent{'s' if n > 1 else ''}",
+                callback_data=f"cap:{d}|{lbl}",
+            )])
+    rows.append([InlineKeyboardButton("✓ Done", callback_data="cap:DONE")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def show_caps(query, draft) -> int:
+    await query.edit_message_text(
+        "<b>How many agents per slot?</b>\n\n"
+        "Tap a slot to put two on it. Leave the rest at one.",
+        parse_mode=constants.ParseMode.HTML,
+        reply_markup=cap_keyboard(draft),
+    )
+    return ASK_CAPS
+
+
+async def on_week_caps(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    draft = context.user_data.get("draft")
+    if not draft:
+        await query.answer("That setup has expired — send /newweek again.",
+                           show_alert=True)
+        return ConversationHandler.END
+    pick = query.data.split(":", 1)[1]
+    caps = draft.setdefault("caps", {})
+
+    if pick == "DONE":
+        await query.answer()
+        doubled = [k for k, v in caps.items() if v > 1]
+        line = (f"👥 {len(doubled)} slot(s) take more than one agent"
+                if doubled else "Every slot takes one agent")
+        await query.edit_message_text(
+            f"{esc(line)}\n\n{shape_summary(draft.get('slots') or {})}\n\n"
+            "Anything else to change?",
+            parse_mode=constants.ParseMode.HTML,
+            reply_markup=week_shape_keyboard(has_slots=True),
+        )
+        return ASK_SLOTS
+
+    caps[pick] = caps.get(pick, 1) % 3 + 1      # 1 → 2 → 3 → 1
+    await query.answer()
+    try:
+        await query.edit_message_reply_markup(reply_markup=cap_keyboard(draft))
+    except BadRequest:
+        pass
+    return ASK_CAPS
+
+
 async def on_week_days(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
     draft = context.user_data.get("draft")
@@ -362,6 +422,11 @@ async def on_week_days(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             "ph_sg": f"✓ {name}: {days} now end at 6pm",
             "ph_other": f"✓ {name} noted on {days} — hours unchanged",
         }[mode]
+        draft["cap_days"] = set(chosen)
+        await query.answer()
+        if mode == "campaign":
+            # the usual reason for a campaign week is needing more cover
+            return await show_caps(query, draft)
         await query.edit_message_text(
             f"{esc(headline)}\n\n{shape_summary(cfg)}\n\n"
             "Anything else to change?",
@@ -446,10 +511,13 @@ async def confirm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 (week_id, i, name, the_date.isoformat()),
             )
             day_id = dcur.lastrowid
+            caps = draft.get("caps", {})
             for j, lbl in enumerate(draft["slots"][name]):
                 run(
-                    "INSERT INTO slots (day_id, idx, label, start_min) VALUES (?,?,?,?)",
-                    (day_id, j, lbl, slot_start_minutes(lbl)),
+                    "INSERT INTO slots (day_id, idx, label, start_min, capacity) "
+                    "VALUES (?,?,?,?,?)",
+                    (day_id, j, lbl, slot_start_minutes(lbl),
+                     caps.get(f"{name}|{lbl}", SLOT_CAPACITY)),
                 )
 
         fixed_filled = apply_fixed_slots(week_id)
