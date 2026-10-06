@@ -306,6 +306,8 @@ async def cmd_clockout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     pay = round(mins / 60 * rate_for(user.id, day))
 
     _base, _ot = entry_split(fresh)
+    if is_salaried(user.id):
+        _ot = 0                         # salaried — overtime isn't a thing
     msg = [f"✅ Clocked out at <b>{when.strftime('%H:%M')}</b>"]
     if _ot:
         msg.append(f"Shift: {hhmm(_base)}")
@@ -593,6 +595,8 @@ def week_report(first: date, last: date) -> str:
         (first.isoformat(), last.isoformat()),
     )
     for r in auto:
+        if is_salaried(r["agent_id"]):
+            continue
         who = r["display_name"] or r["name"]
         flags.append(
             f"⏰ {esc(who)} missed a clock-out on "
@@ -1145,6 +1149,8 @@ async def job_ask_overtime(context: ContextTypes.DEFAULT_TYPE) -> None:
     for r in rows:
         if q1("SELECT 1 FROM ot_claims WHERE entry_id=?", (r["id"],)):
             continue                              # already asked about this one
+        if is_salaried(r["agent_id"]):
+            continue                              # not paid hourly, so no overtime
         out = datetime.fromisoformat(r["clock_out"])
         slot = q1("SELECT label FROM slots WHERE id=?", (r["slot_id"],)) \
             if r["slot_id"] else None
@@ -1588,6 +1594,8 @@ async def job_auto_close(context: ContextTypes.DEFAULT_TYPE) -> None:
         except Exception:
             pass
         log.info("Auto-closed entry %s for %s", r["id"], r["agent_id"])
+        if is_salaried(r["agent_id"]):
+            continue                              # salaried — clock-outs don't matter
         await flag_to_admins(
             context.bot,
             f"⚠️ <b>Missed clock-out</b>\n\n"
