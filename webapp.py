@@ -148,8 +148,7 @@ def team_payload(first: date, mode: str = "month") -> dict:
         t = timesheet(a["user_id"], first, last)
         revs = len(reviews_for(a["user_id"], first, last))
         rc = revs * REVIEW_RATE_CENTS
-        if not t["shifts"] and not revs:
-            continue
+        idle = not t["shifts"] and not revs
         odd = sum(
             1 for sh in t["shifts"]
             if sh["row"]["status"] == "auto" or not sh["row"]["slot_id"]
@@ -161,6 +160,7 @@ def team_payload(first: date, mode: str = "month") -> dict:
         tot_rev += revs
         rows.append({
             "id": a["user_id"],
+            "idle": idle,
             "name": a["display_name"] or a["name"],
             "shifts": len(t["shifts"]),
             "minutes": t["minutes"],
@@ -170,8 +170,9 @@ def team_payload(first: date, mode: str = "month") -> dict:
             "pay": "salaried" if is_salaried(a["user_id"]) else money(t["cents"] + rc),
             "flags": odd,
         })
-    rows.sort(key=lambda r: -r["minutes"])
-    top = rows[0]["minutes"] if rows else 1
+    rows.sort(key=lambda r: (r["idle"], -r["minutes"], r["name"].lower()))
+    worked = [r for r in rows if not r["idle"]]
+    top = worked[0]["minutes"] if worked else 1
     for r in rows:
         r["bar"] = round(r["minutes"] / top * 100) if top else 0
 
@@ -187,7 +188,8 @@ def team_payload(first: date, mode: str = "month") -> dict:
         "totalPay": money(tot_cents),
         "totalReviews": tot_rev,
         "flags": flags,
-        "headcount": len(rows),
+        "headcount": len(worked),
+        "listed": len(rows),
     }
 
 

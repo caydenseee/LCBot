@@ -2223,8 +2223,10 @@ MINIAPP_HTML = """<!DOCTYPE html>
   .p:last-child { border-bottom:0; }
   .p.tappable { cursor:pointer; -webkit-tap-highlight-color:transparent; }
   .p.tappable:active { opacity:.6; }
+  .p.quiet .pn { color: var(--tg-theme-hint-color,#888); font-weight:500; }
   .p.tappable { cursor:pointer; -webkit-tap-highlight-color:transparent; }
   .p.tappable:active { opacity:.6; }
+  .p.quiet .pn { color: var(--tg-theme-hint-color,#888); font-weight:500; }
   .ptop { display:flex; justify-content:space-between; align-items:baseline; }
   .pn { font-weight:600; }
   .pp { font-variant-numeric:tabular-nums; font-weight:600; }
@@ -2915,10 +2917,18 @@ async function loadTeam() {
 
   if (d.people.length) {
     h += '<h2>By agent</h2>';
+    let gap = false;
     for (const p of d.people) {
-      h += `<div class="p tappable" data-agent="${p.id}"><div class="ptop">`;
+      if (p.idle && !gap) { gap = true; h += '<h2>No shifts this period</h2>'; }
+      h += `<div class="p tappable${p.idle ? ' quiet' : ''}" data-agent="${p.id}">`;
+      h += '<div class="ptop">';
       h += `<div class="pn">${esc(p.name)}${p.flags ? ' <span class="flag">⚠️</span>' : ''}</div>`;
       h += `<div class="pp">${esc(p.pay)}</div></div>`;
+      if (p.idle) {
+        h += `<div class="pp">${esc(p.pay === 'salaried' ? 'salaried' : '—')}</div></div>`;
+        h += '<div class="t">nothing logged · tap to open</div></div>';
+        continue;
+      }
       h += `<div class="t">${p.shifts} shift(s) · ${esc(p.hours)}`;
       h += p.ot ? ` · +${esc(p.ot)} OT` : '';
       h += p.reviews ? ` · ${p.reviews}⭐` : '';
