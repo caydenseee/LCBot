@@ -644,9 +644,14 @@ def agent_payload(agent_id: int, mode: str, first: date) -> dict:
         ):
             missed.append(f"{row['day_name']} {row['label']}")
 
+    a = q1("SELECT * FROM agents WHERE user_id=?", (agent_id,))
     return {
         "id": agent_id,
         "name": display_name_of(agent_id, ""),
+        "username": (a["username"] if a else "") or "",
+        "role": role_of(agent_id),
+        "onAvails": bool(a["on_avails"]) if a else True,
+        "tagCalls": bool(a["tag_calls"]) if a else True,
         "mode": mode,
         "label": label,
         "prev": prev_s,
@@ -662,6 +667,36 @@ def agent_payload(agent_id: int, mode: str, first: date) -> dict:
         "missed": missed,
         "open": t["open"],
     }
+
+
+def web_agent_set(admin_id: int, agent_id: int, field: str, value) -> dict:
+    """Change one of an agent's settings from the Team screen."""
+    row = q1("SELECT * FROM agents WHERE user_id=?", (agent_id,))
+    if not row:
+        return {"ok": False, "error": "No such agent."}
+
+    if field == "name":
+        nm = str(value).strip()
+        if not 2 <= len(nm) <= 40:
+            return {"ok": False, "error": "Give a name between 2 and 40 characters."}
+        run("UPDATE agents SET display_name=? WHERE user_id=?", (nm, agent_id))
+        return {"ok": True, "field": field, "value": nm}
+
+    column = {
+        "avails": "on_avails",
+        "tag": "tag_calls",
+        "hourly": "salaried",      # the toggle reads "paid hourly", so it's inverted
+    }.get(field)
+    if not column:
+        return {"ok": False, "error": "Unknown setting."}
+
+    want = bool(value)
+    stored = 0 if (column == "salaried" and want) else (1 if want else 0)
+    if column == "salaried":
+        stored = 0 if want else 1          # paid hourly on  → salaried off
+    run(f"UPDATE agents SET {column}=? WHERE user_id=?", (stored, agent_id))
+    log.info("%s set %s=%s for %s", admin_id, field, want, agent_id)
+    return {"ok": True, "field": field, "value": want}
 
 
 def web_has_access(user_id: int) -> bool:
@@ -871,7 +906,18 @@ class MiniAppHandler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             body = {}
 
-        if path == "/api/case":
+        if path == "/api/agent/set":
+            if not is_admin(uid):
+                self._send(403, b'{"error":"admins only"}')
+                return
+            try:
+                who = int(body.get("id", 0))
+            except (TypeError, ValueError):
+                who = 0
+            out = (web_agent_set(uid, who, str(body.get("field", "")),
+                                 body.get("value"))
+                   if who else {"ok": False, "error": "No agent given."})
+        elif path == "/api/case":
             out = web_case_add(uid, body if isinstance(body, dict) else {})
         elif path == "/api/case/toggle":
             try:

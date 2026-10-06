@@ -2180,6 +2180,26 @@ MINIAPP_HTML = """<!DOCTYPE html>
   .t { font-size:12px; color: var(--tg-theme-hint-color,#777); margin-top:1px; }
   .h { font-variant-numeric: tabular-nums; text-align:right; }
   .flag { font-size:11px; color:#c60; }
+  .row { display:flex; align-items:center; justify-content:space-between;
+     padding:13px 2px; border-bottom:1px solid var(--tg-theme-secondary-bg-color,#eee); }
+  .row:last-child { border-bottom:0; }
+  .row .lbl { font-size:14px; }
+  .row .lbl small { display:block; font-size:11px;
+     color: var(--tg-theme-hint-color,#888); margin-top:2px; }
+  .sw { width:50px; height:30px; border-radius:15px; flex:0 0 auto; cursor:pointer;
+     background: var(--tg-theme-secondary-bg-color,#d8d8dc); position:relative;
+     transition:background .15s; }
+  .sw.on { background: var(--tg-theme-link-color,#2a7); }
+  .sw i { position:absolute; top:3px; left:3px; width:24px; height:24px;
+     border-radius:12px; background:#fff; transition:left .15s; }
+  .sw.on i { left:23px; }
+  .nameedit { display:flex; gap:8px; margin-top:10px; }
+  .nameedit input { flex:1; border:1px solid var(--tg-theme-secondary-bg-color,#e5e5e7);
+     border-radius:10px; padding:10px 12px; font-size:15px; font-family:inherit;
+     background: var(--tg-theme-bg-color,#fff); color: var(--tg-theme-text-color,#111); }
+  .nameedit button { border:0; border-radius:10px; padding:10px 16px; font-size:14px;
+     font-weight:600; background: var(--tg-theme-link-color,#2a7); color:#fff;
+     cursor:pointer; }
   .back { font-size:13px; color: var(--tg-theme-link-color,#2a7);
           cursor:pointer; margin-bottom:10px; }
   .ref { float:right; font-variant-numeric:tabular-nums; opacity:.45;
@@ -2813,10 +2833,54 @@ async function loadAgent() {
     h += '<div class="empty">Nothing logged in this period.</div>';
   }
 
+  h += '<h2>Settings</h2>';
+  h += sw('avails', 'Chased for avails',
+          'Reminders and the not-yet-confirmed list', d.onAvails);
+  h += sw('tag', 'Tagged in the 8pm post',
+          'Named when tomorrow\'s shifts go out', d.tagCalls);
+  h += sw('hourly', 'Paid hourly',
+          'Off means salaried — hours recorded, no hourly pay', !d.salaried);
+
+  h += '<h2>Name on the board</h2>';
+  h += '<div class="nameedit">'
+    + `<input id="dispName" value="${esc(d.name)}">`
+    + '<button id="saveName">Save</button></div>';
+  if (d.username) h += `<div class="note">@${esc(d.username)} · ${esc(d.role)}</div>`;
+
   app.innerHTML = h + navBar();
   wire();
   const back = document.getElementById('toTeam');
   if (back) back.onclick = () => { AGENT = null; START = ''; render(); };
+
+  document.querySelectorAll('[data-sw]').forEach(el => {
+    el.onclick = async () => {
+      const on = !el.classList.contains('on');
+      el.classList.toggle('on', on);
+      const out = await post('/api/agent/set',
+        { id: AGENT, field: el.dataset.sw, value: on });
+      if (!out.ok) {
+        el.classList.toggle('on', !on);
+        toast(out.error || 'Could not change that.');
+        return;
+      }
+      toast(el.dataset.label + (on ? ' on' : ' off'));
+    };
+  });
+
+  const sn = document.getElementById('saveName');
+  if (sn) sn.onclick = async () => {
+    const v = document.getElementById('dispName').value;
+    const out = await post('/api/agent/set', { id: AGENT, field: 'name', value: v });
+    toast(out.ok ? 'Saved' : (out.error || 'Could not save that.'));
+    if (out.ok) await loadAgent();
+  };
+}
+
+function sw(field, label, hint, on) {
+  return '<div class="row"><div class="lbl">' + esc(label)
+    + '<small>' + esc(hint) + '</small></div>'
+    + `<div class="sw${on ? ' on' : ''}" data-sw="${field}" `
+    + `data-label="${esc(label)}"><i></i></div></div>`;
 }
 
 async function loadTeam() {
