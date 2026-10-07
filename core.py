@@ -1725,6 +1725,7 @@ STORES = [
     ("🇸🇬", "[SG]SHPBOWERS"),
     ("🇲🇾", "[MY]SHPSONOS"),
     ("🇹🇭", "THLAZSONOS"),
+    ("🇹🇭", "THSHPSONOS"),
 ]
 PRIORITIES = [("🟢", "Low"), ("🟠", "Medium"), ("🔴", "High")]
 PLATFORMS = ["DUOKE", "LIVECHAT"]
@@ -1750,6 +1751,7 @@ STORE_CHANNEL = {
     "[SG]SHPBOWERS": "SHOPEE_SG",
     "[MY]SHPSONOS": "SHOPEE_MY",
     "THLAZSONOS": "TH",
+    "THSHPSONOS": "TH",
 }
 
 
