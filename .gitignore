@@ -8,3 +8,10 @@ bot.env
 venv/
 __pycache__/
 *.pyc
+*.db-shm
+*.db-wal
+.DS_Store
+bot 2.py
+test.env
+run-test.sh
+test-data/

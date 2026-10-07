@@ -1,5 +1,7 @@
 """Entry point: starts the bot, schedules jobs, wires the commands up."""
 
+from __future__ import annotations
+
 from core import *  # noqa: F401,F403
 from core import db  # noqa: F401  (restore overwrites it in place)
 from board import *  # noqa: F401,F403
