@@ -481,7 +481,9 @@ def handover_payload(user_id: int) -> dict:
     )
 
     def shape(r, closed=False):
-        age = (today - date.fromisoformat(r["the_date"])).days
+        added = date.fromisoformat(r["the_date"])
+        age = (today - added).days
+        due = case_due(added, r["prio"])
         out = {
             "id": r["id"],
             "prio": r["prio"] or "",
@@ -494,6 +496,10 @@ def handover_payload(user_id: int) -> dict:
             "from": display_name_of(r["agent_id"], ""),
             "age": age,
             "stale": age >= 3,
+            "channel": r["channel"] or "",
+            "channelName": CHANNEL_NAMES.get(r["channel"] or "", ""),
+            "due": due.strftime("%a %-d %b"),
+            "sla": "" if closed else sla_mark(due, today),
         }
         if closed:
             out["closedBy"] = display_name_of(r["closed_by"], "") if r["closed_by"] else ""
@@ -506,7 +512,11 @@ def handover_payload(user_id: int) -> dict:
     return {
         "openCases": [shape(r) for r in open_rows],
         "closedCases": [shape(r, True) for r in closed_rows],
-        "stores": [{"flag": f, "store": st} for f, st in STORES],
+        "stores": [{"flag": f, "store": st,
+                    "channel": CHANNEL_NAMES.get(STORE_CHANNEL.get(st, ""), "")}
+                   for f, st in STORES],
+        "fields": [{"key": k, "label": lb, "required": req}
+                   for k, lb, req in CASE_FIELDS],
         "platforms": PLATFORMS,
         "priorities": [{"emoji": e, "name": n} for e, n in PRIORITIES],
         "nextWorking": next_working_day(today).strftime("%A %-d %b"),
@@ -519,21 +529,18 @@ def web_case_toggle(user_id: int, case_id: int, close: bool) -> dict:
     if not row:
         return {"ok": False, "error": "That case is gone."}
     if close:
-        run("UPDATE ho_cases SET closed=1, closed_by=?, closed_at=? WHERE id=?",
-            (user_id, now().isoformat(), case_id))
+        close_case(case_id, user_id)
     else:
-        run("UPDATE ho_cases SET closed=0, closed_by=NULL, closed_at=NULL "
-            "WHERE id=?", (case_id,))
+        reopen_case(case_id)
     return {"ok": True, "closed": close, "username": row["username"]}
 
 
 def web_case_add(user_id: int, c: dict) -> dict:
-    username = str(c.get("username", "")).strip()
-    body = str(c.get("body", "")).strip()
-    if not username:
-        return {"ok": False, "error": "Who's the customer?"}
-    if len(body) < 5:
-        return {"ok": False, "error": "Add a bit more detail to the case."}
+    d = {}
+    for key, label, required in CASE_FIELDS:
+        d[key] = str(c.get(key, "")).strip()
+        if required and len(d[key]) < 2:
+            return {"ok": False, "error": f"Fill in: {label}."}
 
     platform = str(c.get("platform", "")).strip().upper()
     if platform not in PLATFORMS:
@@ -541,7 +548,6 @@ def web_case_add(user_id: int, c: dict) -> dict:
     prio = str(c.get("prio", "")).strip()
     if prio not in [e for e, _ in PRIORITIES]:
         return {"ok": False, "error": "Pick how urgent it is."}
-    section = "follow" if c.get("section") == "follow" else "open"
 
     flag = store = ""
     if platform == "DUOKE":
@@ -551,24 +557,21 @@ def web_case_add(user_id: int, c: dict) -> dict:
             return {"ok": False, "error": "Pick a store."}
         flag, store = match[0]
 
-    run(
-        "INSERT INTO ho_cases (agent_id, the_date, section, prio, platform, flag,"
-        " store, username, body, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)",
-        (user_id, now().date().isoformat(), section, prio, platform, flag,
-         store, username, body, now().isoformat()),
-    )
-    return {"ok": True, "username": username}
+    d.update(section="follow" if c.get("section") == "follow" else "open",
+             prio=prio, platform=platform, flag=flag, store=store)
+    insert_case(user_id, d, now().date())
+    return {"ok": True, "username": d["username"]}
 
 
 def web_handover_post(user_id: int) -> dict:
     """Post whatever is open, noting what this person closed today."""
     today = now().date()
     cases = [case_row_to_dict(r) for r in
-             q("SELECT * FROM ho_cases WHERE closed=0 ORDER BY id")]
+             open_cases()]
     closed = [
         case_row_to_dict(r) for r in q(
-            "SELECT * FROM ho_cases WHERE closed=1 AND closed_by=? "
-            "AND closed_at >= ? ORDER BY closed_at",
+            "SELECT * FROM ho_cases WHERE sh_closed=1 AND sh_closed_by=? "
+            "AND sh_closed_at >= ? ORDER BY sh_closed_at",
             (user_id, today.isoformat()),
         )
     ]

@@ -445,6 +445,32 @@ for _col, _ddl in [
 ]:
     if _col not in _cols:
         db.execute(f"ALTER TABLE agents ADD COLUMN {_col} {_ddl}")
+# Handover cases: the Online channel, the case split into fields, and a
+# close tick for each side (SH and Online). `closed` stays as "fully closed".
+_hc_cols = {r[1] for r in db.execute("PRAGMA table_info(ho_cases)")}
+for _col, _ddl in [
+    ("channel", "TEXT"),
+    ("order_no", "TEXT"),
+    ("product", "TEXT"),
+    ("happened", "TEXT"),
+    ("done", "TEXT"),
+    ("need", "TEXT"),
+    ("sh_closed", "INTEGER NOT NULL DEFAULT 0"),
+    ("sh_closed_by", "INTEGER"),
+    ("sh_closed_at", "TEXT"),
+    ("on_closed", "INTEGER NOT NULL DEFAULT 0"),
+    ("on_closed_by", "INTEGER"),
+    ("on_closed_at", "TEXT"),
+]:
+    if _col not in _hc_cols:
+        db.execute(f"ALTER TABLE ho_cases ADD COLUMN {_col} {_ddl}")
+if "sh_closed" not in _hc_cols:
+    # Cases closed before the two ticks existed count as closed on both sides.
+    db.execute(
+        "UPDATE ho_cases SET sh_closed=1, sh_closed_by=closed_by, "
+        "sh_closed_at=closed_at, on_closed=1, on_closed_by=closed_by, "
+        "on_closed_at=closed_at WHERE closed=1"
+    )
 for _name, _cfg in SEED_PRESETS.items():
     db.execute(
         "INSERT OR IGNORE INTO presets (name, config) VALUES (?,?)",
@@ -1698,9 +1724,60 @@ STORES = [
     ("🇸🇬", "[SG]SGMARSHALL"),
     ("🇸🇬", "[SG]SHPBOWERS"),
     ("🇲🇾", "[MY]SHPSONOS"),
+    ("🇹🇭", "THLAZSONOS"),
 ]
 PRIORITIES = [("🟢", "Low"), ("🟠", "Medium"), ("🔴", "High")]
 PLATFORMS = ["DUOKE", "LIVECHAT"]
+
+# The Online team's channels, each with its own chat and platform manager.
+CHANNELS = [
+    ("SHOPEE_SG", "🇸🇬", "Shopee SG"),
+    ("SHOPEE_MY", "🇲🇾", "Shopee MY"),
+    ("LAZADA_SG", "🇸🇬", "Lazada SG"),
+    ("LAZADA_MY", "🇲🇾", "Lazada MY"),
+    ("TH", "🇹🇭", "TH"),
+    ("WEBSTORE", "🌐", "TC Webstore"),
+]
+CHANNEL_NAMES = {key: f"{flag} {name}" for key, flag, name in CHANNELS}
+STORE_CHANNEL = {
+    "SGLAZADASONOS": "LAZADA_SG",
+    "SGLAZMARSHALL": "LAZADA_SG",
+    "SGLAZBOWERS": "LAZADA_SG",
+    "MYLAZSONOS": "LAZADA_MY",
+    "MYLAZBOWERS": "LAZADA_MY",
+    "[SG]SHPSONOS": "SHOPEE_SG",
+    "[SG]SGMARSHALL": "SHOPEE_SG",
+    "[SG]SHPBOWERS": "SHOPEE_SG",
+    "[MY]SHPSONOS": "SHOPEE_MY",
+    "THLAZSONOS": "TH",
+}
+
+
+def channel_for(platform: str | None, store: str | None) -> str:
+    """Duoke cases go by store; Livechat is always the webstore."""
+    if (platform or "").upper() == "LIVECHAT":
+        return "WEBSTORE"
+    return STORE_CHANNEL.get(store or "", "")
+
+
+# What a case needs, in the order agents are asked. (key, label, required)
+CASE_FIELDS = [
+    ("username", "Customer username", True),
+    ("order_no", "Order number", True),
+    ("product", "Product", True),
+    ("happened", "What happened", True),
+    ("done", "What SH did", False),
+    ("need", "What's needed next", True),
+]
+
+
+def compose_body(d: dict) -> str:
+    """The case in the same shape agents have always written it."""
+    lines = [d["order_no"], d["product"], "", f"• {d['happened']}"]
+    if d.get("done"):
+        lines.append(f"• {d['done']}")
+    lines += ["", f"‼️Need Help: {d['need']}"]
+    return "\n".join(lines)
 
 
 def next_working_day(from_date: date) -> date:
@@ -1709,6 +1786,92 @@ def next_working_day(from_date: date) -> date:
     while d.weekday() >= 5:
         d += timedelta(days=1)
     return d
+
+
+# Working days each urgency gets: 🔴 the same day, 🟠 the next, 🟢 the one after.
+SLA_DAYS = {"🔴": 0, "🟠": 1, "🟢": 2}
+
+
+def case_due(the_date: date, prio: str | None) -> date:
+    """Worked out rather than stored, so changing SLA_DAYS updates every case."""
+    d = the_date
+    while d.weekday() >= 5:              # a weekend case starts on Monday
+        d += timedelta(days=1)
+    for _ in range(SLA_DAYS.get(prio or "", 2)):
+        d = next_working_day(d)
+    return d
+
+
+def sla_mark(due: date, today: date | None = None) -> str:
+    """⏰ due today, 🚨 overdue, nothing otherwise."""
+    today = today or now().date()
+    if today > due:
+        return "🚨"
+    return "⏰" if today == due else ""
+
+
+def online_covers(channel: str | None) -> bool:
+    """Whether a case on this channel also needs the Online team's tick.
+    No one has the Online role yet, so SH's tick alone closes a case."""
+    return False
+
+
+def insert_case(agent_id: int, d: dict, the_date: date) -> int:
+    """Save a new case. Fills in its channel and the written-out body."""
+    d["channel"] = channel_for(d["platform"], d.get("store"))
+    d["body"] = compose_body(d)
+    cur = run(
+        "INSERT INTO ho_cases (agent_id, the_date, section, prio, platform, flag,"
+        " store, username, body, channel, order_no, product, happened, done,"
+        " need, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (agent_id, the_date.isoformat(), d["section"], d["prio"], d["platform"],
+         d.get("flag", ""), d.get("store", ""), d["username"], d["body"],
+         d["channel"], d["order_no"], d["product"], d["happened"],
+         d.get("done") or None, d["need"], now().isoformat()),
+    )
+    return cur.lastrowid
+
+
+def close_case(case_id: int, user_id: int, side: str = "sh") -> None:
+    """Tick one side closed. Fully closed once both sides are, or once SH is
+    if the Online team doesn't cover that channel."""
+    if side not in ("sh", "on"):
+        raise ValueError(side)
+    ts = now().isoformat()
+    run(
+        f"UPDATE ho_cases SET {side}_closed=1, {side}_closed_by=?, "
+        f"{side}_closed_at=? WHERE id=?",
+        (user_id, ts, case_id),
+    )
+    row = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    if row and row["sh_closed"] and (
+        row["on_closed"] or not online_covers(row["channel"])
+    ):
+        run(
+            "UPDATE ho_cases SET closed=1, closed_by=?, closed_at=? WHERE id=?",
+            (user_id, ts, case_id),
+        )
+
+
+def reopen_case(case_id: int) -> None:
+    """Back to open on both sides."""
+    run(
+        "UPDATE ho_cases SET closed=0, closed_by=NULL, closed_at=NULL, "
+        "sh_closed=0, sh_closed_by=NULL, sh_closed_at=NULL, "
+        "on_closed=0, on_closed_by=NULL, on_closed_at=NULL WHERE id=?",
+        (case_id,),
+    )
+
+
+# Sort cases from before channels existed into one, by their store.
+for _r in db.execute(
+    "SELECT id, platform, store FROM ho_cases WHERE channel IS NULL"
+).fetchall():
+    db.execute(
+        "UPDATE ho_cases SET channel=? WHERE id=?",
+        (channel_for(_r[1], _r[2]), _r[0]),
+    )
+db.commit()
 
 
 def render_case(c: dict) -> str:
@@ -1789,8 +1952,8 @@ def handover_keyboard(running=None) -> InlineKeyboardMarkup:
 
 
 def open_cases() -> list:
-    """Cases still live, oldest first."""
-    return q("SELECT * FROM ho_cases WHERE closed=0 ORDER BY id")
+    """Cases still live on SH's side, oldest first."""
+    return q("SELECT * FROM ho_cases WHERE closed=0 AND sh_closed=0 ORDER BY id")
 
 
 def case_row_to_dict(r) -> dict:
@@ -2512,14 +2675,17 @@ function caseCard(c, closed) {
   h += `<div class="tick${closed ? '' : ' on'}" data-id="${c.id}" `
      + `data-close="${closed ? '0' : '1'}">${closed ? '' : '✓'}</div>`;
   h += '<div style="flex:1">';
-  h += `<div class="nm">${esc(c.prio)} ${esc(c.username)}</div>`;
+  h += `<div class="nm">${c.sla ? c.sla + ' ' : ''}${esc(c.prio)} ${esc(c.username)}</div>`;
   const bits = [];
+  if (c.channelName) bits.push(esc(c.channelName));
   if (c.platform) bits.push('▫️' + esc(c.platform));
   if (c.store) bits.push(esc(c.flag) + esc(c.store));
   if (c.from) bits.push('from ' + esc(c.from));
   if (closed && c.closedBy) bits.push('closed by ' + esc(c.closedBy));
   if (closed && c.closedWhen) bits.push(esc(c.closedWhen));
-  else if (c.age) bits.push(`<span class="${c.stale ? 'stale' : ''}">${c.age}d${c.stale ? ' ⏳' : ''}</span>`);
+  else if (c.due) bits.push(`<span class="${c.sla ? 'stale' : ''}">`
+    + (c.sla === '🚨' ? 'overdue, was due ' : c.sla ? 'due today, ' : 'due ')
+    + `${esc(c.due)}</span>`);
   if (c.section === 'follow') bits.push('follow up');
   h += `<div class="meta">${bits.join(' · ')}</div>`;
   h += '</div></div>';
@@ -2552,13 +2718,27 @@ function caseForm(d) {
     h += '<div class="fld"><label>Store</label><select id="store">'
       + '<option value="">Pick one…</option>'
       + d.stores.map(s =>
-          `<option value="${esc(s.store)}"${f.store === s.store ? ' selected' : ''}>${esc(s.flag)}${esc(s.store)}</option>`
+          `<option value="${esc(s.store)}"${f.store === s.store ? ' selected' : ''}>${esc(s.flag)}${esc(s.store)} · ${esc(s.channel)}</option>`
         ).join('') + '</select></div>';
   }
-  h += `<div class="fld"><label>Customer username</label>`
-    + `<input id="username" value="${esc(f.username || '')}" placeholder="kiemmengkoo"></div>`;
-  h += '<div class="fld"><label>The case</label>'
-    + `<textarea id="body" placeholder="2609046GFY4T9B\nSonos Move Gen 2\n\n• what happened\n• what you did\n\n‼️Need Help: what's needed next">${esc(f.body || '')}</textarea></div>`;
+  if (f.platform === 'LIVECHAT') {
+    h += '<div class="note" style="margin-top:0">Goes to 🌐 TC Webstore</div>';
+  }
+  const tips = {
+    username: 'kiemmengkoo', order_no: '2609046GFY4T9B',
+    product: 'Sonos Move Gen 2', happened: "Customer says the speaker won't charge",
+    done: 'Asked for a photo of the charging light',
+    need: 'Arrange a replacement once the photo comes in',
+  };
+  const long = { happened: 1, done: 1, need: 1 };
+  for (const fd of d.fields) {
+    const v = esc(f[fd.key] || '');
+    h += `<div class="fld"><label>${esc(fd.label)}${fd.required ? '' : ' (optional)'}</label>`;
+    h += long[fd.key]
+      ? `<textarea id="f_${fd.key}" rows="2" placeholder="${esc(tips[fd.key])}">${v}</textarea>`
+      : `<input id="f_${fd.key}" value="${v}" placeholder="${esc(tips[fd.key])}">`;
+    h += '</div>';
+  }
   h += '<button class="big" id="saveCase">Save this case</button>';
   h += '<button class="big" id="cancelCase" style="background:var(--tg-theme-secondary-bg-color,#eee);color:var(--tg-theme-text-color,#111);margin-top:8px">Cancel</button>';
   return h;
@@ -2622,7 +2802,7 @@ function wireHandover() {
 
   const nc = document.getElementById('newCase');
   if (nc) nc.onclick = () => {
-    HO_FORM = { section: 'open', prio: '', platform: '', store: '', username: '', body: '' };
+    HO_FORM = { section: 'open', prio: '', platform: '', store: '' };
     loadHandover();
   };
   const cc = document.getElementById('cancelCase');
@@ -2673,11 +2853,11 @@ function wireHandover() {
 
 function keepForm() {
   if (!HO_FORM) return;
-  const u = document.getElementById('username');
-  const b = document.getElementById('body');
+  for (const fd of (HO && HO.fields) || []) {
+    const el = document.getElementById('f_' + fd.key);
+    if (el) HO_FORM[fd.key] = el.value;
+  }
   const st = document.getElementById('store');
-  if (u) HO_FORM.username = u.value;
-  if (b) HO_FORM.body = b.value;
   if (st) HO_FORM.store = st.value;
 }
 

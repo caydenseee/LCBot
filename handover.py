@@ -118,10 +118,7 @@ async def on_handover_none(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     cleared = [case_row_to_dict(c) for c in open_cases()]
     async with write_lock:
         for c in open_cases():
-            run(
-                "UPDATE ho_cases SET closed=1, closed_by=?, closed_at=? WHERE id=?",
-                (user.id, now().isoformat(), c["id"]),
-            )
+            close_case(c["id"], user.id)
         run(
             "INSERT INTO handovers (agent_id, the_date, body, created_at) "
             "VALUES (?,?,?,?)",
@@ -144,14 +141,14 @@ def case_picker(keep: set) -> InlineKeyboardMarkup:
     for c in open_cases():
         mark = "✅" if c["id"] in keep else "☑️"
         who = display_name_of(c["agent_id"], "")
-        age = (now().date() - date.fromisoformat(c["the_date"])).days
+        due = case_due(date.fromisoformat(c["the_date"]), c["prio"])
         label = f"{mark} {c['prio']} {c['username']}"
+        if c["channel"]:
+            label += f" · {CHANNEL_NAMES.get(c['channel'], '')}"
         if who:
             label += f" · {who.split()[0]}"
-        if age >= 3:
-            label += f" · {age}d ⏳"
-        elif age:
-            label += f" · {age}d"
+        if sla_mark(due):
+            label += f" · {sla_mark(due)}"
         rows.append([InlineKeyboardButton(label[:60], callback_data=f"hk:{c['id']}")])
     rows.append([InlineKeyboardButton("➕ Add a new case", callback_data="hk:new")])
     rows.append([InlineKeyboardButton("📤 Post handover", callback_data="hk:post")])
@@ -212,21 +209,10 @@ async def finish_handover(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             if c["id"] in keep:
                 cases.append(case_row_to_dict(c))
             else:
-                run(
-                    "UPDATE ho_cases SET closed=1, closed_by=?, closed_at=? "
-                    "WHERE id=?",
-                    (user.id, now().isoformat(), c["id"]),
-                )
+                close_case(c["id"], user.id)
                 closed.append(case_row_to_dict(c))
         for d in new_cases:
-            run(
-                "INSERT INTO ho_cases (agent_id, the_date, section, prio, platform,"
-                " flag, store, username, body, created_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (user.id, today.isoformat(), d["section"], d["prio"],
-                 d["platform"], d["flag"], d["store"], d["username"], d["body"],
-                 now().isoformat()),
-            )
+            insert_case(user.id, d, today)
             cases.append(d)
         run(
             "INSERT INTO handovers (agent_id, the_date, body, created_at) "
@@ -338,24 +324,45 @@ async def show_store(query, context) -> int:
     return HO_STORE
 
 
-async def ask_for_case(query, context) -> int:
-    """The last step — they type the case itself."""
-    d = context.user_data["ho_draft"]
+def case_head(d: dict) -> str:
     head = f"{d['prio']} ▫️{d['platform']}"
     if d.get("store"):
         head += f" · {d['flag']}{d['store']}"
+    channel = channel_for(d["platform"], d.get("store"))
+    if channel:
+        head += f"\n{CHANNEL_NAMES[channel]}"
+    return head
+
+
+def field_prompt(d: dict) -> str:
+    """The question for the step the draft is on."""
+    step = d.get("_step", 0)
+    _, label, required = CASE_FIELDS[step]
+    examples = {
+        "username": "kiemmengkoo",
+        "order_no": "2609046GFY4T9B",
+        "product": "Sonos Move Gen 2",
+        "happened": "Customer says the speaker won't charge",
+        "done": "Asked for a photo of the charging light",
+        "need": "Arrange a replacement once the photo comes in",
+    }
+    key = CASE_FIELDS[step][0]
+    tail = "/skip if nothing · " if not required else ""
+    return (
+        f"{case_head(d)}\n\n"
+        f"<b>{step + 1}/{len(CASE_FIELDS)} · {label}</b>"
+        f"{'' if required else ' (optional)'}\n"
+        f"<i>e.g. {esc(examples[key])}</i>\n\n"
+        f"<i>{tail}/back to change the last answer · /cancel to stop</i>"
+    )
+
+
+async def ask_for_case(query, context) -> int:
+    """After the buttons, ask for each part of the case in turn."""
+    d = context.user_data["ho_draft"]
+    d["_step"] = 0
     await query.edit_message_text(
-        f"{head}\n\n"
-        "<b>Now send the case.</b>\n"
-        "First line = the customer's username. Then the rest as you'd write it:"
-        "\n\n<code>kiemmengkoo\n"
-        "2609046GFY4T9B\n"
-        "Sonos Move Gen 2\n\n"
-        "• what happened\n"
-        "• what you did\n\n"
-        "‼️Need Help: what's needed next</code>\n\n"
-        "<i>/back to change the last answer · /cancel to stop</i>",
-        parse_mode=constants.ParseMode.HTML,
+        field_prompt(d), parse_mode=constants.ParseMode.HTML
     )
     return HO_BODY
 
@@ -434,8 +441,14 @@ async def on_ho_store(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
 
 async def on_ho_back_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """/back while typing the case — return to the step before it."""
+    """/back while typing — the previous question, or the buttons before them."""
     d = context.user_data.get("ho_draft", {})
+    if d.get("_step", 0) > 0:
+        d["_step"] -= 1
+        await update.message.reply_text(
+            field_prompt(d), parse_mode=constants.ParseMode.HTML
+        )
+        return HO_BODY
     rows = [[InlineKeyboardButton("◀️ Yes, change it", callback_data="hf:back")],
             [InlineKeyboardButton("✖️ Cancel the handover",
                                   callback_data="hf:cancel")]]
@@ -449,23 +462,51 @@ async def on_ho_back_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def on_ho_body(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """One answer per message, until every required part is in."""
+    d = context.user_data["ho_draft"]
+    step = d.get("_step", 0)
+    key, label, _ = CASE_FIELDS[step]
     text = update.message.text.strip()
-    parts = text.split("\n", 1)
-    if len(parts) < 2 or len(parts[1].strip()) < 5:
+    if len(text) < 2:
         await update.message.reply_text(
-            "I need the username on the first line, then the case below it. "
-            "Try again, or /cancel."
+            f"I need the {label.lower()} here. Try again, or /cancel."
+        )
+        return HO_BODY
+    d[key] = text
+    return await next_field(update, context)
+
+
+async def on_ho_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """/skip — only for the optional parts."""
+    d = context.user_data["ho_draft"]
+    key, label, required = CASE_FIELDS[d.get("_step", 0)]
+    if required:
+        await update.message.reply_text(
+            f"{label} can't be skipped, the Online team needs it. "
+            "Type it in, or /cancel."
+        )
+        return HO_BODY
+    d[key] = ""
+    return await next_field(update, context)
+
+
+async def next_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    d = context.user_data["ho_draft"]
+    d["_step"] = d.get("_step", 0) + 1
+    if d["_step"] < len(CASE_FIELDS):
+        await update.message.reply_text(
+            field_prompt(d), parse_mode=constants.ParseMode.HTML
         )
         return HO_BODY
 
-    d = context.user_data["ho_draft"]
-    d["username"] = parts[0].strip()
-    d["body"] = parts[1].strip()
+    d.pop("_step", None)
+    d["body"] = compose_body(d)
     context.user_data.setdefault("ho_cases", []).append(d)
+    context.user_data.pop("ho_draft", None)
     n = len(context.user_data["ho_cases"])
-
     await update.message.reply_text(
-        f"✅ Case saved ({n} new this shift).",
+        f"✅ Case saved ({n} new this shift).\n\n"
+        f"{case_head(d)}\n{d['username']}\n{d['body']}",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ Add another case", callback_data="hm:more")],
             [InlineKeyboardButton("📤 Post handover", callback_data="hm:post")],

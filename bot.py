@@ -854,6 +854,7 @@ def main() -> None:
                 HO_STORE: [CallbackQueryHandler(on_ho_store, pattern=r"^hb:")],
                 HO_BODY: [
                     CommandHandler("back", on_ho_back_cmd),
+                    CommandHandler("skip", on_ho_skip),
                     CallbackQueryHandler(on_ho_platform, pattern=r"^hf:"),
                     CallbackQueryHandler(on_ho_store, pattern=r"^hb:"),
                     MessageHandler(filters.TEXT & ~filters.COMMAND, on_ho_body),
