@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Which repo to work through
 
-- **Database-related work** (schemas, warehouse tables, data pipelines, queries against company data): go through https://github.com/tcacoustic/tc-data-warehouse
+- **Database-related work** (schemas, warehouse tables, data pipelines, queries against company data): go through the separate data warehouse repo, not this one
 - **Everything else** (this bot's code, features, fixes): go through https://github.com/caydenseee/LCBot (this repo's `origin`)
 
 ## What this is
