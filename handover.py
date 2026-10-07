@@ -328,9 +328,8 @@ def case_head(d: dict) -> str:
     head = f"{d['prio']} ▫️{d['platform']}"
     if d.get("store"):
         head += f" · {d['flag']}{d['store']}"
-    channel = channel_for(d["platform"], d.get("store"))
-    if channel:
-        head += f"\n{CHANNEL_NAMES[channel]}"
+    if d["platform"] == "LIVECHAT":          # the store already says where else
+        head += f" · {CHANNEL_NAMES['WEBSTORE']}"
     return head
 
 

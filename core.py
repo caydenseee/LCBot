@@ -1720,12 +1720,12 @@ STORES = [
     ("🇸🇬", "SGLAZBOWERS"),
     ("🇲🇾", "MYLAZSONOS"),
     ("🇲🇾", "MYLAZBOWERS"),
+    ("🇹🇭", "THLAZSONOS"),
     ("🇸🇬", "[SG]SHPSONOS"),
     ("🇸🇬", "[SG]SGMARSHALL"),
     ("🇸🇬", "[SG]SHPBOWERS"),
     ("🇲🇾", "[MY]SHPSONOS"),
-    ("🇹🇭", "THLAZSONOS"),
-    ("🇹🇭", "THSHPSONOS"),
+    ("🇹🇭", "[TH]SHPSONOS"),
 ]
 PRIORITIES = [("🟢", "Low"), ("🟠", "Medium"), ("🔴", "High")]
 PLATFORMS = ["DUOKE", "LIVECHAT"]
@@ -1751,7 +1751,7 @@ STORE_CHANNEL = {
     "[SG]SHPBOWERS": "SHOPEE_SG",
     "[MY]SHPSONOS": "SHOPEE_MY",
     "THLAZSONOS": "TH",
-    "THSHPSONOS": "TH",
+    "[TH]SHPSONOS": "TH",
 }
 
 
