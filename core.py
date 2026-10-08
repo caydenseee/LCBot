@@ -35,6 +35,7 @@ from telegram import (
     BotCommand,
     KeyboardButton,
     ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
     MenuButtonWebApp,
     WebAppInfo,
     BotCommandScopeAllGroupChats,
@@ -442,6 +443,7 @@ for _col, _ddl in [
     ("requested_at", "TEXT"),
     ("decided_by", "INTEGER"),
     ("decided_at", "TEXT"),
+    ("channels", "TEXT"),            # Online team: JSON list of channel keys
 ]:
     if _col not in _cols:
         db.execute(f"ALTER TABLE agents ADD COLUMN {_col} {_ddl}")
@@ -467,12 +469,23 @@ for _col, _ddl in [
 for _col, _ddl in [
     ("chat_posted", "INTEGER NOT NULL DEFAULT 0"),
     ("post_id", "INTEGER"),
+    ("handed_back", "INTEGER NOT NULL DEFAULT 0"),
 ]:
     if _col not in _hc_cols:
         db.execute(f"ALTER TABLE ho_cases ADD COLUMN {_col} {_ddl}")
 if "chat_posted" not in _hc_cols:
     # Only cases added from now on go to the store chats.
     db.execute("UPDATE ho_cases SET chat_posted=1")
+# Who did what to a case, and any note they left.
+db.execute("""CREATE TABLE IF NOT EXISTS case_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_id    INTEGER NOT NULL,
+    user_id    INTEGER,
+    side       TEXT,
+    action     TEXT NOT NULL,
+    note       TEXT,
+    created_at TEXT NOT NULL
+)""")
 # One message in a store's chat, listing new cases from one handover.
 db.execute("""CREATE TABLE IF NOT EXISTS channel_posts (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1009,6 +1022,16 @@ def admin_ids() -> list:
     return sorted(ids)
 
 
+def is_online(user_id: int) -> bool:
+    """The Online team: platform managers who only see handover cases."""
+    return role_of(user_id) == "online"
+
+
+def online_channels(user_id: int) -> list:
+    row = q1("SELECT channels FROM agents WHERE user_id=?", (user_id,))
+    return json.loads(row["channels"]) if row and row["channels"] else []
+
+
 def role_of(user_id: int) -> str:
     if is_owner(user_id):
         return "owner"
@@ -1157,7 +1180,7 @@ def apply_fixed_slots(week_id: int) -> int:
 
 
 def week_stats(week_id: int) -> dict:
-    roster = q("SELECT * FROM agents WHERE status='active' AND on_avails=1")
+    roster = q("SELECT * FROM agents WHERE status='active' AND role<>'online' AND on_avails=1")
     confirmed = {
         r["user_id"] for r in q("SELECT user_id FROM confirmations WHERE week_id=?", (week_id,))
     }
@@ -1676,10 +1699,18 @@ OT_WHEN = 260
 SWAP_PICK, SWAP_WHO, SWAP_REASON = 240, 241, 242
 
 
+ONLINE_ONLY = ("That's for the SH team. Use /cases to see your open cases, "
+               "or /help.")
+
+
 async def gate(update: Update) -> bool:
     """True if this person may use the bot. Replies if not."""
     uid = update.effective_user.id
     status = agent_status(uid)
+    if status == "active" and is_online(uid):
+        if update.message:
+            await update.message.reply_text(ONLINE_ONLY)
+        return False
     if status == "active":
         return True
     msg = {
@@ -1694,6 +1725,9 @@ async def gate(update: Update) -> bool:
 async def gate_cb(query) -> bool:
     """Same, for button taps."""
     status = agent_status(query.from_user.id)
+    if status == "active" and is_online(query.from_user.id):
+        await query.answer(ONLINE_ONLY, show_alert=True)
+        return False
     if status == "active":
         return True
     msg = {
@@ -1882,9 +1916,32 @@ def sla_mark(due: date, today: date | None = None) -> str:
 
 
 def online_covers(channel: str | None) -> bool:
-    """Whether a case on this channel also needs the Online team's tick.
-    No one has the Online role yet, so SH's tick alone closes a case."""
-    return False
+    """Whether a case on this channel also needs the Online team's tick:
+    true once someone in the Online role looks after that channel."""
+    if not channel:
+        return False
+    return any(
+        channel in json.loads(r["channels"] or "[]")
+        for r in q("SELECT channels FROM agents WHERE role='online' "
+                   "AND status='active' AND channels IS NOT NULL")
+    )
+
+
+def log_case(case_id: int, user_id: int | None, side: str, action: str,
+             note: str = "") -> None:
+    run("INSERT INTO case_log (case_id, user_id, side, action, note, created_at)"
+        " VALUES (?,?,?,?,?,?)",
+        (case_id, user_id, side, action, note or None, now().isoformat()))
+
+
+def latest_note(case_id: int):
+    """The newest note left on a case, or None."""
+    return q1("SELECT * FROM case_log WHERE case_id=? AND note IS NOT NULL "
+              "ORDER BY id DESC LIMIT 1", (case_id,))
+
+
+def case_history(case_id: int) -> list:
+    return q("SELECT * FROM case_log WHERE case_id=? ORDER BY id", (case_id,))
 
 
 def insert_case(agent_id: int, d: dict, the_date: date) -> int:
@@ -1911,9 +1968,10 @@ def close_case(case_id: int, user_id: int, side: str = "sh") -> None:
     ts = now().isoformat()
     run(
         f"UPDATE ho_cases SET {side}_closed=1, {side}_closed_by=?, "
-        f"{side}_closed_at=? WHERE id=?",
+        f"{side}_closed_at=?, handed_back=0 WHERE id=?",
         (user_id, ts, case_id),
     )
+    log_case(case_id, user_id, side, "closed")
     row = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
     if row and row["sh_closed"] and (
         row["on_closed"] or not online_covers(row["channel"])
@@ -1924,7 +1982,7 @@ def close_case(case_id: int, user_id: int, side: str = "sh") -> None:
         )
 
 
-def reopen_case(case_id: int) -> None:
+def reopen_case(case_id: int, user_id: int | None = None) -> None:
     """Back to open on both sides."""
     run(
         "UPDATE ho_cases SET closed=0, closed_by=NULL, closed_at=NULL, "
@@ -1932,6 +1990,32 @@ def reopen_case(case_id: int) -> None:
         "on_closed=0, on_closed_by=NULL, on_closed_at=NULL WHERE id=?",
         (case_id,),
     )
+    log_case(case_id, user_id, "on" if user_id and is_online(user_id)
+             else "sh", "reopened")
+
+
+def force_close_case(case_id: int, admin_id: int) -> None:
+    """Admins: close both sides when one side never will."""
+    ts = now().isoformat()
+    run(
+        "UPDATE ho_cases SET closed=1, closed_by=?, closed_at=?, handed_back=0, "
+        "sh_closed=1, sh_closed_by=COALESCE(sh_closed_by, ?), "
+        "sh_closed_at=COALESCE(sh_closed_at, ?), "
+        "on_closed=1, on_closed_by=COALESCE(on_closed_by, ?), "
+        "on_closed_at=COALESCE(on_closed_at, ?) WHERE id=?",
+        (admin_id, ts, admin_id, ts, admin_id, ts, case_id),
+    )
+    log_case(case_id, admin_id, "admin", "force closed")
+
+
+def hand_back_case(case_id: int, user_id: int, note: str) -> None:
+    """Online needs something from SH: open it again on SH's side, flagged."""
+    run(
+        "UPDATE ho_cases SET handed_back=1, closed=0, closed_by=NULL, "
+        "closed_at=NULL, sh_closed=0, sh_closed_by=NULL, sh_closed_at=NULL "
+        "WHERE id=?", (case_id,),
+    )
+    log_case(case_id, user_id, "on", "handed back", note)
 
 
 def parse_channel(text: str) -> str | None:
@@ -1957,12 +2041,22 @@ def case_status_line(r) -> str:
         when = (datetime.fromisoformat(r["closed_at"]).strftime("%-d %b %H:%M")
                 if r["closed_at"] else "")
         return "✅ Closed" + (f" by {who}" if who else "") + (f" · {when}" if when else "")
+    if r["handed_back"]:
+        return "↩️ Handed back to SH"
     if r["sh_closed"]:
         return "☑️ SH closed · ⬜ waiting on Online"
     if r["on_closed"]:
         return "☑️ Online closed · ⬜ waiting on SH"
     due = case_due(date.fromisoformat(r["the_date"]), r["prio"])
     return f"🔸 Open · due {due.strftime('%a %-d %b')}"
+
+
+def note_line(case_id: int) -> str:
+    n = latest_note(case_id)
+    if not n:
+        return ""
+    when = datetime.fromisoformat(n["created_at"]).strftime("%-d %b %H:%M")
+    return f"📝 {when} · {display_name_of(n['user_id'], '')}: {n['note']}"
 
 
 def render_channel_post(post_id: int) -> str:
@@ -1973,8 +2067,12 @@ def render_channel_post(post_id: int) -> str:
     out = [f"📋 Handover · {CHANNEL_NAMES.get(p['channel'], p['channel'])}",
            f"{day}" + (f" · from {who}" if who else "")]
     for r in cases:
-        out += ["", "──────────", case_status_line(r),
-                render_case(case_row_to_dict(r))]
+        out += ["", "──────────", case_status_line(r)]
+        if note_line(r["id"]):
+            out.append(note_line(r["id"]))
+        c = case_row_to_dict(r)
+        c["handback"] = ""                  # the note line already says it
+        out.append(render_case(c))
     return "\n".join(out)
 
 
@@ -2075,7 +2173,10 @@ def render_case(c: dict) -> str:
     lines = [f"▫️{c['platform']}", f"{c['prio']} {c['username']}"]
     if c.get("store"):                       # Duoke only — Livechat has no brands
         lines.append(f"{c.get('flag', '')}{c['store']}")
-    return "\n".join(lines) + "\n" + c["body"].strip()
+    out = "\n".join(lines) + "\n" + c["body"].strip()
+    if c.get("handback"):
+        out += f"\n↩️ Handed back by {c['handback']}"
+    return out
 
 
 def render_handover(cases: list, who: str, the_date: date,
@@ -2150,7 +2251,13 @@ def open_cases() -> list:
 
 
 def case_row_to_dict(r) -> dict:
+    back = ""
+    if r["handed_back"]:
+        n = latest_note(r["id"])
+        if n:
+            back = f"{display_name_of(n['user_id'], 'Online')}: {n['note']}"
     return {
+        "handback": back,
         "section": r["section"], "prio": r["prio"], "platform": r["platform"],
         "flag": r["flag"], "store": r["store"], "username": r["username"],
         "body": r["body"],
@@ -2418,6 +2525,8 @@ ADMIN_GROUPS = [
         ("dropreqs", "Shift requests waiting"),
         ("handovers", "Recent closing handovers"),
         ("linkchat", "Link a store's chat to its cases"),
+        ("cases", "Open cases — close, note, force close"),
+        ("channels", "Online team and the channels they cover"),
         ("access", "Who approved or declined whom"),
         ("roster", "Who's on the list"),
         ("rename", "Fix someone's name on the schedule"),
@@ -2456,10 +2565,28 @@ ADMIN_COMMANDS = AGENT_COMMANDS + [
 ]
 
 
+ONLINE_HELP = (
+    "👋 <b>Online team</b>\n\n"
+    "/cases — open handover cases, your channels first. Tap one to:\n"
+    "  ✅ close it on your side\n"
+    "  📝 add a note (what's done, what's next)\n"
+    "  ↩️ hand it back to SH if you need something from them\n"
+    "/help — this list again\n\n"
+    "<i>A case is fully closed once both SH and Online have ticked it.</i>"
+)
+
+ONLINE_COMMANDS = [
+    ("cases", "Open cases for your channels"),
+    ("help", "List commands"),
+]
+
+
 async def refresh_menu_for(bot, user_id: int) -> None:
     """Re-publish one person's menu after their role changes."""
     role = role_of(user_id)
     pairs = ADMIN_COMMANDS if role in ("admin", "owner") else AGENT_COMMANDS
+    if role == "online":
+        pairs = ONLINE_COMMANDS
     if role == "owner":
         pairs = pairs + OWNER_EXTRA
     try:
@@ -2487,7 +2614,8 @@ async def publish_command_menus(app: Application) -> None:
             )
             elevated = set(ADMIN_IDS) | {
                 r["user_id"]
-                for r in q("SELECT user_id FROM agents WHERE role='admin' AND active=1")
+                for r in q("SELECT user_id FROM agents WHERE role IN ('admin', "
+                           "'online') AND active=1")
             }
             for uid in elevated:
                 await refresh_menu_for(bot, uid)

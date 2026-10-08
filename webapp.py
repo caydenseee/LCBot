@@ -137,7 +137,7 @@ def team_payload(first: date, mode: str = "month") -> dict:
     conn.row_factory = sqlite3.Row
     try:
         agents = conn.execute(
-            "SELECT user_id, display_name, name FROM agents WHERE status='active' "
+            "SELECT user_id, display_name, name FROM agents WHERE status='active' AND role<>'online' "
             "ORDER BY name"
         ).fetchall()
     finally:
@@ -535,7 +535,7 @@ def web_case_toggle(user_id: int, case_id: int, close: bool) -> dict:
     if close:
         close_case(case_id, user_id)
     else:
-        reopen_case(case_id)
+        reopen_case(case_id, user_id)
     on_bot_loop(refresh_case_post(bot_ref(), case_id))
     return {"ok": True, "closed": close, "username": row["username"]}
 
@@ -719,12 +719,13 @@ def web_has_access(user_id: int) -> bool:
     conn = sqlite3.connect(DB_PATH, timeout=5)
     try:
         row = conn.execute(
-            "SELECT status FROM agents WHERE user_id=?", (user_id,)
+            "SELECT status, role FROM agents WHERE user_id=?", (user_id,)
         ).fetchone()
     finally:
         conn.close()
     if row:
-        return row[0] == "active"
+        # The Online team uses /cases for now; the app is SH's.
+        return row[0] == "active" and row[1] != "online"
     return not ADMIN_IDS
 
 

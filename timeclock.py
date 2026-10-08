@@ -557,7 +557,7 @@ def week_report(first: date, last: date) -> str:
     # ---- hours and pay per agent
     people = []
     total_min = total_cents = 0
-    for a in q("SELECT * FROM agents WHERE status='active' ORDER BY name"):
+    for a in q("SELECT * FROM agents WHERE status='active' AND role<>'online' ORDER BY name"):
         t = timesheet(a["user_id"], first, last)
         revs = len(reviews_for(a["user_id"], first, last))
         if not t["shifts"] and not revs and not t["open"]:
@@ -1043,7 +1043,7 @@ async def cmd_timesheet(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     lines = [f"🕐 <b>Team hours — {esc(span)}</b>", ""]
     total_min = total_cents = 0
     any_rows = False
-    for a in q("SELECT * FROM agents WHERE status='active' ORDER BY name"):
+    for a in q("SELECT * FROM agents WHERE status='active' AND role<>'online' ORDER BY name"):
         t = timesheet(a["user_id"], first, last)
         if not t["shifts"] and not t["open"]:
             continue

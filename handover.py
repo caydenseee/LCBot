@@ -203,11 +203,15 @@ async def on_handover_none(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 def case_picker(keep: set) -> InlineKeyboardMarkup:
     rows = []
-    for c in open_cases():
+    for c in sorted(open_cases(), key=lambda r: (not r["handed_back"], r["id"])):
         mark = "✅" if c["id"] in keep else "☑️"
         who = display_name_of(c["agent_id"], "")
         due = case_due(date.fromisoformat(c["the_date"]), c["prio"])
         label = f"{mark} {c['prio']} {c['username']}"
+        if c["handed_back"]:
+            label = f"↩️ {label}"
+        elif c["on_closed"]:
+            label += " · ☑️ON"
         if c["channel"]:
             label += f" · {CHANNEL_NAMES.get(c['channel'], '')}"
         if who:
@@ -715,3 +719,202 @@ async def cmd_handovers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await reply_long(update.message, 
         "\n".join(lines), parse_mode=constants.ParseMode.HTML
     )
+
+
+# --------------------------------------------------------------------------
+# /cases — the Online team's view of handover cases
+# --------------------------------------------------------------------------
+
+CASE_NOTE = 270
+
+
+def may_see_cases(user_id: int) -> bool:
+    return is_online(user_id) or is_admin(user_id)
+
+
+def case_button_label(r) -> str:
+    due = case_due(date.fromisoformat(r["the_date"]), r["prio"])
+    label = f"{r['prio']} {r['username']} · {CHANNEL_NAMES.get(r['channel'] or '', '?')}"
+    if r["handed_back"]:
+        label = "↩️ " + label
+    elif r["sh_closed"]:
+        label += " · ☑️SH"
+    elif r["on_closed"]:
+        label += " · ☑️ON"
+    if sla_mark(due):
+        label += f" {sla_mark(due)}"
+    return label[:60]
+
+
+def cases_list(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    mine = set(online_channels(user_id))
+    rows = q("SELECT * FROM ho_cases WHERE closed=0 ORDER BY id")
+    own = [r for r in rows if r["channel"] in mine]
+    rest = [r for r in rows if r["channel"] not in mine]
+    if not rows:
+        return "📋 <b>Open cases</b>\n\nNothing open right now 🎉", None
+    lines = ["📋 <b>Open cases</b>", ""]
+    if mine:
+        lines.append(f"Your channels: {len(own)} · Others: {len(rest)}")
+    else:
+        lines.append(f"{len(rows)} open")
+    lines += ["", "↩️ handed back to SH · ☑️SH / ☑️ON one side has closed it",
+              "⏰ due today · 🚨 overdue", "", "<i>Tap a case to open it.</i>"]
+    buttons = []
+    for group, title in ((own, "— Your channels —"), (rest, "— Other channels —")):
+        if not group:
+            continue
+        if mine:
+            buttons.append([InlineKeyboardButton(title, callback_data="cs:l")])
+        buttons += [[InlineKeyboardButton(case_button_label(r),
+                                          callback_data=f"cs:v:{r['id']}")]
+                    for r in group]
+    buttons.append([InlineKeyboardButton("🔄 Refresh", callback_data="cs:l")])
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
+
+
+def case_view(case_id: int, user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    if not r:
+        return "That case is gone.", InlineKeyboardMarkup(
+            [[InlineKeyboardButton("◀️ All cases", callback_data="cs:l")]])
+    c = case_row_to_dict(r)
+    c["handback"] = ""
+    lines = [case_status_line(r)]
+    if r["sh_closed"] and not r["closed"]:
+        lines.append(f"SH closed it · {display_name_of(r['sh_closed_by'], '')}")
+    if r["on_closed"] and not r["closed"]:
+        lines.append(f"Online closed it · {display_name_of(r['on_closed_by'], '')}")
+    lines += ["", render_case(c)]
+    hist = case_history(case_id)[-6:]
+    if hist:
+        lines += ["", "🕓 History"]
+        for h in hist:
+            when = datetime.fromisoformat(h["created_at"]).strftime("%-d %b %H:%M")
+            who = display_name_of(h["user_id"], "") if h["user_id"] else ""
+            line = f"{when} · {who or h['side']}: {h['action']}"
+            if h["note"]:
+                line += f" — {h['note']}"
+            lines.append(line)
+
+    online = is_online(user_id)
+    buttons = []
+    if not r["closed"]:
+        if online and not r["on_closed"]:
+            buttons.append([InlineKeyboardButton("✅ Close (Online side)",
+                                                 callback_data=f"cs:x:{case_id}")])
+        buttons.append([InlineKeyboardButton("📝 Add a note",
+                                             callback_data=f"cs:n:{case_id}")])
+        if online:
+            buttons.append([InlineKeyboardButton("↩️ Hand back to SH",
+                                                 callback_data=f"cs:h:{case_id}")])
+        if is_admin(user_id):
+            buttons.append([InlineKeyboardButton("🔒 Force close (both sides)",
+                                                 callback_data=f"cs:f:{case_id}")])
+    buttons.append([InlineKeyboardButton("◀️ All cases", callback_data="cs:l")])
+    return "\n".join(lines), InlineKeyboardMarkup(buttons)
+
+
+async def cmd_cases(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if update.effective_chat.type != constants.ChatType.PRIVATE:
+        return
+    uid = update.effective_user.id
+    if agent_status(uid) != "active" and not is_owner(uid):
+        await gate(update)
+        return
+    if not may_see_cases(uid):
+        await update.message.reply_text("Use /handover to see and close cases.")
+        return
+    text, kb = cases_list(uid)
+    await update.message.reply_text(text, parse_mode=constants.ParseMode.HTML,
+                                    reply_markup=kb)
+
+
+async def on_cases_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """cs:l list · cs:v view · cs:x Online closes · cs:f admin force-closes"""
+    query = update.callback_query
+    uid = query.from_user.id
+    if not may_see_cases(uid):
+        await query.answer("That's for the Online team and admins.", show_alert=True)
+        return
+    parts = query.data.split(":")
+    action = parts[1]
+    case_id = int(parts[2]) if len(parts) > 2 else 0
+
+    if action == "x" and is_online(uid):
+        async with write_lock:
+            close_case(case_id, uid, side="on")
+        await refresh_case_post(context.bot, case_id)
+        await query.answer("Closed on the Online side ✓")
+    elif action == "f" and is_admin(uid):
+        async with write_lock:
+            force_close_case(case_id, uid)
+        await refresh_case_post(context.bot, case_id)
+        await query.answer("Force closed ✓")
+    else:
+        await query.answer()
+
+    if action == "l":
+        text, kb = cases_list(uid)
+        parse = constants.ParseMode.HTML
+    else:
+        text, kb = case_view(case_id, uid)
+        parse = None
+    try:
+        await query.edit_message_text(text, parse_mode=parse, reply_markup=kb)
+    except BadRequest:
+        pass
+
+
+async def on_case_note_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """cs:n add a note · cs:h hand back to SH (Online only) — then they type."""
+    query = update.callback_query
+    uid = query.from_user.id
+    _, action, raw = query.data.split(":")
+    if not may_see_cases(uid) or (action == "h" and not is_online(uid)):
+        await query.answer("You can't do that here.", show_alert=True)
+        return ConversationHandler.END
+    await query.answer()
+    context.user_data["case_note"] = (action, int(raw))
+    r = q1("SELECT username FROM ho_cases WHERE id=?", (int(raw),))
+    who = r["username"] if r else "this case"
+    ask = (f"↩️ <b>Hand {esc(who)} back to SH</b>\n\nWhat do you need from them?"
+           if action == "h" else
+           f"📝 <b>Note on {esc(who)}</b>\n\nWhat's the latest? "
+           "(e.g. refund done, waiting on courier)")
+    await query.edit_message_text(ask + "\n\n<i>/cancel to stop</i>",
+                                  parse_mode=constants.ParseMode.HTML)
+    return CASE_NOTE
+
+
+async def on_case_note_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    action, case_id = context.user_data.pop("case_note", (None, 0))
+    note = update.message.text.strip()
+    uid = update.effective_user.id
+    if not case_id:
+        return ConversationHandler.END
+    if len(note) < 2:
+        context.user_data["case_note"] = (action, case_id)
+        await update.message.reply_text("Type a few words, or /cancel.")
+        return CASE_NOTE
+    side = "on" if is_online(uid) else "sh"
+    async with write_lock:
+        if action == "h":
+            hand_back_case(case_id, uid, note)
+        else:
+            log_case(case_id, uid, side, "note", note)
+    await refresh_case_post(context.bot, case_id)
+    if action == "h":
+        r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+        await post_ops(
+            context.bot,
+            f"↩️ {display_name_of(uid, 'Online')} handed a case back to SH\n"
+            f"{r['prio']} {r['username']} · {CHANNEL_NAMES.get(r['channel'] or '', '')}\n"
+            f"Needs: {note}\n\nIt's at the top of the next /handover.",
+        )
+    text, kb = case_view(case_id, uid)
+    await update.message.reply_text(
+        ("↩️ Handed back to SH." if action == "h" else "📝 Note saved.") + "\n\n" + text,
+        reply_markup=kb,
+    )
+    return ConversationHandler.END
