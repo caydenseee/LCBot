@@ -877,6 +877,7 @@ def main() -> None:
     )
     app.add_handler(CommandHandler("handover", cmd_handover))
     app.add_handler(CommandHandler("handovers", cmd_handovers))
+    app.add_handler(CommandHandler("linkchat", cmd_linkchat))
     app.add_handler(
         ConversationHandler(
             entry_points=[CommandHandler("addreview", cmd_addreview)],

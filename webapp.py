@@ -535,6 +535,7 @@ def web_case_toggle(user_id: int, case_id: int, close: bool) -> dict:
         close_case(case_id, user_id)
     else:
         reopen_case(case_id)
+    on_bot_loop(refresh_case_post(bot_ref(), case_id))
     return {"ok": True, "closed": close, "username": row["username"]}
 
 
@@ -588,6 +589,7 @@ def web_handover_post(user_id: int) -> dict:
          "\n\n".join(render_case(c) for c in cases), now().isoformat()),
     )
     posted = bool(on_bot_loop(post_ops(bot_ref(), text)))
+    on_bot_loop(post_new_cases_to_chats(bot_ref(), user_id), timeout=30)
     return {
         "ok": True, "posted": posted, "open": len(cases), "closed": len(closed),
         "text": text if not posted else "",

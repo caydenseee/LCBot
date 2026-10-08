@@ -68,6 +68,64 @@ async def cmd_support(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+async def sync_store_chats(bot, agent_id: int, closed_ids=()) -> None:
+    """After a handover: new cases to their store chats, closed ones updated."""
+    await post_new_cases_to_chats(bot, agent_id)
+    for cid in closed_ids:
+        await refresh_case_post(bot, cid)
+
+
+async def cmd_linkchat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/linkchat Shopee SG      — in a store's group: post its new cases here
+       /linkchat                — which chat each channel posts to
+       /linkchat off Shopee SG  — stop posting that channel's cases"""
+    if not is_admin(update.effective_user.id):
+        return
+    chat = update.effective_chat
+    args = " ".join(context.args).strip()
+    names = ", ".join(name for _, _, name in CHANNELS)
+
+    if not args:
+        lines = ["<b>Store chats</b>", ""]
+        for key, flag, name in CHANNELS:
+            where = channel_chat(key)
+            lines.append(f"{flag} {esc(name)}: " + (
+                f"<b>{esc(where.get('title') or str(where['chat']))}</b>"
+                if where else "<i>not linked</i>"))
+        lines += ["", "To link one, send this inside that store's group:",
+                  "<code>/linkchat Shopee SG</code>",
+                  "To unlink: <code>/linkchat off Shopee SG</code>"]
+        await update.message.reply_text(
+            "\n".join(lines), parse_mode=constants.ParseMode.HTML)
+        return
+
+    off = args.lower().startswith("off ")
+    channel = parse_channel(args[4:] if off else args)
+    if not channel:
+        await update.message.reply_text(
+            f"I don't know that one. Use one of: {names}.")
+        return
+    if off:
+        async with write_lock:
+            set_setting(f"chat:{channel}", "")
+        await update.message.reply_text(
+            f"Unlinked. New {CHANNEL_NAMES[channel]} cases won't be posted to a chat.")
+        return
+    if chat.type not in (constants.ChatType.GROUP, constants.ChatType.SUPERGROUP):
+        await update.message.reply_text(
+            "Send this inside the store's group chat, so I know where to post.")
+        return
+
+    thread = update.message.message_thread_id if update.message.is_topic_message else None
+    async with write_lock:
+        set_setting(f"chat:{channel}", json.dumps(
+            {"chat": chat.id, "thread": thread, "title": chat.title or ""}))
+    await update.message.reply_text(
+        f"✅ Linked. New {CHANNEL_NAMES[channel]} cases will be posted here "
+        "whenever a handover is posted, and updated as they're closed."
+    )
+
+
 async def on_handover_carry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Everything still open, nothing new from this shift."""
     query = update.callback_query
@@ -93,6 +151,7 @@ async def on_handover_carry(update: Update, context: ContextTypes.DEFAULT_TYPE) 
              "\n\n".join(render_case(c) for c in cases), now().isoformat()),
         )
     posted = await post_ops(context.bot, text)
+    await sync_store_chats(context.bot, user.id)
     await query.answer("Carried forward ✓")
     await query.edit_message_text(
         f"✅ Handover posted — {len(cases)} case(s) still open."
@@ -117,9 +176,10 @@ async def on_handover_none(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     today = now().date()
     cleared = [case_row_to_dict(c) for c in open_cases()]
+    closed_ids = [c["id"] for c in open_cases()]
     async with write_lock:
-        for c in open_cases():
-            close_case(c["id"], user.id)
+        for cid in closed_ids:
+            close_case(cid, user.id)
         run(
             "INSERT INTO handovers (agent_id, the_date, body, created_at) "
             "VALUES (?,?,?,?)",
@@ -129,6 +189,7 @@ async def on_handover_none(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         [], display_name_of(user.id, user.full_name), today, cleared
     )
     posted = await post_ops(context.bot, text)
+    await sync_store_chats(context.bot, user.id, closed_ids)
     await query.answer("Nothing to hand over ✓")
     await query.edit_message_text(
         "✅ Handover posted — nothing outstanding.\n\nThanks, enjoy your evening."
@@ -205,7 +266,7 @@ async def finish_handover(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         keep = {c["id"] for c in open_cases()}
     new_cases = context.user_data.get("ho_cases", [])
 
-    cases, closed = [], []
+    cases, closed, closed_ids = [], [], []
     async with write_lock:
         for c in open_cases():
             if c["id"] in keep:
@@ -213,6 +274,7 @@ async def finish_handover(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             else:
                 close_case(c["id"], user.id)
                 closed.append(case_row_to_dict(c))
+                closed_ids.append(c["id"])
         for d in new_cases:
             insert_case(user.id, d, today)
             cases.append(d)
@@ -226,6 +288,7 @@ async def finish_handover(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     who = display_name_of(user.id, user.full_name)
     text = render_handover(cases, who, today, closed)
     posted = await post_ops(context.bot, text)
+    await sync_store_chats(context.bot, user.id, closed_ids)
     for k in ("ho_cases", "ho_draft", "ho_keep"):
         context.user_data.pop(k, None)
 

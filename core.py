@@ -465,6 +465,26 @@ for _col, _ddl in [
 ]:
     if _col not in _hc_cols:
         db.execute(f"ALTER TABLE ho_cases ADD COLUMN {_col} {_ddl}")
+for _col, _ddl in [
+    ("chat_posted", "INTEGER NOT NULL DEFAULT 0"),
+    ("post_id", "INTEGER"),
+]:
+    if _col not in _hc_cols:
+        db.execute(f"ALTER TABLE ho_cases ADD COLUMN {_col} {_ddl}")
+if "chat_posted" not in _hc_cols:
+    # Only cases added from now on go to the store chats.
+    db.execute("UPDATE ho_cases SET chat_posted=1")
+# One message in a store's chat, listing new cases from one handover.
+db.execute("""CREATE TABLE IF NOT EXISTS channel_posts (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel    TEXT NOT NULL,
+    chat_id    INTEGER NOT NULL,
+    thread_id  INTEGER,
+    message_id INTEGER,
+    agent_id   INTEGER,
+    the_date   TEXT NOT NULL,
+    created_at TEXT NOT NULL
+)""")
 if "sh_closed" not in _hc_cols:
     # Cases closed before the two ticks existed count as closed on both sides.
     db.execute(
@@ -1935,6 +1955,117 @@ def reopen_case(case_id: int) -> None:
     )
 
 
+def parse_channel(text: str) -> str | None:
+    """'Shopee SG', 'shopee_sg', 'TH', 'Webstore' — all find their channel."""
+    want = re.sub(r"[^a-z]", "", (text or "").lower())
+    for key, _, name in CHANNELS:
+        if want in (re.sub(r"[^a-z]", "", key.lower()),
+                    re.sub(r"[^a-z]", "", name.lower())):
+            return key
+    return "WEBSTORE" if want == "webstore" else None
+
+
+def channel_chat(channel: str | None) -> dict | None:
+    """Where a channel's new cases go: {'chat', 'thread', 'title'}, or None."""
+    raw = setting(f"chat:{channel}", "") if channel else ""
+    return json.loads(raw) if raw else None
+
+
+def case_status_line(r) -> str:
+    """How a case stands, for its line in the store chat."""
+    if r["closed"]:
+        who = display_name_of(r["closed_by"], "") if r["closed_by"] else ""
+        when = (datetime.fromisoformat(r["closed_at"]).strftime("%-d %b %H:%M")
+                if r["closed_at"] else "")
+        return "✅ Closed" + (f" by {who}" if who else "") + (f" · {when}" if when else "")
+    if r["sh_closed"]:
+        return "☑️ SH closed · ⬜ waiting on Online"
+    if r["on_closed"]:
+        return "☑️ Online closed · ⬜ waiting on SH"
+    due = case_due(date.fromisoformat(r["the_date"]), r["prio"])
+    return f"🔸 Open · due {due.strftime('%a %-d %b')}"
+
+
+def render_channel_post(post_id: int) -> str:
+    p = q1("SELECT * FROM channel_posts WHERE id=?", (post_id,))
+    cases = q("SELECT * FROM ho_cases WHERE post_id=? ORDER BY id", (post_id,))
+    who = display_name_of(p["agent_id"], "") if p["agent_id"] else ""
+    day = date.fromisoformat(p["the_date"]).strftime("%-d %b %Y")
+    out = [f"📋 Handover · {CHANNEL_NAMES.get(p['channel'], p['channel'])}",
+           f"{day}" + (f" · from {who}" if who else "")]
+    for r in cases:
+        out += ["", "──────────", case_status_line(r),
+                render_case(case_row_to_dict(r))]
+    return "\n".join(out)
+
+
+async def post_new_cases_to_chats(bot, agent_id: int) -> int:
+    """Send each store's chat the new cases from this handover, one message
+    per chat. Returns how many messages went out."""
+    by_channel: dict = {}
+    for r in q("SELECT * FROM ho_cases WHERE chat_posted=0 ORDER BY id"):
+        if r["closed"] or r["sh_closed"] or not channel_chat(r["channel"]):
+            run("UPDATE ho_cases SET chat_posted=1 WHERE id=?", (r["id"],))
+            continue
+        by_channel.setdefault(r["channel"], []).append(r)
+
+    sent = 0
+    for channel, cases in by_channel.items():
+        where = channel_chat(channel)
+        # Keep each message under Telegram's length limit.
+        chunks, size = [[]], 0
+        for r in cases:
+            n = len(render_case(case_row_to_dict(r))) + 60
+            if chunks[-1] and size + n > TG_LIMIT - 300:
+                chunks.append([])
+                size = 0
+            chunks[-1].append(r)
+            size += n
+        for chunk in chunks:
+            pid = run(
+                "INSERT INTO channel_posts (channel, chat_id, thread_id, agent_id,"
+                " the_date, created_at) VALUES (?,?,?,?,?,?)",
+                (channel, where["chat"], where.get("thread"), agent_id,
+                 now().date().isoformat(), now().isoformat()),
+            ).lastrowid
+            ids = [r["id"] for r in chunk]
+            marks = ",".join("?" * len(ids))
+            run(f"UPDATE ho_cases SET post_id=?, chat_posted=1 WHERE id IN ({marks})",
+                (pid, *ids))
+            kw = {"message_thread_id": where["thread"]} if where.get("thread") else {}
+            try:
+                msg = await bot.send_message(where["chat"], render_channel_post(pid), **kw)
+                run("UPDATE channel_posts SET message_id=? WHERE id=?",
+                    (msg.message_id, pid))
+                sent += 1
+            except Exception as e:
+                # Try again with the next handover.
+                log.warning("Couldn't post to the %s chat: %s", channel, e)
+                run(f"UPDATE ho_cases SET post_id=NULL, chat_posted=0 "
+                    f"WHERE id IN ({marks})", tuple(ids))
+                run("DELETE FROM channel_posts WHERE id=?", (pid,))
+    return sent
+
+
+async def refresh_case_post(bot, case_id: int) -> None:
+    """Edit the store chat's message so a case's line shows how it stands now."""
+    r = q1("SELECT post_id FROM ho_cases WHERE id=?", (case_id,))
+    p = q1("SELECT * FROM channel_posts WHERE id=?",
+           (r["post_id"],)) if r and r["post_id"] else None
+    if not p or not p["message_id"]:
+        return
+    try:
+        await bot.edit_message_text(
+            render_channel_post(p["id"]), chat_id=p["chat_id"],
+            message_id=p["message_id"],
+        )
+    except BadRequest as e:
+        if "not modified" not in str(e).lower():
+            log.warning("Couldn't update the %s chat: %s", p["channel"], e)
+    except Exception as e:
+        log.warning("Couldn't update the %s chat: %s", p["channel"], e)
+
+
 # Sort cases from before channels existed into one, by their store.
 for _r in db.execute(
     "SELECT id, platform, store FROM ho_cases WHERE channel IS NULL"
@@ -2296,6 +2427,7 @@ ADMIN_GROUPS = [
         ("pending", "Approve or decline access requests"),
         ("dropreqs", "Shift requests waiting"),
         ("handovers", "Recent closing handovers"),
+        ("linkchat", "Link a store's chat to its cases"),
         ("access", "Who approved or declined whom"),
         ("roster", "Who's on the list"),
         ("rename", "Fix someone's name on the schedule"),
