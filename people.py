@@ -326,6 +326,12 @@ async def on_channel_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             run("UPDATE agents SET role='online', on_avails=0, tag_calls=0, "
                 "channels=COALESCE(channels, '[]') WHERE user_id=?", (uid,))
         await refresh_menu_for(context.bot, uid)
+        try:
+            await context.bot.send_message(
+                uid, ONLINE_HELP, parse_mode=constants.ParseMode.HTML,
+                reply_markup=ReplyKeyboardRemove())
+        except Exception:
+            pass
         await query.answer(f"{shown} is now in the Online team")
         await query.edit_message_text(
             f"<b>Which channels does {esc(shown)} look after?</b>\n"
@@ -336,6 +342,12 @@ async def on_channel_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         async with write_lock:
             run("UPDATE agents SET role='agent', channels=NULL WHERE user_id=?", (uid,))
         await refresh_menu_for(context.bot, uid)
+        try:
+            await context.bot.send_message(
+                uid, "You're back on the SH side. /help shows your commands.",
+                reply_markup=agent_keyboard(uid))
+        except Exception:
+            pass
         await query.answer()
         await query.edit_message_text(
             f"{shown} is no longer in the Online team. They're a regular agent "

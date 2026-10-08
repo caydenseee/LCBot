@@ -36,6 +36,8 @@ from telegram import (
     KeyboardButton,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
+    MenuButtonCommands,
+    MenuButtonDefault,
     MenuButtonWebApp,
     WebAppInfo,
     BotCommandScopeAllGroupChats,
@@ -2594,6 +2596,14 @@ async def refresh_menu_for(bot, user_id: int) -> None:
             [BotCommand(c, d) for c, d in pairs],
             scope=BotCommandScopeChat(user_id),
         )
+        if PUBLIC_URL:
+            # The app is SH's, so the Online team gets the command list there
+            # instead; everyone else falls back to the shared App button.
+            await bot.set_chat_menu_button(
+                chat_id=user_id,
+                menu_button=MenuButtonCommands() if role == "online"
+                else MenuButtonDefault(),
+            )
     except Exception as e:
         log.info("Couldn't refresh menu for %s: %s", user_id, e)
 
