@@ -1815,7 +1815,6 @@ CASE_HINTS = {
 }
 CASE_EXAMPLES = {
     "username": "zoechengg",
-    "product": "Arc Ultra Black",
     "happened": "Customer says the speaker won't charge, or has asked to cancel for a refund",
     "done": "Asked for a photo of the unit",
     "need": "Arrange a replacement, or ON to approve the refund request",
@@ -2810,8 +2809,8 @@ function caseForm(d) {
     h += `<div class="fld"><label>${esc(fd.label)}${fd.required ? '' : ' (optional)'}</label>`;
     h += `<div class="note" style="margin:0 0 4px">${esc(fd.hint)}</div>`;
     h += long[fd.key]
-      ? `<textarea id="f_${fd.key}" rows="2" placeholder="e.g. ${esc(eg)}">${v}</textarea>`
-      : `<input id="f_${fd.key}" value="${v}" placeholder="e.g. ${esc(eg)}">`;
+      ? `<textarea id="f_${fd.key}" rows="2" placeholder="${eg ? 'e.g. ' + esc(eg) : ''}">${v}</textarea>`
+      : `<input id="f_${fd.key}" value="${v}" placeholder="${eg ? 'e.g. ' + esc(eg) : ''}">`;
     h += '</div>';
   }
   h += '<button class="big" id="saveCase">Save this case</button>';

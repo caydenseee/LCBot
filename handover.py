@@ -348,7 +348,8 @@ def field_prompt(d: dict) -> str:
         f"<b>{step + 1}/{len(CASE_FIELDS)} · {label}</b>"
         f"{'' if required else ' (optional)'}\n"
         f"{esc(CASE_HINTS[key])}\n"
-        f"<i>e.g. {esc(example)}</i>\n\n"
+        + (f"<i>e.g. {esc(example)}</i>\n" if example else "")
+        + "\n"
         f"<i>{tail}/back to change the last answer · /cancel to stop</i>"
     )
 
