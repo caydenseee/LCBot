@@ -336,22 +336,15 @@ def case_head(d: dict) -> str:
 def field_prompt(d: dict) -> str:
     """The question for the step the draft is on."""
     step = d.get("_step", 0)
-    _, label, required = CASE_FIELDS[step]
-    examples = {
-        "username": "kiemmengkoo",
-        "order_no": "2609046GFY4T9B",
-        "product": "Sonos Move Gen 2",
-        "happened": "Customer says the speaker won't charge",
-        "done": "Asked for a photo of the charging light",
-        "need": "Arrange a replacement once the photo comes in",
-    }
-    key = CASE_FIELDS[step][0]
-    tail = "/skip if nothing · " if not required else ""
+    key, label, required = CASE_FIELDS[step]
+    example = case_example(key, d.get("platform"), d.get("store"))
+    tail = "/skip if nothing yet · " if not required else ""
     return (
         f"{case_head(d)}\n\n"
         f"<b>{step + 1}/{len(CASE_FIELDS)} · {label}</b>"
         f"{'' if required else ' (optional)'}\n"
-        f"<i>e.g. {esc(examples[key])}</i>\n\n"
+        f"{esc(CASE_HINTS[key])}\n"
+        f"<i>e.g. {esc(example)}</i>\n\n"
         f"<i>{tail}/back to change the last answer · /cancel to stop</i>"
     )
 

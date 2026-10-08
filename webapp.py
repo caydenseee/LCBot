@@ -513,10 +513,13 @@ def handover_payload(user_id: int) -> dict:
         "openCases": [shape(r) for r in open_rows],
         "closedCases": [shape(r, True) for r in closed_rows],
         "stores": [{"flag": f, "store": st,
-                    "channel": CHANNEL_NAMES.get(STORE_CHANNEL.get(st, ""), "")}
+                    "channel": CHANNEL_NAMES.get(STORE_CHANNEL.get(st, ""), ""),
+                    "orderExample": case_example("order_no", "DUOKE", st)}
                    for f, st in STORES],
-        "fields": [{"key": k, "label": lb, "required": req}
+        "fields": [{"key": k, "label": lb, "required": req,
+                    "hint": CASE_HINTS[k], "example": CASE_EXAMPLES.get(k, "")}
                    for k, lb, req in CASE_FIELDS],
+        "webstoreOrderExample": ORDER_EXAMPLES["WEBSTORE"],
         "platforms": PLATFORMS,
         "priorities": [{"emoji": e, "name": n} for e, n in PRIORITIES],
         "nextWorking": next_working_day(today).strftime("%A %-d %b"),

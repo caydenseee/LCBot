@@ -1783,6 +1783,46 @@ CASE_FIELDS = [
 ]
 
 
+# What to type for each part, and an example. Shown in the bot and the app.
+CASE_HINTS = {
+    "username": "Copy the customer's username exactly as it shows in the chat.",
+    "order_no": "Copy the full order number from the order page. No order? Type none.",
+    "product": "Which product? Include the model and colour.",
+    "happened": "Briefly, what's the issue? One or two lines.",
+    "done": "What have you already done or asked for?",
+    "need": "What's the next step to resolve this?",
+}
+CASE_EXAMPLES = {
+    "username": "zoechengg",
+    "product": "Arc Ultra Black",
+    "happened": "Customer says the speaker won't charge, or has asked to cancel for a refund",
+    "done": "Asked for a photo of the unit",
+    "need": "Arrange a replacement, or ON to approve the refund request",
+}
+# Each platform writes its order numbers differently.
+ORDER_EXAMPLES = {
+    "LAZADA": "173908941991792",
+    "SHOPEE": "2609046GFY4T9B",
+    "WEBSTORE": "#40665-TCSG",
+}
+
+
+def order_kind(platform: str | None, store: str | None) -> str:
+    """Lazada, Shopee or the webstore, for the right order number example."""
+    if (platform or "").upper() == "LIVECHAT":
+        return "WEBSTORE"
+    channel = channel_for(platform, store)
+    if channel.startswith("LAZADA") or "LAZ" in (store or ""):
+        return "LAZADA"
+    return "SHOPEE"
+
+
+def case_example(key: str, platform: str | None, store: str | None) -> str:
+    if key == "order_no":
+        return ORDER_EXAMPLES[order_kind(platform, store)]
+    return CASE_EXAMPLES.get(key, "")
+
+
 def compose_body(d: dict) -> str:
     """The case in the same shape agents have always written it."""
     lines = [d["order_no"], d["product"], "", f"• {d['happened']}"]
@@ -2737,19 +2777,20 @@ function caseForm(d) {
   if (f.platform === 'LIVECHAT') {
     h += '<div class="note" style="margin-top:0">Goes to 🌐 TC Webstore</div>';
   }
-  const tips = {
-    username: 'kiemmengkoo', order_no: '2609046GFY4T9B',
-    product: 'Sonos Move Gen 2', happened: "Customer says the speaker won't charge",
-    done: 'Asked for a photo of the charging light',
-    need: 'Arrange a replacement once the photo comes in',
-  };
   const long = { happened: 1, done: 1, need: 1 };
+  const picked = d.stores.find(s => s.store === f.store);
   for (const fd of d.fields) {
     const v = esc(f[fd.key] || '');
+    let eg = fd.example;
+    if (fd.key === 'order_no') {
+      eg = f.platform === 'LIVECHAT' ? d.webstoreOrderExample
+        : (picked ? picked.orderExample : 'Pick a store first');
+    }
     h += `<div class="fld"><label>${esc(fd.label)}${fd.required ? '' : ' (optional)'}</label>`;
+    h += `<div class="note" style="margin:0 0 4px">${esc(fd.hint)}</div>`;
     h += long[fd.key]
-      ? `<textarea id="f_${fd.key}" rows="2" placeholder="${esc(tips[fd.key])}">${v}</textarea>`
-      : `<input id="f_${fd.key}" value="${v}" placeholder="${esc(tips[fd.key])}">`;
+      ? `<textarea id="f_${fd.key}" rows="2" placeholder="e.g. ${esc(eg)}">${v}</textarea>`
+      : `<input id="f_${fd.key}" value="${v}" placeholder="e.g. ${esc(eg)}">`;
     h += '</div>';
   }
   h += '<button class="big" id="saveCase">Save this case</button>';
@@ -2820,6 +2861,8 @@ function wireHandover() {
   };
   const cc = document.getElementById('cancelCase');
   if (cc) cc.onclick = () => { HO_FORM = null; loadHandover(); };
+  const sel = document.getElementById('store');
+  if (sel) sel.onchange = () => { keepForm(); loadHandover(); };
 
   document.querySelectorAll('[data-f]').forEach(el => {
     el.onclick = () => {
