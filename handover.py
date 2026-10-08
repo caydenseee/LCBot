@@ -68,6 +68,69 @@ async def cmd_support(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
+async def sync_store_chats(bot, agent_id: int, closed_ids=(),
+                           post_new: bool = True) -> None:
+    """After a handover: new cases to their store chats (unless the agent
+    chose TC Online only), and closed ones updated either way."""
+    if post_new:
+        await post_new_cases_to_chats(bot, agent_id)
+    else:
+        skip_store_chats()
+    for cid in closed_ids:
+        await refresh_case_post(bot, cid)
+
+
+async def cmd_linkchat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/linkchat Shopee SG      — in a store's group: post its new cases here
+       /linkchat                — which chat each channel posts to
+       /linkchat off Shopee SG  — stop posting that channel's cases"""
+    if not is_admin(update.effective_user.id):
+        return
+    chat = update.effective_chat
+    args = " ".join(context.args).strip()
+    names = ", ".join(name for _, _, name in CHANNELS)
+
+    if not args:
+        lines = ["<b>Store chats</b>", ""]
+        for key, flag, name in CHANNELS:
+            where = channel_chat(key)
+            lines.append(f"{flag} {esc(name)}: " + (
+                f"<b>{esc(where.get('title') or str(where['chat']))}</b>"
+                if where else "<i>not linked</i>"))
+        lines += ["", "To link one, send this inside that store's group:",
+                  "<code>/linkchat Shopee SG</code>",
+                  "To unlink: <code>/linkchat off Shopee SG</code>"]
+        await update.message.reply_text(
+            "\n".join(lines), parse_mode=constants.ParseMode.HTML)
+        return
+
+    off = args.lower().startswith("off ")
+    channel = parse_channel(args[4:] if off else args)
+    if not channel:
+        await update.message.reply_text(
+            f"I don't know that one. Use one of: {names}.")
+        return
+    if off:
+        async with write_lock:
+            set_setting(f"chat:{channel}", "")
+        await update.message.reply_text(
+            f"Unlinked. New {CHANNEL_NAMES[channel]} cases won't be posted to a chat.")
+        return
+    if chat.type not in (constants.ChatType.GROUP, constants.ChatType.SUPERGROUP):
+        await update.message.reply_text(
+            "Send this inside the store's group chat, so I know where to post.")
+        return
+
+    thread = update.message.message_thread_id if update.message.is_topic_message else None
+    async with write_lock:
+        set_setting(f"chat:{channel}", json.dumps(
+            {"chat": chat.id, "thread": thread, "title": chat.title or ""}))
+    await update.message.reply_text(
+        f"✅ Linked. New {CHANNEL_NAMES[channel]} cases will be posted here "
+        "whenever a handover is posted, and updated as they're closed."
+    )
+
+
 async def on_handover_carry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Everything still open, nothing new from this shift."""
     query = update.callback_query
@@ -93,6 +156,7 @@ async def on_handover_carry(update: Update, context: ContextTypes.DEFAULT_TYPE) 
              "\n\n".join(render_case(c) for c in cases), now().isoformat()),
         )
     posted = await post_ops(context.bot, text)
+    await sync_store_chats(context.bot, user.id)
     await query.answer("Carried forward ✓")
     await query.edit_message_text(
         f"✅ Handover posted — {len(cases)} case(s) still open."
@@ -104,7 +168,6 @@ async def on_handover_carry(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 def handover_header(the_date: date) -> str:
     return (
         "⭐️ Live Chat Agent Closing Handover ⭐️\n\n"
-        "> I have closed the tickets on my shift: ✅\n\n"
         f"🔸{the_date.strftime('%-d %b %Y')}, Open Cases"
     )
 
@@ -116,12 +179,10 @@ async def on_handover_none(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         return
     today = now().date()
     cleared = [case_row_to_dict(c) for c in open_cases()]
+    closed_ids = [c["id"] for c in open_cases()]
     async with write_lock:
-        for c in open_cases():
-            run(
-                "UPDATE ho_cases SET closed=1, closed_by=?, closed_at=? WHERE id=?",
-                (user.id, now().isoformat(), c["id"]),
-            )
+        for cid in closed_ids:
+            close_case(cid, user.id)
         run(
             "INSERT INTO handovers (agent_id, the_date, body, created_at) "
             "VALUES (?,?,?,?)",
@@ -131,6 +192,7 @@ async def on_handover_none(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         [], display_name_of(user.id, user.full_name), today, cleared
     )
     posted = await post_ops(context.bot, text)
+    await sync_store_chats(context.bot, user.id, closed_ids)
     await query.answer("Nothing to hand over ✓")
     await query.edit_message_text(
         "✅ Handover posted — nothing outstanding.\n\nThanks, enjoy your evening."
@@ -144,19 +206,42 @@ def case_picker(keep: set) -> InlineKeyboardMarkup:
     for c in open_cases():
         mark = "✅" if c["id"] in keep else "☑️"
         who = display_name_of(c["agent_id"], "")
-        age = (now().date() - date.fromisoformat(c["the_date"])).days
+        due = case_due(date.fromisoformat(c["the_date"]), c["prio"])
         label = f"{mark} {c['prio']} {c['username']}"
+        if c["channel"]:
+            label += f" · {CHANNEL_NAMES.get(c['channel'], '')}"
         if who:
             label += f" · {who.split()[0]}"
-        if age >= 3:
-            label += f" · {age}d ⏳"
-        elif age:
-            label += f" · {age}d"
+        if sla_mark(due):
+            label += f" · {sla_mark(due)}"
         rows.append([InlineKeyboardButton(label[:60], callback_data=f"hk:{c['id']}")])
     rows.append([InlineKeyboardButton("➕ Add a new case", callback_data="hk:new")])
     rows.append([InlineKeyboardButton("📤 Post handover", callback_data="hk:post")])
     rows.append([InlineKeyboardButton("✖️ Cancel", callback_data="hk:cancel")])
     return InlineKeyboardMarkup(rows)
+
+
+def needs_post_choice(context) -> bool:
+    """Only ask where to post when a new case is headed for a store chat."""
+    new = context.user_data.get("ho_cases", [])
+    return store_chats_pending(
+        channel_for(d["platform"], d.get("store")) for d in new)
+
+
+async def ask_where_to_post(query, prefix: str) -> None:
+    await query.edit_message_text(
+        "<b>Where should this handover go?</b>\n\n"
+        "TC Online always gets the full handover. Store chats get only "
+        "their own new cases.",
+        parse_mode=constants.ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📤 TC Online only",
+                                  callback_data=f"{prefix}:send:ops")],
+            [InlineKeyboardButton("📤 TC Online + store chats",
+                                  callback_data=f"{prefix}:send:all")],
+            [InlineKeyboardButton("◀️ Back", callback_data=f"{prefix}:back")],
+        ]),
+    )
 
 
 async def on_handover_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -182,9 +267,18 @@ async def on_handover_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     if choice == "post":
         await query.answer()
+        if needs_post_choice(context):
+            await ask_where_to_post(query, "hk")
+            return HO_PICK
         return await finish_handover(update, context)
 
-    keep.symmetric_difference_update({int(choice)})
+    if choice.startswith("send:"):
+        await query.answer()
+        return await finish_handover(update, context,
+                                     store_chats=choice == "send:all")
+
+    if choice != "back":
+        keep.symmetric_difference_update({int(choice)})
     await query.answer()
     try:
         await query.edit_message_text(
@@ -196,7 +290,8 @@ async def on_handover_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     return HO_PICK
 
 
-async def finish_handover(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def finish_handover(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                          store_chats: bool = True) -> int:
     """Close what wasn't kept, save what's new, and post."""
     query = update.callback_query
     user = query.from_user
@@ -206,27 +301,17 @@ async def finish_handover(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         keep = {c["id"] for c in open_cases()}
     new_cases = context.user_data.get("ho_cases", [])
 
-    cases, closed = [], []
+    cases, closed, closed_ids = [], [], []
     async with write_lock:
         for c in open_cases():
             if c["id"] in keep:
                 cases.append(case_row_to_dict(c))
             else:
-                run(
-                    "UPDATE ho_cases SET closed=1, closed_by=?, closed_at=? "
-                    "WHERE id=?",
-                    (user.id, now().isoformat(), c["id"]),
-                )
+                close_case(c["id"], user.id)
                 closed.append(case_row_to_dict(c))
+                closed_ids.append(c["id"])
         for d in new_cases:
-            run(
-                "INSERT INTO ho_cases (agent_id, the_date, section, prio, platform,"
-                " flag, store, username, body, created_at) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (user.id, today.isoformat(), d["section"], d["prio"],
-                 d["platform"], d["flag"], d["store"], d["username"], d["body"],
-                 now().isoformat()),
-            )
+            insert_case(user.id, d, today)
             cases.append(d)
         run(
             "INSERT INTO handovers (agent_id, the_date, body, created_at) "
@@ -238,6 +323,7 @@ async def finish_handover(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     who = display_name_of(user.id, user.full_name)
     text = render_handover(cases, who, today, closed)
     posted = await post_ops(context.bot, text)
+    await sync_store_chats(context.bot, user.id, closed_ids, post_new=store_chats)
     for k in ("ho_cases", "ho_draft", "ho_keep"):
         context.user_data.pop(k, None)
 
@@ -338,24 +424,38 @@ async def show_store(query, context) -> int:
     return HO_STORE
 
 
-async def ask_for_case(query, context) -> int:
-    """The last step — they type the case itself."""
-    d = context.user_data["ho_draft"]
+def case_head(d: dict) -> str:
     head = f"{d['prio']} ▫️{d['platform']}"
     if d.get("store"):
         head += f" · {d['flag']}{d['store']}"
+    if d["platform"] == "LIVECHAT":          # the store already says where else
+        head += f" · {CHANNEL_NAMES['WEBSTORE']}"
+    return head
+
+
+def field_prompt(d: dict) -> str:
+    """The question for the step the draft is on."""
+    step = d.get("_step", 0)
+    key, label, required = CASE_FIELDS[step]
+    example = case_example(key, d.get("platform"), d.get("store"))
+    tail = "/skip if nothing yet · " if not required else ""
+    return (
+        f"{case_head(d)}\n\n"
+        f"<b>{step + 1}/{len(CASE_FIELDS)} · {label}</b>"
+        f"{'' if required else ' (optional)'}\n"
+        f"{esc(CASE_HINTS[key])}\n"
+        + (f"<i>e.g. {esc(example)}</i>\n" if example else "")
+        + "\n"
+        f"<i>{tail}/back to change the last answer · /cancel to stop</i>"
+    )
+
+
+async def ask_for_case(query, context) -> int:
+    """After the buttons, ask for each part of the case in turn."""
+    d = context.user_data["ho_draft"]
+    d["_step"] = 0
     await query.edit_message_text(
-        f"{head}\n\n"
-        "<b>Now send the case.</b>\n"
-        "First line = the customer's username. Then the rest as you'd write it:"
-        "\n\n<code>kiemmengkoo\n"
-        "2609046GFY4T9B\n"
-        "Sonos Move Gen 2\n\n"
-        "• what happened\n"
-        "• what you did\n\n"
-        "‼️Need Help: what's needed next</code>\n\n"
-        "<i>/back to change the last answer · /cancel to stop</i>",
-        parse_mode=constants.ParseMode.HTML,
+        field_prompt(d), parse_mode=constants.ParseMode.HTML
     )
     return HO_BODY
 
@@ -434,8 +534,14 @@ async def on_ho_store(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
 
 async def on_ho_back_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """/back while typing the case — return to the step before it."""
+    """/back while typing — the previous question, or the buttons before them."""
     d = context.user_data.get("ho_draft", {})
+    if d.get("_step", 0) > 0:
+        d["_step"] -= 1
+        await update.message.reply_text(
+            field_prompt(d), parse_mode=constants.ParseMode.HTML
+        )
+        return HO_BODY
     rows = [[InlineKeyboardButton("◀️ Yes, change it", callback_data="hf:back")],
             [InlineKeyboardButton("✖️ Cancel the handover",
                                   callback_data="hf:cancel")]]
@@ -449,35 +555,67 @@ async def on_ho_back_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
 
 async def on_ho_body(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """One answer per message, until every required part is in."""
+    d = context.user_data["ho_draft"]
+    step = d.get("_step", 0)
+    key, label, _ = CASE_FIELDS[step]
     text = update.message.text.strip()
-    parts = text.split("\n", 1)
-    if len(parts) < 2 or len(parts[1].strip()) < 5:
+    if len(text) < 2:
         await update.message.reply_text(
-            "I need the username on the first line, then the case below it. "
-            "Try again, or /cancel."
+            f"I need the {label.lower()} here. Try again, or /cancel."
+        )
+        return HO_BODY
+    d[key] = text
+    return await next_field(update, context)
+
+
+async def on_ho_skip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """/skip — only for the optional parts."""
+    d = context.user_data["ho_draft"]
+    key, label, required = CASE_FIELDS[d.get("_step", 0)]
+    if required:
+        await update.message.reply_text(
+            f"{label} can't be skipped, the Online team needs it. "
+            "Type it in, or /cancel."
+        )
+        return HO_BODY
+    d[key] = ""
+    return await next_field(update, context)
+
+
+async def next_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    d = context.user_data["ho_draft"]
+    d["_step"] = d.get("_step", 0) + 1
+    if d["_step"] < len(CASE_FIELDS):
+        await update.message.reply_text(
+            field_prompt(d), parse_mode=constants.ParseMode.HTML
         )
         return HO_BODY
 
-    d = context.user_data["ho_draft"]
-    d["username"] = parts[0].strip()
-    d["body"] = parts[1].strip()
+    d.pop("_step", None)
+    d["body"] = compose_body(d)
     context.user_data.setdefault("ho_cases", []).append(d)
+    context.user_data.pop("ho_draft", None)
     n = len(context.user_data["ho_cases"])
-
     await update.message.reply_text(
-        f"✅ Case saved ({n} new this shift).",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ Add another case", callback_data="hm:more")],
-            [InlineKeyboardButton("📤 Post handover", callback_data="hm:post")],
-            [InlineKeyboardButton("✖️ Cancel", callback_data="hm:cancel")],
-        ]),
+        f"✅ Case saved ({n} new this shift).\n\n"
+        f"{case_head(d)}\n{d['username']}\n{d['body']}",
+        reply_markup=more_keyboard(),
     )
     return HO_MORE
 
 
+def more_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Add another case", callback_data="hm:more")],
+        [InlineKeyboardButton("📤 Post handover", callback_data="hm:post")],
+        [InlineKeyboardButton("✖️ Cancel", callback_data="hm:cancel")],
+    ])
+
+
 async def on_ho_more(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    choice = query.data.split(":")[1]
+    choice = query.data.split(":", 1)[1]
     if choice == "cancel":
         await query.answer()
         for k in ("ho_cases", "ho_draft", "ho_keep"):
@@ -492,6 +630,19 @@ async def on_ho_more(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         n = len(context.user_data.get("ho_cases", [])) + 1
         return await show_section(query, context, n)
     await query.answer()
+    if choice.startswith("send:"):
+        return await finish_handover(update, context,
+                                     store_chats=choice == "send:all")
+    if choice == "back":
+        n = len(context.user_data.get("ho_cases", []))
+        await query.edit_message_text(
+            f"{n} new case(s) ready. Add another, or post?",
+            reply_markup=more_keyboard(),
+        )
+        return HO_MORE
+    if needs_post_choice(context):
+        await ask_where_to_post(query, "hm")
+        return HO_MORE
     return await finish_handover(update, context)
 
 

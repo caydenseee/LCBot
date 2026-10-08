@@ -859,6 +859,7 @@ def main() -> None:
                 HO_STORE: [CallbackQueryHandler(on_ho_store, pattern=r"^hb:")],
                 HO_BODY: [
                     CommandHandler("back", on_ho_back_cmd),
+                    CommandHandler("skip", on_ho_skip),
                     CallbackQueryHandler(on_ho_platform, pattern=r"^hf:"),
                     CallbackQueryHandler(on_ho_store, pattern=r"^hb:"),
                     MessageHandler(filters.TEXT & ~filters.COMMAND, on_ho_body),
@@ -876,6 +877,7 @@ def main() -> None:
     )
     app.add_handler(CommandHandler("handover", cmd_handover))
     app.add_handler(CommandHandler("handovers", cmd_handovers))
+    app.add_handler(CommandHandler("linkchat", cmd_linkchat))
     app.add_handler(
         ConversationHandler(
             entry_points=[CommandHandler("addreview", cmd_addreview)],
