@@ -520,6 +520,7 @@ def handover_payload(user_id: int) -> dict:
                     "hint": CASE_HINTS[k], "example": CASE_EXAMPLES.get(k, "")}
                    for k, lb, req in CASE_FIELDS],
         "webstoreOrderExample": ORDER_EXAMPLES["WEBSTORE"],
+        "storeChatsPending": store_chats_pending(),
         "platforms": PLATFORMS,
         "priorities": [{"emoji": e, "name": n} for e, n in PRIORITIES],
         "nextWorking": next_working_day(today).strftime("%A %-d %b"),
@@ -567,7 +568,7 @@ def web_case_add(user_id: int, c: dict) -> dict:
     return {"ok": True, "username": d["username"]}
 
 
-def web_handover_post(user_id: int) -> dict:
+def web_handover_post(user_id: int, store_chats: bool = True) -> dict:
     """Post whatever is open, noting what this person closed today."""
     today = now().date()
     cases = [case_row_to_dict(r) for r in
@@ -589,7 +590,10 @@ def web_handover_post(user_id: int) -> dict:
          "\n\n".join(render_case(c) for c in cases), now().isoformat()),
     )
     posted = bool(on_bot_loop(post_ops(bot_ref(), text)))
-    on_bot_loop(post_new_cases_to_chats(bot_ref(), user_id), timeout=30)
+    if store_chats:
+        on_bot_loop(post_new_cases_to_chats(bot_ref(), user_id), timeout=30)
+    else:
+        skip_store_chats()
     return {
         "ok": True, "posted": posted, "open": len(cases), "closed": len(closed),
         "text": text if not posted else "",
@@ -937,7 +941,7 @@ class MiniAppHandler(BaseHTTPRequestHandler):
             out = (web_case_toggle(uid, cid, bool(body.get("close", True)))
                    if cid else {"ok": False, "error": "No case given."})
         elif path == "/api/handover/post":
-            out = web_handover_post(uid)
+            out = web_handover_post(uid, body.get("storeChats", True) is not False)
         elif path == "/api/claim":
             try:
                 sid = int(body.get("slot", 0))

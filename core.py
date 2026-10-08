@@ -2047,6 +2047,21 @@ async def post_new_cases_to_chats(bot, agent_id: int) -> int:
     return sent
 
 
+def store_chats_pending(extra_channels=()) -> bool:
+    """Whether posting now would put a new case in a linked store chat."""
+    channels = set(extra_channels) | {
+        r["channel"] for r in q(
+            "SELECT channel FROM ho_cases WHERE chat_posted=0 AND closed=0 "
+            "AND sh_closed=0")
+    }
+    return any(channel_chat(c) for c in channels if c)
+
+
+def skip_store_chats() -> None:
+    """'TC Online only' — these new cases never go to the store chats."""
+    run("UPDATE ho_cases SET chat_posted=1 WHERE chat_posted=0")
+
+
 async def refresh_case_post(bot, case_id: int) -> None:
     """Edit the store chat's message so a case's line shows how it stands now."""
     r = q1("SELECT post_id FROM ho_cases WHERE id=?", (case_id,))
@@ -2871,7 +2886,7 @@ function wire() {
   });
 }
 
-let HO = null, HO_FORM = null, HO_SHOWN = {};
+let HO = null, HO_FORM = null, HO_SHOWN = {}, HO_CHOOSE = false;
 let AGENT = null;   // whose detail we're looking at
 
 function caseCard(c, closed) {
@@ -2972,7 +2987,12 @@ async function loadHandover() {
   }
 
   h += '<button class="big" id="newCase" style="margin-top:14px">+  Add a case</button>';
-  if (n) {
+  if (HO_CHOOSE) {
+    h += '<div class="note">TC Online always gets the full handover. Store chats get only their own new cases.</div>';
+    h += '<button class="big" id="postOps" style="margin-top:8px">📤  TC Online only</button>';
+    h += '<button class="big" id="postAll" style="margin-top:8px">📤  TC Online + store chats</button>';
+    h += '<button class="big" id="postBack" style="margin-top:8px;background:var(--tg-theme-secondary-bg-color,#eee);color:var(--tg-theme-text-color,#111)">Back</button>';
+  } else if (n) {
     h += '<button class="big" id="postHo" style="margin-top:8px">📤  Post handover</button>';
   } else {
     h += '<button class="big" id="postHo" style="margin-top:8px">📤  Post "nothing open"</button>';
@@ -3038,25 +3058,37 @@ function wireHandover() {
   };
 
   const pb = document.getElementById('postHo');
-  if (pb) pb.onclick = async () => {
-    pb.disabled = true; pb.textContent = 'Posting…';
-    const out = await post('/api/handover/post', {});
-    if (!out.ok) { toast('Could not post that.'); pb.disabled = false; return; }
-    const app = document.getElementById('app');
-    let h = '<h1>Posted</h1>';
-    h += `<div class="sub">${out.open} open · ${out.closed} closed by you today</div>`;
-    if (!out.posted) {
-      h += '<div class="note">I could not reach TC Online, so here it is to copy:</div>';
-      h += `<div class="case"><div class="body">${esc(out.text)}</div></div>`;
-    } else {
-      h += '<div class="note">It is in TC Online now.</div>';
-    }
-    h += '<button class="big" id="backHo" style="margin-top:14px">Back to handover</button>';
-    app.innerHTML = h + navBar();
-    wire();
-    const b = document.getElementById('backHo');
-    if (b) b.onclick = () => loadHandover();
+  if (pb) pb.onclick = () => {
+    if (HO && HO.storeChatsPending) { HO_CHOOSE = true; loadHandover(); }
+    else postHandover(true, pb);
   };
+  const po = document.getElementById('postOps');
+  if (po) po.onclick = () => postHandover(false, po);
+  const pa = document.getElementById('postAll');
+  if (pa) pa.onclick = () => postHandover(true, pa);
+  const bk = document.getElementById('postBack');
+  if (bk) bk.onclick = () => { HO_CHOOSE = false; loadHandover(); };
+}
+
+async function postHandover(storeChats, btn) {
+  btn.disabled = true; btn.textContent = 'Posting…';
+  HO_CHOOSE = false;
+  const out = await post('/api/handover/post', { storeChats });
+  if (!out.ok) { toast('Could not post that.'); btn.disabled = false; return; }
+  const app = document.getElementById('app');
+  let h = '<h1>Posted</h1>';
+  h += `<div class="sub">${out.open} open · ${out.closed} closed by you today</div>`;
+  if (!out.posted) {
+    h += '<div class="note">I could not reach TC Online, so here it is to copy:</div>';
+    h += `<div class="case"><div class="body">${esc(out.text)}</div></div>`;
+  } else {
+    h += '<div class="note">It is in TC Online now.</div>';
+  }
+  h += '<button class="big" id="backHo" style="margin-top:14px">Back to handover</button>';
+  app.innerHTML = h + navBar();
+  wire();
+  const b = document.getElementById('backHo');
+  if (b) b.onclick = () => loadHandover();
 }
 
 function keepForm() {

@@ -68,9 +68,14 @@ async def cmd_support(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
-async def sync_store_chats(bot, agent_id: int, closed_ids=()) -> None:
-    """After a handover: new cases to their store chats, closed ones updated."""
-    await post_new_cases_to_chats(bot, agent_id)
+async def sync_store_chats(bot, agent_id: int, closed_ids=(),
+                           post_new: bool = True) -> None:
+    """After a handover: new cases to their store chats (unless the agent
+    chose TC Online only), and closed ones updated either way."""
+    if post_new:
+        await post_new_cases_to_chats(bot, agent_id)
+    else:
+        skip_store_chats()
     for cid in closed_ids:
         await refresh_case_post(bot, cid)
 
@@ -219,6 +224,29 @@ def case_picker(keep: set) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
+def needs_post_choice(context) -> bool:
+    """Only ask where to post when a new case is headed for a store chat."""
+    new = context.user_data.get("ho_cases", [])
+    return store_chats_pending(
+        channel_for(d["platform"], d.get("store")) for d in new)
+
+
+async def ask_where_to_post(query, prefix: str) -> None:
+    await query.edit_message_text(
+        "<b>Where should this handover go?</b>\n\n"
+        "TC Online always gets the full handover. Store chats get only "
+        "their own new cases.",
+        parse_mode=constants.ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📤 TC Online only",
+                                  callback_data=f"{prefix}:send:ops")],
+            [InlineKeyboardButton("📤 TC Online + store chats",
+                                  callback_data=f"{prefix}:send:all")],
+            [InlineKeyboardButton("◀️ Back", callback_data=f"{prefix}:back")],
+        ]),
+    )
+
+
 async def on_handover_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Tick which of the running cases are still live."""
     query = update.callback_query
@@ -242,9 +270,18 @@ async def on_handover_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     if choice == "post":
         await query.answer()
+        if needs_post_choice(context):
+            await ask_where_to_post(query, "hk")
+            return HO_PICK
         return await finish_handover(update, context)
 
-    keep.symmetric_difference_update({int(choice)})
+    if choice.startswith("send:"):
+        await query.answer()
+        return await finish_handover(update, context,
+                                     store_chats=choice == "send:all")
+
+    if choice != "back":
+        keep.symmetric_difference_update({int(choice)})
     await query.answer()
     try:
         await query.edit_message_text(
@@ -256,7 +293,8 @@ async def on_handover_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     return HO_PICK
 
 
-async def finish_handover(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def finish_handover(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                          store_chats: bool = True) -> int:
     """Close what wasn't kept, save what's new, and post."""
     query = update.callback_query
     user = query.from_user
@@ -288,7 +326,7 @@ async def finish_handover(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     who = display_name_of(user.id, user.full_name)
     text = render_handover(cases, who, today, closed)
     posted = await post_ops(context.bot, text)
-    await sync_store_chats(context.bot, user.id, closed_ids)
+    await sync_store_chats(context.bot, user.id, closed_ids, post_new=store_chats)
     for k in ("ho_cases", "ho_draft", "ho_keep"):
         context.user_data.pop(k, None)
 
@@ -567,18 +605,22 @@ async def next_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text(
         f"✅ Case saved ({n} new this shift).\n\n"
         f"{case_head(d)}\n{d['username']}\n{d['body']}",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("➕ Add another case", callback_data="hm:more")],
-            [InlineKeyboardButton("📤 Post handover", callback_data="hm:post")],
-            [InlineKeyboardButton("✖️ Cancel", callback_data="hm:cancel")],
-        ]),
+        reply_markup=more_keyboard(),
     )
     return HO_MORE
 
 
+def more_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Add another case", callback_data="hm:more")],
+        [InlineKeyboardButton("📤 Post handover", callback_data="hm:post")],
+        [InlineKeyboardButton("✖️ Cancel", callback_data="hm:cancel")],
+    ])
+
+
 async def on_ho_more(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     query = update.callback_query
-    choice = query.data.split(":")[1]
+    choice = query.data.split(":", 1)[1]
     if choice == "cancel":
         await query.answer()
         for k in ("ho_cases", "ho_draft", "ho_keep"):
@@ -593,6 +635,19 @@ async def on_ho_more(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         n = len(context.user_data.get("ho_cases", [])) + 1
         return await show_section(query, context, n)
     await query.answer()
+    if choice.startswith("send:"):
+        return await finish_handover(update, context,
+                                     store_chats=choice == "send:all")
+    if choice == "back":
+        n = len(context.user_data.get("ho_cases", []))
+        await query.edit_message_text(
+            f"{n} new case(s) ready. Add another, or post?",
+            reply_markup=more_keyboard(),
+        )
+        return HO_MORE
+    if needs_post_choice(context):
+        await ask_where_to_post(query, "hm")
+        return HO_MORE
     return await finish_handover(update, context)
 
 
