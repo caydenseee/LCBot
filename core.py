@@ -43,6 +43,7 @@ from telegram import (
     BotCommandScopeDefault,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    MessageEntity,
     Update,
     constants,
 )
@@ -586,6 +587,25 @@ def verify_init_data(raw: str) -> dict | None:
         return None
 
 
+# The handover's sign-off line, shown in a quote box when the bot posts it.
+CLOSED_LINE = "I have closed the tickets on my shift: ✅"
+
+
+def utf16_len(s: str) -> int:
+    """Telegram measures entity offsets in UTF-16 units, and emoji take two."""
+    return len(s.encode("utf-16-le")) // 2
+
+
+def quote_entities(text: str) -> list | None:
+    """Put the sign-off line in a quote box, wherever the handover is shown."""
+    at = text.find(CLOSED_LINE)
+    if at < 0:
+        return None
+    return [MessageEntity(
+        MessageEntity.BLOCKQUOTE, utf16_len(text[:at]), utf16_len(CLOSED_LINE)
+    )]
+
+
 async def post_ops(bot, text: str) -> bool:
     """Post to the operations group. Returns False if it couldn't."""
     if not OPS_CHAT_ID:
@@ -593,6 +613,7 @@ async def post_ops(bot, text: str) -> bool:
     kw = {}
     if OPS_THREAD_ID:
         kw["message_thread_id"] = OPS_THREAD_ID
+    kw["entities"] = quote_entities(text)
     try:
         await bot.send_message(OPS_CHAT_ID, text, **kw)
         return True
@@ -1938,7 +1959,7 @@ def render_handover(cases: list, who: str, the_date: date,
     out = [
         "⭐️ Live Chat Agent Closing Handover ⭐️",
         "",
-        "> I have closed the tickets on my shift: ✅",
+        CLOSED_LINE,
     ]
     now_cases = [c for c in cases if c["section"] == "open"]
     later = [c for c in cases if c["section"] == "follow"]

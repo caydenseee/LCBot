@@ -98,13 +98,14 @@ async def on_handover_carry(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         f"✅ Handover posted — {len(cases)} case(s) still open."
         if posted else text,
         parse_mode=None,
+        entities=None if posted else quote_entities(text),
     )
 
 
 def handover_header(the_date: date) -> str:
     return (
         "⭐️ Live Chat Agent Closing Handover ⭐️\n\n"
-        "> I have closed the tickets on my shift: ✅\n\n"
+        f"{CLOSED_LINE}\n\n"
         f"🔸{the_date.strftime('%-d %b %Y')}, Open Cases"
     )
 
@@ -133,6 +134,7 @@ async def on_handover_none(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         "✅ Handover posted — nothing outstanding.\n\nThanks, enjoy your evening."
         if posted else text,
         parse_mode=None,
+        entities=None if posted else quote_entities(text),
     )
 
 
@@ -232,7 +234,9 @@ async def finish_handover(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         msg += f", {len(closed)} closed." if closed else "."
         await query.edit_message_text(msg, parse_mode=None)
     else:
-        await query.edit_message_text(text, parse_mode=None)
+        await query.edit_message_text(
+            text, parse_mode=None, entities=quote_entities(text)
+        )
     return ConversationHandler.END
 
 
@@ -556,7 +560,9 @@ async def got_handover(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
             "✅ Handover posted to TC Online. Thanks!"
         )
     else:
-        await update.message.reply_text(text, parse_mode=None)
+        await update.message.reply_text(
+            text, parse_mode=None, entities=quote_entities(text)
+        )
         await update.message.reply_text("Tap the message above to copy it.")
     return ConversationHandler.END
 
