@@ -93,7 +93,7 @@ def snapshot_db() -> tuple[io.BytesIO, dict]:
     tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     tmp.close()
     dest = sqlite3.connect(tmp.name)
-    with dest:
+    with dest, db_lock:
         db.backup(dest)
     dest.close()
 
@@ -234,7 +234,8 @@ async def on_restore_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE)
     try:
         async with write_lock:
             snap = sqlite3.connect(safety)
-            db.backup(snap)
+            with db_lock:
+                db.backup(snap)
             snap.close()
         with open(safety, "rb") as fh:
             await query.message.reply_document(
@@ -252,14 +253,15 @@ async def on_restore_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE)
     # keeps working against the same handle
     try:
         async with write_lock:
-            db.rollback()                      # nothing half-finished
-            src = sqlite3.connect(tmp)
-            src.backup(db)
-            src.close()
-            db.commit()
-            db.execute("PRAGMA journal_mode=WAL")
-            db.execute("PRAGMA busy_timeout=8000")
-            db.commit()
+            with db_lock:
+                db.rollback()                  # nothing half-finished
+                src = sqlite3.connect(tmp)
+                src.backup(db)
+                src.close()
+                db.commit()
+                db.execute("PRAGMA journal_mode=WAL")
+                db.execute("PRAGMA busy_timeout=8000")
+                db.commit()
     except Exception as e:
         log.warning("Restore failed: %s", e)
         await query.message.reply_text(
@@ -459,12 +461,13 @@ async def cmd_reset(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     async with write_lock:
-        for t in ("time_edits", "time_entries", "confirmations",
-                  "signups", "slots", "days", "weeks"):
-            run(f"DELETE FROM {t}")
-        db.execute("DELETE FROM sqlite_sequence WHERE name IN "
-                   "('weeks','days','slots','time_entries','time_edits')")
-        db.commit()
+        with db_lock:
+            for t in ("time_edits", "time_entries", "confirmations",
+                      "signups", "slots", "days", "weeks"):
+                run(f"DELETE FROM {t}")
+            db.execute("DELETE FROM sqlite_sequence WHERE name IN "
+                       "('weeks','days','slots','time_entries','time_edits')")
+            db.commit()
 
     await update.message.reply_text(
         "✅ <b>Cleared.</b>\n\n"
