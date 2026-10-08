@@ -453,18 +453,28 @@ for _name, _cfg in SEED_PRESETS.items():
 db.commit()
 
 
+# The bot and the Mini App's request threads share this one connection, and
+# SQLite can't run two statements on it at once (that gave "bad parameter or
+# other API misuse" and half-read rows). So they take turns. Reentrant, so
+# code already holding it can still call these helpers.
+db_lock = threading.RLock()
+
+
 def q(sql: str, args: tuple = ()) -> list[sqlite3.Row]:
-    return db.execute(sql, args).fetchall()
+    with db_lock:
+        return db.execute(sql, args).fetchall()
 
 
 def q1(sql: str, args: tuple = ()) -> sqlite3.Row | None:
-    return db.execute(sql, args).fetchone()
+    with db_lock:
+        return db.execute(sql, args).fetchone()
 
 
 def run(sql: str, args: tuple = ()) -> sqlite3.Cursor:
-    cur = db.execute(sql, args)
-    db.commit()
-    return cur
+    with db_lock:
+        cur = db.execute(sql, args)
+        db.commit()
+        return cur
 
 
 # --------------------------------------------------------------------------
