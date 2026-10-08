@@ -1808,7 +1808,7 @@ CASE_FIELDS = [
 CASE_HINTS = {
     "username": "Copy the customer's username exactly as it shows in the chat.",
     "order_no": "Copy the full order number from the order page. No order? Type none.",
-    "product": "Which product? Include the model and colour.",
+    "product": "Include the brand, model and colour.",
     "happened": "Briefly, what's the issue? One or two lines.",
     "done": "What have you already done or asked for?",
     "need": "What's the next step to resolve this?",
