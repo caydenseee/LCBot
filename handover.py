@@ -836,6 +836,9 @@ def case_view(case_id: int, user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         if online and not r["on_closed"]:
             buttons.append([InlineKeyboardButton("✅ Close (Online side)",
                                                  callback_data=f"cs:x:{case_id}")])
+        if not online and not r["sh_closed"]:
+            buttons.append([InlineKeyboardButton("✅ Close (SH side)",
+                                                 callback_data=f"cs:s:{case_id}")])
         buttons.append([InlineKeyboardButton("📝 Add a note",
                                              callback_data=f"cs:n:{case_id}"),
                         InlineKeyboardButton("✏️ Edit",
@@ -866,7 +869,8 @@ async def cmd_cases(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def on_cases_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """cs:l list · cs:v view · cs:x Online closes · cs:f admin force-closes"""
+    """cs:l list · cs:v view · cs:x Online closes · cs:s SH closes ·
+    cs:f admin force-closes"""
     query = update.callback_query
     uid = query.from_user.id
     if not may_see_cases(uid):
@@ -881,6 +885,11 @@ async def on_cases_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             close_case(case_id, uid, side="on")
         await refresh_case_post(context.bot, case_id)
         await query.answer("Closed on the Online side ✓")
+    elif action == "s" and not is_online(uid):
+        async with write_lock:
+            close_case(case_id, uid, side="sh")
+        await refresh_case_post(context.bot, case_id)
+        await query.answer("Closed on the SH side ✓")
     elif action == "f" and is_admin(uid):
         async with write_lock:
             force_close_case(case_id, uid)

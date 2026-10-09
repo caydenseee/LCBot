@@ -907,7 +907,7 @@ def main() -> None:
         )
     )
     app.add_handler(CallbackQueryHandler(on_cases_button,
-                                         pattern=r"^cs:(l|v|x|f|e|ep)(:|$)"))
+                                         pattern=r"^cs:(l|v|x|s|f|e|ep)(:|$)"))
     app.add_handler(
         ConversationHandler(
             entry_points=[CommandHandler("addreview", cmd_addreview)],
