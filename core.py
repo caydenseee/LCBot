@@ -1212,10 +1212,12 @@ def is_locked(week_id: int, user_id: int) -> bool:
     )
 
 
-def tag_list(people, room: int = TG_LIMIT) -> str:
-    """Everyone's @handle. Only cut short with +N if the message would
+def tag_list(people, room: int = TG_LIMIT, ping: bool = True) -> str:
+    """Everyone's @handle, or just their names when ping is off so a repost
+    doesn't notify them again. Only cut short with +N if the message would
     otherwise go over Telegram's length limit."""
-    tags = [f"@{p['username']}" if p["username"] else esc(p["name"]) for p in people]
+    tags = [f"@{p['username']}" if ping and p["username"]
+            else esc(p["display_name"] or p["name"]) for p in people]
     shown = []
     for i, tag in enumerate(tags):
         left = len(tags) - i - 1
@@ -1225,7 +1227,8 @@ def tag_list(people, room: int = TG_LIMIT) -> str:
     return ", ".join(shown)
 
 
-def render_board(week_id: int, compact: bool = False) -> tuple[str, InlineKeyboardMarkup]:
+def render_board(week_id: int, compact: bool = False,
+                 ping: bool = True) -> tuple[str, InlineKeyboardMarkup]:
     """The whole week in one message."""
     w = q1("SELECT * FROM weeks WHERE id=?", (week_id,))
     st = week_stats(week_id)
@@ -1289,7 +1292,7 @@ def render_board(week_id: int, compact: bool = False) -> tuple[str, InlineKeyboa
 
     if st["missing"] and not closed:
         room = TG_LIMIT - len("\n".join(lines)) - 120   # leave room for the footer
-        lines += ["", f"⏳ Not yet confirmed: {tag_list(st['missing'], room)}"]
+        lines += ["", f"⏳ Not yet confirmed: {tag_list(st['missing'], room, ping)}"]
 
     if not closed and GROUP_BUTTONS:
         rows.append(
@@ -1304,7 +1307,7 @@ def render_board(week_id: int, compact: bool = False) -> tuple[str, InlineKeyboa
     text = "\n".join(lines)
     # Telegram caps messages at 4096 characters. Shorten name lists if we're close.
     if len(text) > 3900 and not compact:
-        return render_board(week_id, compact=True)
+        return render_board(week_id, compact=True, ping=ping)
     return text, InlineKeyboardMarkup(rows)
 
 
@@ -1337,7 +1340,7 @@ async def refresh_group(context: ContextTypes.DEFAULT_TYPE, week_id: int,
         await refresh_header(context, week_id)
 
 
-def render_header(week_id: int) -> tuple[str, InlineKeyboardMarkup]:
+def render_header(week_id: int, ping: bool = True) -> tuple[str, InlineKeyboardMarkup]:
     w = q1("SELECT * FROM weeks WHERE id=?", (week_id,))
     st = week_stats(week_id)
     a, b = date.fromisoformat(w["start_date"]), date.fromisoformat(w["end_date"])
@@ -1365,7 +1368,7 @@ def render_header(week_id: int) -> tuple[str, InlineKeyboardMarkup]:
 
     if st["missing"] and w["status"] == "open":
         room = TG_LIMIT - len("\n".join(lines)) - 60
-        lines.append(f"⏳ Not yet confirmed: {tag_list(st['missing'], room)}")
+        lines.append(f"⏳ Not yet confirmed: {tag_list(st['missing'], room, ping)}")
 
     kb = []
     if w["status"] == "open":
