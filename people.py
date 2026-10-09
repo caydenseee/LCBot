@@ -591,6 +591,17 @@ async def cmd_roster(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if agents:
         lines += ["", f"<b>Agents ({len(agents)})</b>"] + [line(r) for r in agents]
 
+    # The Online team has access too, but isn't on shifts, so it's listed apart.
+    team = q("SELECT * FROM agents WHERE status='active' AND role='online' ORDER BY name")
+    if team:
+        lines += ["", f"<b>🛒 Online team ({len(team)}) · not on shifts</b>"] + [
+            f"{esc(r['display_name'] or r['name'])}"
+            + (f" @{r['username']}" if r["username"] else "")
+            + f" — {esc(channels_text(r['user_id']))}"
+            for r in team
+        ]
+        lines.append("<i>Change their channels with /channels @handle.</i>")
+
     # Owners set in config may have never messaged the bot.
     missing = [
         uid for uid in ADMIN_IDS

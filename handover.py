@@ -430,10 +430,11 @@ async def show_platform(query, context) -> int:
 
 
 async def show_store(query, context) -> int:
-    """Step 4 — Duoke stores only."""
+    """Step 4 — the store: a marketplace for Duoke, a webstore for Livechat."""
+    platform = context.user_data.get("ho_draft", {}).get("platform")
     rows = [
         [InlineKeyboardButton(f"{flag}{store}", callback_data=f"hb:{i}")]
-        for i, (flag, store) in enumerate(STORES)
+        for i, (flag, store) in enumerate(stores_for(platform))
     ]
     rows.append([InlineKeyboardButton("◀️ Back", callback_data="hb:back"),
                  InlineKeyboardButton("✖️ Cancel", callback_data="hb:cancel")])
@@ -449,7 +450,7 @@ def case_head(d: dict) -> str:
     head = f"{d['prio']} ▫️{d['platform']}"
     if d.get("store"):
         head += f" · {d['flag']}{d['store']}"
-    if d["platform"] == "LIVECHAT":          # the store already says where else
+    if d["platform"] == "LIVECHAT" and not d.get("store"):   # older cases
         head += f" · {CHANNEL_NAMES['WEBSTORE']}"
     return head
 
@@ -522,7 +523,7 @@ async def on_ho_prio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
 
 async def on_ho_platform(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Duoke needs a store; Livechat doesn't, so skip that step for it."""
+    """Then the store: Duoke's marketplaces, or Livechat's two webstores."""
     query = update.callback_query
     await query.answer()
     choice = query.data.split(":", 1)[1]
@@ -533,9 +534,7 @@ async def on_ho_platform(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     d = context.user_data["ho_draft"]
     d["platform"] = choice
-    if choice != "DUOKE":
-        d["flag"], d["store"] = "", ""
-        return await ask_for_case(query, context)
+    d["flag"], d["store"] = "", ""
     return await show_store(query, context)
 
 
@@ -548,8 +547,8 @@ async def on_ho_store(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     if choice == "back":
         return await show_platform(query, context)
 
-    flag, store = STORES[int(choice)]
     d = context.user_data["ho_draft"]
+    flag, store = stores_for(d.get("platform"))[int(choice)]
     d["flag"], d["store"] = flag, store
     return await ask_for_case(query, context)
 
@@ -563,12 +562,9 @@ async def on_ho_back_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             field_prompt(d), parse_mode=constants.ParseMode.HTML
         )
         return HO_BODY
-    rows = [[InlineKeyboardButton("◀️ Yes, change it", callback_data="hf:back")],
+    rows = [[InlineKeyboardButton("◀️ Pick a different store", callback_data="hb:back")],
             [InlineKeyboardButton("✖️ Cancel the handover",
                                   callback_data="hf:cancel")]]
-    if d.get("platform") == "DUOKE":
-        rows[0] = [InlineKeyboardButton("◀️ Pick a different store",
-                                        callback_data="hb:back")]
     await update.message.reply_text(
         "Go back a step?", reply_markup=InlineKeyboardMarkup(rows)
     )

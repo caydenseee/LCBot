@@ -507,8 +507,8 @@ def handover_payload(user_id: int) -> dict:
                                              or r["handed_back"]),
             "status": case_status_line(r),
             "group": order_kind(r["platform"], r["store"]),
-            "region": ("TH" if r["channel"] == "TH" else
-                       (r["channel"] or "").split("_")[-1] if r["channel"] != "WEBSTORE" else ""),
+            "region": {"TH": "TH", "WEBSTORE": "SG", "WEBSTORE_MY": "MY"}.get(
+                r["channel"] or "", (r["channel"] or "").split("_")[-1]),
             "note": note_line(r["id"]),
             "history": case_history_lines(r["id"]),
         }
@@ -532,7 +532,10 @@ def handover_payload(user_id: int) -> dict:
         "fields": [{"key": k, "label": lb, "required": req,
                     "hint": CASE_HINTS[k], "example": CASE_EXAMPLES.get(k, "")}
                    for k, lb, req in CASE_FIELDS],
-        "webstoreOrderExample": ORDER_EXAMPLES["WEBSTORE"],
+        "webstores": [{"flag": f, "store": st,
+                       "channel": CHANNEL_NAMES[STORE_CHANNEL[st]],
+                       "orderExample": case_example("order_no", "LIVECHAT", st)}
+                      for f, st in WEBSTORES],
         "storeChatsPending": store_chats_pending(),
         "platforms": PLATFORMS,
         "priorities": [{"emoji": e, "name": n} for e, n in PRIORITIES],
@@ -615,13 +618,11 @@ def web_case_add(user_id: int, c: dict) -> dict:
     if prio not in [e for e, _ in PRIORITIES]:
         return {"ok": False, "error": "Pick how urgent it is."}
 
-    flag = store = ""
-    if platform == "DUOKE":
-        want = str(c.get("store", "")).strip()
-        match = [(f, st) for f, st in STORES if st == want]
-        if not match:
-            return {"ok": False, "error": "Pick a store."}
-        flag, store = match[0]
+    want = str(c.get("store", "")).strip()
+    match = [(f, st) for f, st in stores_for(platform) if st == want]
+    if not match:
+        return {"ok": False, "error": "Pick a store."}
+    flag, store = match[0]
 
     d.update(section="follow" if c.get("section") == "follow" else "open",
              prio=prio, platform=platform, flag=flag, store=store)
