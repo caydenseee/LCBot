@@ -2122,11 +2122,11 @@ def render_channel_post(post_id: int) -> str:
            f"{day}" + (f" · from {who}" if who else "")]
     for r in cases:
         out += ["", "──────────", case_status_line(r)]
-        if note_line(r["id"]):
-            out.append(note_line(r["id"]))
         c = case_row_to_dict(r)
-        c["handback"] = ""                  # the note line already says it
+        c["handback"] = ""                  # the note line below says it
         out.append(render_case(c))
+        if note_line(r["id"]):              # the latest word, under the case
+            out += ["", note_line(r["id"])]
     return "\n".join(out)
 
 

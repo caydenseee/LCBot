@@ -975,7 +975,7 @@ async def on_handback_choice(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await announce_handback(context.bot, case_id, uid, mine["note"])
     text, kb = case_view(case_id, uid)
     await query.edit_message_text(
-        ("↩️ Handed back to SH.\n\n" if action == "hy" else "") + text, reply_markup=kb)
+        ("✅ Sent back to SH. They'll see it at the top of their next /handover.\n\n" if action == "hy" else "") + text, reply_markup=kb)
     return ConversationHandler.END
 
 
@@ -1000,7 +1000,7 @@ async def on_case_note_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         await announce_handback(context.bot, case_id, uid, note)
     text, kb = case_view(case_id, uid)
     await update.message.reply_text(
-        ("↩️ Handed back to SH." if action == "h" else "📝 Note saved.") + "\n\n" + text,
+        ("✅ Sent back to SH. They'll see it at the top of their next /handover." if action == "h" else "📝 Note saved.") + "\n\n" + text,
         reply_markup=kb,
     )
     return ConversationHandler.END
