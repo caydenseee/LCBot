@@ -666,10 +666,12 @@ async def cmd_schedule(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     bot = context.bot
     old_id = w["header_msg_id"]
 
+    # A repost is a new message, so names only: tagging again would re-ping
+    # everyone who hasn't confirmed. The first post and the reminders ping.
     if BOARD_MODE == "single":
-        text, kb = render_board(w["id"])
+        text, kb = render_board(w["id"], ping=False)
     else:
-        text, kb = render_header(w["id"])
+        text, kb = render_header(w["id"], ping=False)
     msg = await send_group(
         bot, text, reply_markup=kb, parse_mode=constants.ParseMode.HTML
     )
