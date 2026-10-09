@@ -78,6 +78,23 @@ async def sync_store_chats(bot, agent_id: int, closed_ids=(),
         skip_store_chats()
     for cid in closed_ids:
         await refresh_case_post(bot, cid)
+    await notify_pms(bot, agent_id)
+
+
+async def cmd_pmalerts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/pmalerts on|off — the short DM platform managers get about new cases."""
+    if not is_admin(update.effective_user.id):
+        return
+    want = (context.args[0].lower() if context.args else "")
+    if want in ("on", "off"):
+        async with write_lock:
+            set_setting("pm_alerts", want)
+    state = setting("pm_alerts", "on")
+    await update.message.reply_text(
+        f"New-case messages to the Online team are <b>{state}</b>.\n"
+        "Change with <code>/pmalerts on</code> or <code>/pmalerts off</code>.",
+        parse_mode=constants.ParseMode.HTML,
+    )
 
 
 async def cmd_linkchat(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -746,7 +763,10 @@ def case_button_label(r) -> str:
     return label[:60]
 
 
-def cases_list(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+CASES_PER_PAGE = 15
+
+
+def cases_list(user_id: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
     mine = set(online_channels(user_id))
     rows = q("SELECT * FROM ho_cases WHERE closed=0 ORDER BY id")
     own = [r for r in rows if r["channel"] in mine]
@@ -760,16 +780,29 @@ def cases_list(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         lines.append(f"{len(rows)} open")
     lines += ["", "↩️ handed back to SH · ☑️SH / ☑️ON one side has closed it",
               "⏰ due today · 🚨 overdue", "", "<i>Tap a case to open it.</i>"]
-    buttons = []
-    for group, title in ((own, "— Your channels —"), (rest, "— Other channels —")):
-        if not group:
-            continue
-        if mine:
-            buttons.append([InlineKeyboardButton(title, callback_data="cs:l")])
-        buttons += [[InlineKeyboardButton(case_button_label(r),
-                                          callback_data=f"cs:v:{r['id']}")]
-                    for r in group]
-    buttons.append([InlineKeyboardButton("🔄 Refresh", callback_data="cs:l")])
+    # Own channels first, a page at a time: keeps it scannable on a phone and
+    # well under Telegram's 100-button limit.
+    ordered = [(r, True) for r in own] + [(r, False) for r in rest]
+    pages = max(1, -(-len(ordered) // CASES_PER_PAGE))
+    page = min(max(page, 0), pages - 1)
+    here = f"cs:l:{page}"
+    buttons, heading = [], None
+    for r, is_own in ordered[page * CASES_PER_PAGE:(page + 1) * CASES_PER_PAGE]:
+        if mine and is_own != heading:
+            heading = is_own
+            title = "— Your channels —" if is_own else "— Other channels —"
+            buttons.append([InlineKeyboardButton(title, callback_data=here)])
+        buttons.append([InlineKeyboardButton(case_button_label(r),
+                                             callback_data=f"cs:v:{r['id']}")])
+    if pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton("◀️ Prev", callback_data=f"cs:l:{page - 1}"))
+        nav.append(InlineKeyboardButton(f"Page {page + 1}/{pages}", callback_data=here))
+        if page < pages - 1:
+            nav.append(InlineKeyboardButton("Next ▶️", callback_data=f"cs:l:{page + 1}"))
+        buttons.append(nav)
+    buttons.append([InlineKeyboardButton("🔄 Refresh", callback_data=here)])
     return "\n".join(lines), InlineKeyboardMarkup(buttons)
 
 
@@ -839,7 +872,7 @@ async def on_cases_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
     parts = query.data.split(":")
     action = parts[1]
-    case_id = int(parts[2]) if len(parts) > 2 else 0
+    case_id = int(parts[2]) if len(parts) > 2 else 0    # the page, for cs:l
 
     if action == "x" and is_online(uid):
         async with write_lock:
@@ -855,7 +888,7 @@ async def on_cases_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.answer()
 
     if action == "l":
-        text, kb = cases_list(uid)
+        text, kb = cases_list(uid, page=case_id)
         parse = constants.ParseMode.HTML
     else:
         text, kb = case_view(case_id, uid)

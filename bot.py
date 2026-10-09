@@ -884,6 +884,7 @@ def main() -> None:
     app.add_handler(CommandHandler("handovers", cmd_handovers))
     app.add_handler(CommandHandler("linkchat", cmd_linkchat))
     app.add_handler(CommandHandler("cases", cmd_cases))
+    app.add_handler(CommandHandler("pmalerts", cmd_pmalerts))
     app.add_handler(
         ConversationHandler(
             entry_points=[

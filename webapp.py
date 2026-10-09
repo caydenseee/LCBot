@@ -594,6 +594,7 @@ def web_handover_post(user_id: int, store_chats: bool = True) -> dict:
         on_bot_loop(post_new_cases_to_chats(bot_ref(), user_id), timeout=30)
     else:
         skip_store_chats()
+    on_bot_loop(notify_pms(bot_ref(), user_id), timeout=30)
     return {
         "ok": True, "posted": posted, "open": len(cases), "closed": len(closed),
         "text": text if not posted else "",

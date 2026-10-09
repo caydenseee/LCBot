@@ -472,9 +472,13 @@ for _col, _ddl in [
     ("chat_posted", "INTEGER NOT NULL DEFAULT 0"),
     ("post_id", "INTEGER"),
     ("handed_back", "INTEGER NOT NULL DEFAULT 0"),
+    ("pm_notified", "INTEGER NOT NULL DEFAULT 0"),
 ]:
     if _col not in _hc_cols:
         db.execute(f"ALTER TABLE ho_cases ADD COLUMN {_col} {_ddl}")
+if "pm_notified" not in _hc_cols:
+    # Platform managers only hear about cases added from now on.
+    db.execute("UPDATE ho_cases SET pm_notified=1")
 if "chat_posted" not in _hc_cols:
     # Only cases added from now on go to the store chats.
     db.execute("UPDATE ho_cases SET chat_posted=1")
@@ -2150,6 +2154,37 @@ def skip_store_chats() -> None:
     run("UPDATE ho_cases SET chat_posted=1 WHERE chat_posted=0")
 
 
+async def notify_pms(bot, agent_id: int) -> None:
+    """After a handover, a short DM to each platform manager whose channels
+    have new cases. One message per person per handover, not per case."""
+    rows = q("SELECT * FROM ho_cases WHERE pm_notified=0 ORDER BY id")
+    if not rows:
+        return
+    run("UPDATE ho_cases SET pm_notified=1 WHERE pm_notified=0")
+    if setting("pm_alerts", "on") == "off":
+        return
+    by_channel: dict = {}
+    for r in rows:
+        if not r["closed"]:
+            by_channel.setdefault(r["channel"], []).append(r)
+    who = display_name_of(agent_id, "SH")
+    for pm in q("SELECT * FROM agents WHERE role='online' AND status='active'"):
+        mine = [ch for ch in json.loads(pm["channels"] or "[]") if ch in by_channel]
+        if not mine:
+            continue
+        lines = [f"🆕 New cases from {who}'s handover", ""]
+        for ch in mine:
+            cases = by_channel[ch]
+            names = ", ".join(c["username"] for c in cases[:5])
+            more = f" +{len(cases) - 5}" if len(cases) > 5 else ""
+            lines.append(f"{CHANNEL_NAMES.get(ch, ch)}: {len(cases)} ({names}{more})")
+        lines += ["", "Open /cases to see them."]
+        try:
+            await bot.send_message(pm["user_id"], "\n".join(lines))
+        except Exception as e:
+            log.info("Couldn't message %s about new cases: %s", pm["user_id"], e)
+
+
 async def refresh_case_post(bot, case_id: int) -> None:
     """Edit the store chat's message so a case's line shows how it stands now."""
     r = q1("SELECT post_id FROM ho_cases WHERE id=?", (case_id,))
@@ -2537,6 +2572,7 @@ ADMIN_GROUPS = [
         ("handovers", "Recent closing handovers"),
         ("linkchat", "Link a store's chat to its cases"),
         ("cases", "Open cases — close, note, force close"),
+        ("pmalerts", "New-case messages to the Online team on/off"),
         ("channels", "Online team and the channels they cover"),
         ("access", "Who approved or declined whom"),
         ("roster", "Who's on the list"),
