@@ -1930,7 +1930,7 @@ REQUEST_HINTS = {
 }
 REQUEST_EXAMPLES = {
     "happened": "Item is out of stock until next week",
-    "done": "Checked with the warehouse",
+    "done": "",                  # no example: left blank on purpose
     "need": "Ask the customer if they're OK to wait or want to cancel",
 }
 
@@ -3352,7 +3352,7 @@ function caseForm(d) {
   const picked = storeList.find(s => s.store === f.store);
   for (const fd of d.fields) {
     const v = esc(f[fd.key] || '');
-    let eg = (req && d.request.examples[fd.key]) || fd.example;
+    let eg = (req && fd.key in d.request.examples) ? d.request.examples[fd.key] : fd.example;
     if (fd.key === 'order_no') {
       eg = picked ? picked.orderExample : 'Pick a store first';
     }

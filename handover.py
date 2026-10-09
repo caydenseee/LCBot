@@ -470,7 +470,7 @@ def field_prompt(d: dict) -> str:
     if d.get("request"):
         label = case_label(key, "on")
         hint = REQUEST_HINTS.get(key, hint)
-        example = REQUEST_EXAMPLES.get(key, example)
+        example = REQUEST_EXAMPLES[key] if key in REQUEST_EXAMPLES else example
     tail = "/skip if nothing yet · " if not required else ""
     return (
         f"{case_head(d)}\n\n"
