@@ -704,7 +704,10 @@ def main() -> None:
             states={
                 ASK_NAME: [
                     MessageHandler(filters.TEXT & ~filters.COMMAND, got_name)
-                ]
+                ],
+                CASE_NOTE: [   # /start note_<id> from a store chat's 📝 Note
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, on_case_note_text)
+                ],
             },
             fallbacks=[CommandHandler("cancel", cancel)],
         )
@@ -884,6 +887,7 @@ def main() -> None:
     app.add_handler(CommandHandler("handover", cmd_handover))
     app.add_handler(CommandHandler("handovers", cmd_handovers))
     app.add_handler(CommandHandler("linkchat", cmd_linkchat))
+    app.add_handler(CallbackQueryHandler(on_store_close, pattern=r"^sc:x:\d+$"))
     app.add_handler(CommandHandler("cases", cmd_cases))
     app.add_handler(CommandHandler("pmalerts", cmd_pmalerts))
     app.add_handler(

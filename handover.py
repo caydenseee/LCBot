@@ -738,10 +738,13 @@ async def cmd_handovers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 # /cases — the Online team's view of handover cases
 # --------------------------------------------------------------------------
 
-CASE_NOTE = 270
-
-
 def may_see_cases(user_id: int) -> bool:
+    """Anyone with access: SH agents (notes, closing their side), the Online
+    team, and admins."""
+    return agent_status(user_id) == "active" or is_owner(user_id)
+
+
+def may_edit_cases(user_id: int) -> bool:
     return is_online(user_id) or is_admin(user_id)
 
 
@@ -835,10 +838,10 @@ def case_view(case_id: int, user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         if not online and not r["sh_closed"]:
             buttons.append([InlineKeyboardButton("✅ Close (SH side)",
                                                  callback_data=f"cs:s:{case_id}")])
-        buttons.append([InlineKeyboardButton("📝 Add a note",
-                                             callback_data=f"cs:n:{case_id}"),
-                        InlineKeyboardButton("✏️ Edit",
-                                             callback_data=f"cs:e:{case_id}")])
+        row = [InlineKeyboardButton("📝 Add a note", callback_data=f"cs:n:{case_id}")]
+        if may_edit_cases(user_id):
+            row.append(InlineKeyboardButton("✏️ Edit", callback_data=f"cs:e:{case_id}"))
+        buttons.append(row)
         if online:
             buttons.append([InlineKeyboardButton("↩️ Hand back to SH",
                                                  callback_data=f"cs:h:{case_id}")])
@@ -856,9 +859,6 @@ async def cmd_cases(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if agent_status(uid) != "active" and not is_owner(uid):
         await gate(update)
         return
-    if not may_see_cases(uid):
-        await update.message.reply_text("Use /handover to see and close cases.")
-        return
     text, kb = cases_list(uid)
     await update.message.reply_text(text, parse_mode=constants.ParseMode.HTML,
                                     reply_markup=kb)
@@ -870,7 +870,7 @@ async def on_cases_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     query = update.callback_query
     uid = query.from_user.id
     if not may_see_cases(uid):
-        await query.answer("That's for the Online team and admins.", show_alert=True)
+        await query.answer("Send /start to the bot first.", show_alert=True)
         return
     parts = query.data.split(":")
     action = parts[1]
@@ -894,6 +894,8 @@ async def on_cases_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     else:
         await query.answer()
 
+    if action in ("e", "ep") and not may_edit_cases(uid):
+        return
     if action == "e":
         text, kb = edit_picker(case_id)
         await query.edit_message_text(text, parse_mode=constants.ParseMode.HTML,
@@ -1015,8 +1017,6 @@ async def on_case_note_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 # ✏️ Editing a case from /cases
 # --------------------------------------------------------------------------
 
-CASE_EDIT = 271
-EDIT_LABELS = {"prio": "Urgency", **{k: label for k, label, _ in CASE_FIELDS}}
 
 
 def edit_picker(case_id: int) -> tuple[str, InlineKeyboardMarkup]:
@@ -1038,28 +1038,12 @@ def edit_picker(case_id: int) -> tuple[str, InlineKeyboardMarkup]:
             f"or pick what to rewrite.{note}"), InlineKeyboardMarkup(rows)
 
 
-def save_case_edit(case_id: int, user_id: int, key: str, value: str) -> None:
-    """Change one part of a case, rebuild its written-out body, and log it."""
-    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
-    old = r[key] or ""
-    if old == value:
-        return
-    run(f"UPDATE ho_cases SET {key}=? WHERE id=?", (value or None, case_id))
-    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
-    if r["order_no"] is not None:
-        d = {k: r[k] or "" for k, _, _ in CASE_FIELDS}
-        run("UPDATE ho_cases SET body=? WHERE id=?", (compose_body(d), case_id))
-    side = "on" if is_online(user_id) else "sh"
-    log_case(case_id, user_id, side, "edited",
-             f"{EDIT_LABELS[key]}: {old or '(blank)'} → {value or '(blank)'}")
-
-
 async def on_case_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """cs:ef:<id>:<field> — ask for the new text."""
     query = update.callback_query
     uid = query.from_user.id
     _, _, raw, key = query.data.split(":", 3)
-    if not may_see_cases(uid) or key not in EDIT_LABELS or key == "prio":
+    if not may_edit_cases(uid) or key not in EDIT_LABELS or key == "prio":
         await query.answer("You can't do that here.", show_alert=True)
         return ConversationHandler.END
     r = q1("SELECT * FROM ho_cases WHERE id=?", (int(raw),))
@@ -1100,3 +1084,29 @@ async def on_case_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await update.message.reply_text(f"✏️ {EDIT_LABELS[key]} updated.\n\n" + text,
                                     reply_markup=kb)
     return ConversationHandler.END
+
+
+async def on_store_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """sc:x:<id> — ✅ Close under a case in a store chat. Closes the tapper's
+    own side: Online team or SH. The message updates; nothing new is posted."""
+    query = update.callback_query
+    uid = query.from_user.id
+    if not may_see_cases(uid):
+        await query.answer("This is for the SH and Online teams.", show_alert=True)
+        return
+    case_id = int(query.data.split(":")[2])
+    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    if not r or r["closed"]:
+        await query.answer("That case is already closed.")
+        await refresh_case_post(context.bot, case_id)
+        return
+    side = "on" if is_online(uid) else "sh"
+    if r[f"{side}_closed"]:
+        other = "SH" if side == "on" else "Online"
+        await query.answer(f"Already closed on your side — waiting on {other}.",
+                           show_alert=True)
+        return
+    async with write_lock:
+        close_case(case_id, uid, side=side)
+    await refresh_case_post(context.bot, case_id)
+    await query.answer(f"Closed on the {'Online' if side == 'on' else 'SH'} side ✓")
