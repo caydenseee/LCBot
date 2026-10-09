@@ -1110,3 +1110,107 @@ async def on_store_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         close_case(case_id, uid, side=side)
     await refresh_case_post(context.bot, case_id)
     await query.answer(f"Closed on the {'Online' if side == 'on' else 'SH'} side ✓")
+
+
+# --------------------------------------------------------------------------
+# 📊 Case report — weekly for the Online team and admins, or /report anytime
+# --------------------------------------------------------------------------
+
+def fmt_span(seconds: float) -> str:
+    hours = seconds / 3600
+    return f"{hours:.1f} h" if hours < 24 else f"{hours / 24:.1f} days"
+
+
+def case_report(channels: list, first: date, last: date) -> str:
+    """How each channel's cases went between first and last (inclusive)."""
+    start = datetime.combine(first, time(0, 0), TZ).isoformat()
+    end = datetime.combine(last + timedelta(days=1), time(0, 0), TZ).isoformat()
+    today = now().date()
+    lines = [f"📊 <b>Case report · {first.strftime('%-d %b')} – {last.strftime('%-d %b')}</b>"]
+    totals = {"new": 0, "closed": 0, "open": 0, "overdue": 0, "back": 0}
+    for key, flag, name in CHANNELS:
+        if key not in channels:
+            continue
+        new = q1("SELECT COUNT(*) c FROM ho_cases WHERE channel=? AND created_at>=? "
+                 "AND created_at<?", (key, start, end))["c"]
+        done = q("SELECT created_at, closed_at FROM ho_cases WHERE channel=? AND closed=1 "
+                 "AND closed_at>=? AND closed_at<?", (key, start, end))
+        open_rows = q("SELECT the_date, prio FROM ho_cases WHERE channel=? AND closed=0", (key,))
+        overdue = sum(1 for r in open_rows
+                      if sla_mark(case_due(date.fromisoformat(r["the_date"]), r["prio"]), today) == "🚨")
+        back = q1("SELECT COUNT(*) c FROM case_log l JOIN ho_cases h ON h.id=l.case_id "
+                  "WHERE h.channel=? AND l.action='handed back' AND l.created_at>=? "
+                  "AND l.created_at<?", (key, start, end))["c"]
+        spans = [(datetime.fromisoformat(r["closed_at"]) - datetime.fromisoformat(r["created_at"])).total_seconds()
+                 for r in done if r["closed_at"] and r["created_at"]]
+        for k, v in (("new", new), ("closed", len(done)), ("open", len(open_rows)),
+                     ("overdue", overdue), ("back", back)):
+            totals[k] += v
+        lines += ["", f"<b>{flag} {esc(name)}</b>"]
+        if not (new or done or open_rows or back):
+            lines.append("  Quiet — no cases")
+            continue
+        lines.append(f"  🆕 {new} new · ✅ {len(done)} closed · ⏳ {len(open_rows)} open"
+                     + (f" (🚨 {overdue} overdue)" if overdue else ""))
+        extra = []
+        if back:
+            extra.append(f"↩️ {back} handed back")
+        if spans:
+            extra.append(f"⏱ {fmt_span(sum(spans) / len(spans))} avg to close")
+        if extra:
+            lines.append("  " + " · ".join(extra))
+    if len(channels) > 1:
+        lines += ["", f"<b>All</b>: 🆕 {totals['new']} · ✅ {totals['closed']} · "
+                      f"⏳ {totals['open']}" + (f" (🚨 {totals['overdue']})" if totals["overdue"] else "")
+                      + (f" · ↩️ {totals['back']}" if totals["back"] else "")]
+    return "\n".join(lines)
+
+
+def report_channels(user_id: int) -> list:
+    """Admins see every channel; the Online team sees their own."""
+    if is_admin(user_id) and not is_online(user_id):
+        return [k for k, _, _ in CHANNELS]
+    return online_channels(user_id)
+
+
+async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/report — the last 7 days for your channels (admins: all of them)."""
+    if update.effective_chat.type != constants.ChatType.PRIVATE:
+        return
+    uid = update.effective_user.id
+    if not (is_online(uid) or is_admin(uid)):
+        return
+    channels = report_channels(uid)
+    if not channels:
+        await update.message.reply_text("You don't have any channels yet — an admin sets them.")
+        return
+    today = now().date()
+    await update.message.reply_text(case_report(channels, today - timedelta(days=6), today),
+                                    parse_mode=constants.ParseMode.HTML)
+
+
+async def job_case_report(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Monday morning: last week's cases, to each Online team member for their
+    channels and to admins for all of them."""
+    if now().weekday() != 0:
+        return
+    first, last = week_bounds(now().date() - timedelta(days=7))
+    sent = set()
+    for pm in online_team():
+        mine = json.loads(pm["channels"] or "[]")
+        if mine and pm["user_id"] not in sent:
+            try:
+                await context.bot.send_message(pm["user_id"], case_report(mine, first, last),
+                                               parse_mode=constants.ParseMode.HTML)
+                sent.add(pm["user_id"])
+            except Exception as e:
+                log.info("Couldn't send %s their case report: %s", pm["user_id"], e)
+    everything = case_report([k for k, _, _ in CHANNELS], first, last)
+    for aid in admin_ids():
+        if aid in sent:
+            continue
+        try:
+            await context.bot.send_message(aid, everything, parse_mode=constants.ParseMode.HTML)
+        except Exception:
+            pass
+    log.info("Case reports sent for %s", first)

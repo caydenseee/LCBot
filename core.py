@@ -2674,6 +2674,7 @@ ADMIN_GROUPS = [
         ("handovers", "Recent closing handovers"),
         ("linkchat", "Link a store's chat to its cases"),
         ("pmalerts", "New-case messages to the Online team on/off"),
+        ("report", "Case report by channel, last 7 days"),
         ("channels", "Online team and the channels they cover"),
         ("access", "Who approved or declined whom"),
         ("roster", "Who's on the list"),
@@ -2720,6 +2721,7 @@ ONLINE_HELP = (
     "  📝 add a note (what's done, what's next)\n"
     "  ↩️ hand it back to SH if you need something from them\n"
     "  ✏️ edit it if a detail is wrong\n"
+    "/report — how your channels' cases went this past week\n"
     "Or tap <b>App</b> by the 📎 for the same cases, sorted into "
     "Shopee, Lazada and Webstore.\n"
     "/help — this list again\n\n"
@@ -2728,6 +2730,7 @@ ONLINE_HELP = (
 
 ONLINE_COMMANDS = [
     ("cases", "Open cases for your channels"),
+    ("report", "Your channels' cases, last 7 days"),
     ("help", "List commands"),
 ]
 
