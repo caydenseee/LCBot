@@ -419,6 +419,42 @@ async def cmd_channels(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     )
 
 
+async def cmd_actas(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/actas online | /actas sh — test bot only (TEST_MODE=on): the owner
+    switches their own account to the Online team's side and back."""
+    user = update.effective_user
+    if (not TEST_MODE or not is_owner(user.id)
+            or update.effective_chat.type != constants.ChatType.PRIVATE):
+        return
+    want = context.args[0].lower() if context.args else ""
+    if want not in ("online", "sh"):
+        await update.message.reply_text(
+            "Test mode: /actas online to see the Online team's side, "
+            "/actas sh to come back.")
+        return
+    async with write_lock:
+        touch_agent(user, dm_ok=1)
+        if want == "online":
+            run("UPDATE agents SET role='online', status='active', "
+                "channels=COALESCE(channels, '[]') WHERE user_id=?", (user.id,))
+        else:
+            run("UPDATE agents SET role='agent', status='active' WHERE user_id=?",
+                (user.id,))
+    await refresh_menu_for(context.bot, user.id)
+    if want == "online":
+        await update.message.reply_text(
+            "🧪 <b>Test mode: you're on the Online team's side now.</b>\n"
+            "/actas sh switches back.\n\n" + ONLINE_HELP,
+            parse_mode=constants.ParseMode.HTML, reply_markup=ReplyKeyboardRemove())
+        await update.message.reply_text(
+            "<b>Which channels do you look after?</b>\nTick all that apply, then Done.",
+            parse_mode=constants.ParseMode.HTML, reply_markup=channel_picker(user.id))
+    else:
+        await update.message.reply_text(
+            "🧪 Back on the SH side. /help shows your commands.",
+            reply_markup=agent_keyboard(user.id))
+
+
 async def cmd_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Who approved or declined whom, and when."""
     if not is_admin(update.effective_user.id):

@@ -160,6 +160,9 @@ OPS_CHAT_ID = env_int("OPS_CHAT_ID")
 OPS_THREAD_ID = env_int("OPS_THREAD_ID") or None
 # Mini App. PUBLIC_URL comes from Railway once you generate a domain.
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "").strip().rstrip("/")
+# Set TEST_MODE=on only on the test bot: lets the owner try the Online team's
+# side themselves with /actas. Never set it on the live bot.
+TEST_MODE = os.environ.get("TEST_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
 # Telegram's webview caches a Mini App per URL, so a bad page can survive a
 # deploy. Stamping the URL on startup makes every deploy a fresh address.
 BUILD_STAMP = datetime.now().strftime("%Y%m%d%H%M%S")
@@ -1039,6 +1042,11 @@ def online_channels(user_id: int) -> list:
 
 def role_of(user_id: int) -> str:
     if is_owner(user_id):
+        if TEST_MODE:
+            # The owner trying out the Online team's side with /actas online.
+            row = q1("SELECT role FROM agents WHERE user_id=?", (user_id,))
+            if row and row["role"] == "online":
+                return "online"
         return "owner"
     row = q1("SELECT role FROM agents WHERE user_id=? AND active=1", (user_id,))
     return row["role"] if row else "agent"
@@ -1929,16 +1937,25 @@ def sla_mark(due: date, today: date | None = None) -> str:
     return "⏰" if today == due else ""
 
 
+def online_team() -> list:
+    """Everyone in the Online team. On the test bot (TEST_MODE) the owner
+    counts too once they've picked channels, even while back on the SH side,
+    so one person can test both sides."""
+    rows = q("SELECT * FROM agents WHERE role='online' AND status='active'")
+    if TEST_MODE:
+        seen = {r["user_id"] for r in rows}
+        rows += [r for r in q("SELECT * FROM agents WHERE channels IS NOT NULL "
+                              "AND channels <> '[]'")
+                 if is_owner(r["user_id"]) and r["user_id"] not in seen]
+    return rows
+
+
 def online_covers(channel: str | None) -> bool:
     """Whether a case on this channel also needs the Online team's tick:
     true once someone in the Online role looks after that channel."""
     if not channel:
         return False
-    return any(
-        channel in json.loads(r["channels"] or "[]")
-        for r in q("SELECT channels FROM agents WHERE role='online' "
-                   "AND status='active' AND channels IS NOT NULL")
-    )
+    return any(channel in json.loads(r["channels"] or "[]") for r in online_team())
 
 
 def log_case(case_id: int, user_id: int | None, side: str, action: str,
@@ -2181,7 +2198,7 @@ async def notify_pms(bot, agent_id: int) -> None:
         if not r["closed"]:
             by_channel.setdefault(r["channel"], []).append(r)
     who = display_name_of(agent_id, "SH")
-    for pm in q("SELECT * FROM agents WHERE role='online' AND status='active'"):
+    for pm in online_team():
         mine = [ch for ch in json.loads(pm["channels"] or "[]") if ch in by_channel]
         if not mine:
             continue
