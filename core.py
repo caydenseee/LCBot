@@ -475,6 +475,7 @@ for _col, _ddl in [
     ("post_id", "INTEGER"),
     ("handed_back", "INTEGER NOT NULL DEFAULT 0"),
     ("pm_notified", "INTEGER NOT NULL DEFAULT 0"),
+    ("origin", "TEXT NOT NULL DEFAULT 'sh'"),     # 'on' = an Online request
 ]:
     if _col not in _hc_cols:
         db.execute(f"ALTER TABLE ho_cases ADD COLUMN {_col} {_ddl}")
@@ -494,7 +495,8 @@ db.execute("""CREATE TABLE IF NOT EXISTS case_log (
     note       TEXT,
     created_at TEXT NOT NULL
 )""")
-# One message in a store's chat, listing new cases from one handover.
+# One message in a store's chat: new cases from one handover, or one
+# Online request.
 db.execute("""CREATE TABLE IF NOT EXISTS channel_posts (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     channel    TEXT NOT NULL,
@@ -505,6 +507,8 @@ db.execute("""CREATE TABLE IF NOT EXISTS channel_posts (
     the_date   TEXT NOT NULL,
     created_at TEXT NOT NULL
 )""")
+if "kind" not in {r[1] for r in db.execute("PRAGMA table_info(channel_posts)")}:
+    db.execute("ALTER TABLE channel_posts ADD COLUMN kind TEXT NOT NULL DEFAULT 'handover'")
 if "sh_closed" not in _hc_cols:
     # Cases closed before the two ticks existed count as closed on both sides.
     db.execute(
@@ -1916,12 +1920,33 @@ def case_example(key: str, platform: str | None, store: str | None) -> str:
     return CASE_EXAMPLES.get(key, "")
 
 
-def compose_body(d: dict) -> str:
+# An Online request is the same case, asked the other way round: Online
+# tells SH what's needed with the customer.
+REQUEST_LABELS = {"done": "What Online has done", "need": "What SH needs to do"}
+REQUEST_HINTS = {
+    "happened": "What's going on? One or two lines.",
+    "done": "What Online has already checked or done.",
+    "need": "What should SH do with the customer?",
+}
+REQUEST_EXAMPLES = {
+    "happened": "Item is out of stock until next week",
+    "done": "Checked with the warehouse",
+    "need": "Ask the customer if they're OK to wait or want to cancel",
+}
+
+
+def case_label(key: str, origin: str = "sh") -> str:
+    base = {k: label for k, label, _ in CASE_FIELDS}.get(key, key)
+    return REQUEST_LABELS.get(key, base) if origin == "on" else base
+
+
+def compose_body(d: dict, origin: str = "sh") -> str:
     """The case in the same shape agents have always written it."""
     lines = [d["order_no"], d["product"], "", f"• {d['happened']}"]
     if d.get("done"):
         lines.append(f"• {d['done']}")
-    lines += ["", f"‼️Need Help: {d['need']}"]
+    ask = "📣 SH to do" if origin == "on" else "‼️Need Help"
+    lines += ["", f"{ask}: {d['need']}"]
     return "\n".join(lines)
 
 
@@ -2003,18 +2028,23 @@ def case_history(case_id: int) -> list:
     return q("SELECT * FROM case_log WHERE case_id=? ORDER BY id", (case_id,))
 
 
-def insert_case(agent_id: int, d: dict, the_date: date) -> int:
-    """Save a new case. Fills in its channel and the written-out body."""
+def insert_case(agent_id: int, d: dict, the_date: date, origin: str = "sh") -> int:
+    """Save a new case. Fills in its channel and the written-out body.
+    origin 'on' is an Online request: posted to its store chat straight away,
+    so it's marked as already posted and the PM isn't told about their own."""
     d["channel"] = channel_for(d["platform"], d.get("store"))
-    d["body"] = compose_body(d)
+    d["body"] = compose_body(d, origin)
+    done_already = 1 if origin == "on" else 0
     cur = run(
         "INSERT INTO ho_cases (agent_id, the_date, section, prio, platform, flag,"
         " store, username, body, channel, order_no, product, happened, done,"
-        " need, created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        " need, created_at, origin, pm_notified, chat_posted)"
+        " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (agent_id, the_date.isoformat(), d["section"], d["prio"], d["platform"],
          d.get("flag", ""), d.get("store", ""), d["username"], d["body"],
          d["channel"], d["order_no"], d["product"], d["happened"],
-         d.get("done") or None, d["need"], now().isoformat()),
+         d.get("done") or None, d["need"], now().isoformat(),
+         origin, done_already, done_already),
     )
     return cur.lastrowid
 
@@ -2054,7 +2084,8 @@ def save_case_edit(case_id: int, user_id: int, key: str, value: str) -> None:
     r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
     if r["order_no"] is not None:
         d = {k: r[k] or "" for k, _, _ in CASE_FIELDS}
-        run("UPDATE ho_cases SET body=? WHERE id=?", (compose_body(d), case_id))
+        run("UPDATE ho_cases SET body=? WHERE id=?",
+            (compose_body(d, r["origin"]), case_id))
     side = "on" if is_online(user_id) else "sh"
     log_case(case_id, user_id, side, "edited",
              f"{EDIT_LABELS[key]}: {old or '(blank)'} → {value or '(blank)'}")
@@ -2162,12 +2193,15 @@ def render_channel_post(post_id: int) -> str:
     cases = q("SELECT * FROM ho_cases WHERE post_id=? ORDER BY id", (post_id,))
     who = display_name_of(p["agent_id"], "") if p["agent_id"] else ""
     day = date.fromisoformat(p["the_date"]).strftime("%-d %b %Y")
-    out = [f"📋 Handover · {CHANNEL_NAMES.get(p['channel'], p['channel'])}",
+    heading = "📣 Online request" if p["kind"] == "request" else "📋 Handover"
+    out = [f"{heading} · {CHANNEL_NAMES.get(p['channel'], p['channel'])}",
            f"{day}" + (f" · from {who}" if who else "")]
     for r in cases:
         out += ["", "──────────", case_status_line(r)]
         c = case_row_to_dict(r)
         c["handback"] = ""                  # the note line below says it
+        if p["kind"] == "request":
+            c["request"] = ""               # the heading already says it
         out.append(render_case(c))
         if note_line(r["id"]):              # the latest word, under the case
             out += ["", note_line(r["id"])]
@@ -2201,42 +2235,102 @@ async def post_new_cases_to_chats(bot, agent_id: int) -> int:
 
     sent = 0
     for channel, cases in by_channel.items():
-        where = channel_chat(channel)
-        # Keep each message under Telegram's length limit.
-        chunks, size = [[]], 0
-        for r in cases:
-            n = len(render_case(case_row_to_dict(r))) + 60
-            if chunks[-1] and size + n > TG_LIMIT - 300:
-                chunks.append([])
-                size = 0
-            chunks[-1].append(r)
-            size += n
-        for chunk in chunks:
-            pid = run(
-                "INSERT INTO channel_posts (channel, chat_id, thread_id, agent_id,"
-                " the_date, created_at) VALUES (?,?,?,?,?,?)",
-                (channel, where["chat"], where.get("thread"), agent_id,
-                 now().date().isoformat(), now().isoformat()),
-            ).lastrowid
-            ids = [r["id"] for r in chunk]
-            marks = ",".join("?" * len(ids))
-            run(f"UPDATE ho_cases SET post_id=?, chat_posted=1 WHERE id IN ({marks})",
-                (pid, *ids))
-            kw = {"message_thread_id": where["thread"]} if where.get("thread") else {}
-            try:
-                msg = await bot.send_message(
-                    where["chat"], render_channel_post(pid),
-                    reply_markup=channel_post_keyboard(pid, bot.username), **kw)
-                run("UPDATE channel_posts SET message_id=? WHERE id=?",
-                    (msg.message_id, pid))
-                sent += 1
-            except Exception as e:
-                # Try again with the next handover.
-                log.warning("Couldn't post to the %s chat: %s", channel, e)
-                run(f"UPDATE ho_cases SET post_id=NULL, chat_posted=0 "
-                    f"WHERE id IN ({marks})", tuple(ids))
-                run("DELETE FROM channel_posts WHERE id=?", (pid,))
+        sent += await send_channel_post(bot, channel, cases, agent_id)
     return sent
+
+
+async def send_channel_post(bot, channel: str, cases: list, agent_id: int,
+                            kind: str = "handover") -> int:
+    """Post cases to a channel's linked chat, split to fit. A failed send is
+    undone so it's tried again next time."""
+    where = channel_chat(channel)
+    if not where:
+        return 0
+    sent = 0
+    # Keep each message under Telegram's length limit.
+    chunks, size = [[]], 0
+    for r in cases:
+        n = len(render_case(case_row_to_dict(r))) + 60
+        if chunks[-1] and size + n > TG_LIMIT - 300:
+            chunks.append([])
+            size = 0
+        chunks[-1].append(r)
+        size += n
+    for chunk in chunks:
+        pid = run(
+            "INSERT INTO channel_posts (channel, chat_id, thread_id, agent_id,"
+            " the_date, created_at, kind) VALUES (?,?,?,?,?,?,?)",
+            (channel, where["chat"], where.get("thread"), agent_id,
+             now().date().isoformat(), now().isoformat(), kind),
+        ).lastrowid
+        ids = [r["id"] for r in chunk]
+        marks = ",".join("?" * len(ids))
+        run(f"UPDATE ho_cases SET post_id=?, chat_posted=1 WHERE id IN ({marks})",
+            (pid, *ids))
+        kw = {"message_thread_id": where["thread"]} if where.get("thread") else {}
+        try:
+            msg = await bot.send_message(
+                where["chat"], render_channel_post(pid),
+                reply_markup=channel_post_keyboard(pid, bot.username), **kw)
+            run("UPDATE channel_posts SET message_id=? WHERE id=?",
+                (msg.message_id, pid))
+            sent += 1
+        except Exception as e:
+            # Try again with the next handover.
+            log.warning("Couldn't post to the %s chat: %s", channel, e)
+            run(f"UPDATE ho_cases SET post_id=NULL, chat_posted=0 "
+                f"WHERE id IN ({marks})", tuple(ids))
+            run("DELETE FROM channel_posts WHERE id=?", (pid,))
+    return sent
+
+
+async def post_request(bot, case_id: int, pm_id: int) -> bool:
+    """A new Online request goes straight to its store's chat, where SH sees
+    it. No linked chat: TC Online instead, so SH always hears about it."""
+    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    if not r:
+        return False
+    if channel_chat(r["channel"]):
+        run("UPDATE ho_cases SET chat_posted=0 WHERE id=?", (case_id,))
+        if await send_channel_post(bot, r["channel"], [r], pm_id, kind="request"):
+            return True
+        run("UPDATE ho_cases SET chat_posted=1 WHERE id=?", (case_id,))
+    c = case_row_to_dict(r)
+    return await post_ops(
+        bot, f"📣 Online request · {CHANNEL_NAMES.get(r['channel'] or '', '')}\n\n"
+             + render_case(c) + "\n\nIt's at the top of /handover.")
+
+
+async def notify_reply(bot, case_id: int, author_id: int, note: str | None = None,
+                       closed: bool = False) -> None:
+    """SH answered something Online is waiting on: tell that PM privately.
+    Covers Online requests (the PM who raised it) and handed-back cases (the PM
+    who handed it back). Online's own notes and closes don't ping anyone."""
+    if is_online(author_id):
+        return
+    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    if not r:
+        return
+    if r["origin"] == "on":
+        pm = r["agent_id"]
+    else:
+        back = q1("SELECT user_id FROM case_log WHERE case_id=? AND action='handed back' "
+                  "ORDER BY id DESC LIMIT 1", (case_id,))
+        pm = back["user_id"] if back else None
+    if not pm or pm == author_id:
+        return
+    who = display_name_of(author_id, "SH")
+    where = CHANNEL_NAMES.get(r["channel"] or "", "")
+    if closed:
+        text = (f"✅ {who} has done {r['username']} ({where}).\n"
+                + ("Confirm it in /cases to close it."
+                   if not r["on_closed"] else "It's fully closed now."))
+    else:
+        text = f"💬 {who} replied on {r['username']} ({where}):\n{note}\n\nOpen /cases to reply."
+    try:
+        await bot.send_message(pm, text)
+    except Exception as e:
+        log.info("Couldn't tell %s about a reply: %s", pm, e)
 
 
 def store_chats_pending(extra_channels=()) -> bool:
@@ -2318,6 +2412,8 @@ db.commit()
 
 def render_case(c: dict) -> str:
     lines = [f"▫️{c['platform']}", f"{c['prio']} {c['username']}"]
+    if c.get("request"):
+        lines.insert(0, f"📣 Online request from {c['request']}")
     if c.get("store"):                       # Duoke only — Livechat has no brands
         lines.append(f"{c.get('flag', '')}{c['store']}")
     out = "\n".join(lines) + "\n" + c["body"].strip()
@@ -2404,6 +2500,8 @@ def case_row_to_dict(r) -> dict:
         if n:
             back = f"{display_name_of(n['user_id'], 'Online')}: {n['note']}"
     return {
+        "request": (display_name_of(r["agent_id"], "Online")
+                    if r["origin"] == "on" else ""),
         "handback": back,
         "section": r["section"], "prio": r["prio"], "platform": r["platform"],
         "flag": r["flag"], "store": r["store"], "username": r["username"],
@@ -2721,6 +2819,7 @@ ONLINE_HELP = (
     "  📝 add a note (what's done, what's next)\n"
     "  ↩️ hand it back to SH if you need something from them\n"
     "  ✏️ edit it if a detail is wrong\n"
+    "  ➕ New Online request: ask SH to do something with a customer\n"
     "/report — how your channels' cases went this past week\n"
     "Or tap <b>App</b> by the 📎 for the same cases, sorted into "
     "Shopee, Lazada and Webstore.\n"
@@ -3199,7 +3298,8 @@ function caseCard(c, closed) {
     + `${esc(c.due)}</span>`);
   if (c.section === 'follow') bits.push('follow up');
   h += `<div class="meta">${bits.join(' · ')}</div>`;
-  if (c.waiting) h += `<div class="st">${esc(c.status)}</div>`;
+  if (c.request && !c.shClosed && !c.handedBack) h += `<div class="st">📣 Online request from ${esc(c.request)}</div>`;
+  else if (c.waiting) h += `<div class="st">${esc(c.status)}</div>`;
   h += '</div></div>';
   if (c.note) h += `<div class="nt">${esc(c.note)}</div>`;
   if (HO_SHOWN[c.id]) {
@@ -3223,11 +3323,15 @@ function caseCard(c, closed) {
 
 function caseForm(d) {
   const f = HO_FORM;
-  let h = '<h2>New case</h2>';
-  h += '<div class="fld"><label>When</label><div class="pick">'
-    + `<button data-f="section" data-v="open" class="${f.section === 'open' ? 'on' : ''}">🔸 Open now</button>`
-    + `<button data-f="section" data-v="follow" class="${f.section === 'follow' ? 'on' : ''}">🔹 ${esc(d.nextWorking)}</button>`
-    + '</div></div>';
+  const req = ONLINE;   // the Online team's new cases are requests for SH
+  let h = req ? '<h2>📣 New Online request</h2>'
+       + '<div class="note" style="margin-top:0">Goes straight to SH in that store chat.</div>' : '<h2>New case</h2>';
+  if (!req) {
+    h += '<div class="fld"><label>When</label><div class="pick">'
+      + `<button data-f="section" data-v="open" class="${f.section === 'open' ? 'on' : ''}">🔸 Open now</button>`
+      + `<button data-f="section" data-v="follow" class="${f.section === 'follow' ? 'on' : ''}">🔹 ${esc(d.nextWorking)}</button>`
+      + '</div></div>';
+  }
   h += '<div class="fld"><label>How urgent</label><div class="pick">'
     + d.priorities.map(p =>
         `<button data-f="prio" data-v="${p.emoji}" class="${f.prio === p.emoji ? 'on' : ''}">${p.emoji} ${esc(p.name)}</button>`
@@ -3248,18 +3352,20 @@ function caseForm(d) {
   const picked = storeList.find(s => s.store === f.store);
   for (const fd of d.fields) {
     const v = esc(f[fd.key] || '');
-    let eg = fd.example;
+    let eg = (req && d.request.examples[fd.key]) || fd.example;
     if (fd.key === 'order_no') {
       eg = picked ? picked.orderExample : 'Pick a store first';
     }
-    h += `<div class="fld"><label>${esc(fd.label)}${fd.required ? '' : ' (optional)'}</label>`;
-    h += `<div class="note" style="margin:0 0 4px">${esc(fd.hint)}</div>`;
+    const label = (req && d.request.labels[fd.key]) || fd.label;
+    const hint = (req && d.request.hints[fd.key]) || fd.hint;
+    h += `<div class="fld"><label>${esc(label)}${fd.required ? '' : ' (optional)'}</label>`;
+    h += `<div class="note" style="margin:0 0 4px">${esc(hint)}</div>`;
     h += long[fd.key]
       ? `<textarea id="f_${fd.key}" rows="2" placeholder="${eg ? 'e.g. ' + esc(eg) : ''}">${v}</textarea>`
       : `<input id="f_${fd.key}" value="${v}" placeholder="${eg ? 'e.g. ' + esc(eg) : ''}">`;
     h += '</div>';
   }
-  h += '<button class="big" id="saveCase">Save this case</button>';
+  h += `<button class="big" id="saveCase">${req ? '📣 Send to SH' : 'Save this case'}</button>`;
   h += '<button class="big" id="cancelCase" style="background:var(--tg-theme-secondary-bg-color,#eee);color:var(--tg-theme-text-color,#111);margin-top:8px">Cancel</button>';
   return h;
 }
@@ -3285,7 +3391,8 @@ async function loadHandover() {
     h += '<div class="note" style="margin-top:0">Untick a case to close it. '
        + 'Cases waiting on Online stay here until they close it too.</div>';
     // Anything Online handed back goes first: someone is waiting on SH.
-    const order = [...d.openCases].sort((a, b) => (b.handedBack - a.handedBack) || (a.id - b.id));
+    const first = c => (c.handedBack || (c.request && !c.shClosed)) ? 1 : 0;
+    const order = [...d.openCases].sort((a, b) => (first(b) - first(a)) || (a.id - b.id));
     for (const c of order) h += caseCard(c, false);
   }
 
@@ -3367,9 +3474,10 @@ function wireHandover() {
     keepForm();
     save.disabled = true; save.textContent = 'Saving…';
     const out = await post('/api/case', HO_FORM);
-    save.disabled = false; save.textContent = 'Save this case';
+    save.disabled = false; save.textContent = ONLINE ? '📣 Send to SH' : 'Save this case';
     if (!out.ok) { toast(out.error || 'Could not save that.'); return; }
-    toast('Added ' + out.username);
+    toast(out.request ? (out.sent ? 'Sent to SH' : 'Saved — SH will see it in /handover')
+                      : 'Added ' + out.username);
     HO_FORM = null;
     await loadHandover();
   };
@@ -3496,6 +3604,11 @@ function keepEdit(id) {
 
 function renderOnline(d) {
   const app = document.getElementById('app');
+  if (HO_FORM) {
+    app.innerHTML = caseForm(d);
+    wireHandover();
+    return;
+  }
   const mine = new Set(d.myChannels || []);
   const open = d.openCases;
   if (!ON_GROUP) {
@@ -3510,6 +3623,7 @@ function renderOnline(d) {
   let h = '<h1>Handover cases</h1>';
   h += `<div class="sub">${open.length} open`
      + `${mine.size ? ' · ' + nMine + ' on your channels' : ''}</div>`;
+  h += '<button class="big" id="newCase" style="margin:10px 0 0">📣  New Online request</button>';
 
   h += '<div class="otabs">' + ON_GROUPS.map(([g, label]) => {
     const n = open.filter(c => c.group === g).length;

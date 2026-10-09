@@ -504,8 +504,10 @@ def handover_payload(user_id: int) -> dict:
             "onClosed": bool(r["on_closed"]),
             "handedBack": bool(r["handed_back"]),
             "waiting": (not closed) and bool(r["sh_closed"] or r["on_closed"]
-                                             or r["handed_back"]),
+                                             or r["handed_back"] or r["origin"] == "on"),
             "status": case_status_line(r),
+            "request": (display_name_of(r["agent_id"], "Online")
+                        if r["origin"] == "on" else ""),
             "group": order_kind(r["platform"], r["store"]),
             "region": {"TH": "TH", "WEBSTORE": "SG", "WEBSTORE_MY": "MY"}.get(
                 r["channel"] or "", (r["channel"] or "").split("_")[-1]),
@@ -532,6 +534,8 @@ def handover_payload(user_id: int) -> dict:
                     "channel": CHANNEL_NAMES.get(STORE_CHANNEL.get(st, ""), ""),
                     "orderExample": case_example("order_no", "DUOKE", st)}
                    for f, st in STORES],
+        "request": {"labels": REQUEST_LABELS, "hints": REQUEST_HINTS,
+                    "examples": REQUEST_EXAMPLES},
         "fields": [{"key": k, "label": lb, "required": req,
                     "hint": CASE_HINTS[k], "example": CASE_EXAMPLES.get(k, "")}
                    for k, lb, req in CASE_FIELDS],
@@ -561,7 +565,7 @@ def case_history_lines(case_id: int, limit: int = 8) -> list:
 
 # What the Online team may do from the app.
 ONLINE_POSTS = {"/api/case/toggle", "/api/case/note", "/api/case/handback",
-                "/api/case/edit"}
+                "/api/case/edit", "/api/case"}
 
 
 def web_case_edit(user_id: int, case_id: int, changes: dict) -> dict:
@@ -618,6 +622,7 @@ def web_case_note(user_id: int, case_id: int, note: str) -> dict:
         return {"ok": False, "error": "That case is gone."}
     log_case(case_id, user_id, "on" if is_online(user_id) else "sh", "note", note[:500])
     on_bot_loop(refresh_case_post(bot_ref(), case_id))
+    on_bot_loop(notify_reply(bot_ref(), case_id, user_id, note=note[:500]))
     return {"ok": True, "username": row["username"]}
 
 
@@ -630,6 +635,8 @@ def web_case_toggle(user_id: int, case_id: int, close: bool) -> dict:
     else:
         reopen_case(case_id, user_id)
     on_bot_loop(refresh_case_post(bot_ref(), case_id))
+    if close:
+        on_bot_loop(notify_reply(bot_ref(), case_id, user_id, closed=True))
     return {"ok": True, "closed": close, "username": row["username"]}
 
 
@@ -655,6 +662,12 @@ def web_case_add(user_id: int, c: dict) -> dict:
 
     d.update(section="follow" if c.get("section") == "follow" else "open",
              prio=prio, platform=platform, flag=flag, store=store)
+    if is_online(user_id):
+        d["section"] = "open"
+        cid = insert_case(user_id, d, now().date(), origin="on")
+        log_case(cid, user_id, "on", "raised")
+        sent = bool(on_bot_loop(post_request(bot_ref(), cid, user_id), timeout=30))
+        return {"ok": True, "username": d["username"], "request": True, "sent": sent}
     insert_case(user_id, d, now().date())
     return {"ok": True, "username": d["username"]}
 
