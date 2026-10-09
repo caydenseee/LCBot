@@ -78,6 +78,7 @@ async def sync_store_chats(bot, agent_id: int, closed_ids=(),
         skip_store_chats()
     for cid in closed_ids:
         await refresh_case_post(bot, cid)
+        await notify_reply(bot, cid, agent_id, closed=True)
     await notify_pms(bot, agent_id)
 
 
@@ -220,13 +221,16 @@ async def on_handover_none(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
 def case_picker(keep: set) -> InlineKeyboardMarkup:
     rows = []
-    for c in sorted(open_cases(), key=lambda r: (not r["handed_back"], r["id"])):
+    for c in sorted(open_cases(), key=lambda r: (
+            not (r["handed_back"] or r["origin"] == "on"), r["id"])):
         mark = "✅" if c["id"] in keep else "☑️"
         who = display_name_of(c["agent_id"], "")
         due = case_due(date.fromisoformat(c["the_date"]), c["prio"])
         label = f"{mark} {c['prio']} {c['username']}"
         if c["handed_back"]:
             label = f"↩️ {label}"
+        elif c["origin"] == "on":
+            label = f"📣 {label}"
         elif c["on_closed"]:
             label += " · ☑️ON"
         if c["channel"]:
@@ -448,6 +452,8 @@ async def show_store(query, context) -> int:
 
 def case_head(d: dict) -> str:
     head = f"{d['prio']} ▫️{d['platform']}"
+    if d.get("request"):
+        head = "📣 Online request\n" + head
     if d.get("store"):
         head += f" · {d['flag']}{d['store']}"
     if d["platform"] == "LIVECHAT" and not d.get("store"):   # older cases
@@ -460,12 +466,17 @@ def field_prompt(d: dict) -> str:
     step = d.get("_step", 0)
     key, label, required = CASE_FIELDS[step]
     example = case_example(key, d.get("platform"), d.get("store"))
+    hint = CASE_HINTS[key]
+    if d.get("request"):
+        label = case_label(key, "on")
+        hint = REQUEST_HINTS.get(key, hint)
+        example = REQUEST_EXAMPLES[key] if key in REQUEST_EXAMPLES else example
     tail = "/skip if nothing yet · " if not required else ""
     return (
         f"{case_head(d)}\n\n"
         f"<b>{step + 1}/{len(CASE_FIELDS)} · {label}</b>"
         f"{'' if required else ' (optional)'}\n"
-        f"{esc(CASE_HINTS[key])}\n"
+        f"{esc(hint)}\n"
         + (f"<i>e.g. {esc(example)}</i>\n" if example else "")
         + "\n"
         f"<i>{tail}/back to change the last answer · /cancel to stop</i>"
@@ -483,12 +494,27 @@ async def ask_for_case(query, context) -> int:
 
 
 async def cancel_handover(query, context) -> int:
+    request = context.user_data.get("ho_draft", {}).get("request")
     for k in ("ho_cases", "ho_draft", "ho_keep"):
         context.user_data.pop(k, None)
     await query.edit_message_text(
+        "Request cancelled — nothing was sent.\n\n/cases to start again."
+        if request else
         "Handover cancelled — nothing was posted.\n\n/handover to start again."
     )
     return ConversationHandler.END
+
+
+async def on_request_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """cs:new — the Online team raises a case for SH, using the same steps."""
+    query = update.callback_query
+    if not is_online(query.from_user.id):
+        await query.answer("Online requests come from the Online team.", show_alert=True)
+        return ConversationHandler.END
+    await query.answer()
+    context.user_data["ho_cases"] = []
+    context.user_data["ho_draft"] = {"section": "open", "request": True}
+    return await show_prio(query, context)
 
 
 async def on_ho_section(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -516,6 +542,8 @@ async def on_ho_prio(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if choice == "cancel":
         return await cancel_handover(query, context)
     if choice == "back":
+        if context.user_data.get("ho_draft", {}).get("request"):
+            return await cancel_handover(query, context)
         n = len(context.user_data.get("ho_cases", [])) + 1
         return await show_section(query, context, n)
     context.user_data["ho_draft"]["prio"] = choice
@@ -610,6 +638,8 @@ async def next_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return HO_BODY
 
     d.pop("_step", None)
+    if d.pop("request", False):
+        return await send_request(update, context, d)
     d["body"] = compose_body(d)
     context.user_data.setdefault("ho_cases", []).append(d)
     context.user_data.pop("ho_draft", None)
@@ -620,6 +650,25 @@ async def next_field(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         reply_markup=more_keyboard(),
     )
     return HO_MORE
+
+
+async def send_request(update: Update, context: ContextTypes.DEFAULT_TYPE, d: dict) -> int:
+    uid = update.effective_user.id
+    async with write_lock:
+        cid = insert_case(uid, d, now().date(), origin="on")
+        log_case(cid, uid, "on", "raised")
+    for k in ("ho_cases", "ho_draft", "ho_keep"):
+        context.user_data.pop(k, None)
+    sent = await post_request(context.bot, cid, uid)
+    where = channel_chat(d["channel"])
+    to = (f"in {where.get('title') or 'the store chat'}" if where else "in TC Online")
+    head = (f"📣 Sent to SH {to}." if sent else
+            "📣 Saved. SH will see it at the top of /handover.")
+    text, kb = case_view(cid, uid)
+    await update.message.reply_text(
+        f"{head} You'll get a message when they reply or close it.\n\n{text}",
+        reply_markup=kb)
+    return ConversationHandler.END
 
 
 def more_keyboard() -> InlineKeyboardMarkup:
@@ -753,6 +802,8 @@ def case_button_label(r) -> str:
     label = f"{r['prio']} {r['username']} · {CHANNEL_NAMES.get(r['channel'] or '', '?')}"
     if r["handed_back"]:
         label = "↩️ " + label
+    elif r["origin"] == "on" and not r["sh_closed"]:
+        label = "📣 " + label
     elif r["sh_closed"]:
         label += " · ☑️SH"
     elif r["on_closed"]:
@@ -770,14 +821,18 @@ def cases_list(user_id: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
     rows = q("SELECT * FROM ho_cases WHERE closed=0 ORDER BY id")
     own = [r for r in rows if r["channel"] in mine]
     rest = [r for r in rows if r["channel"] not in mine]
+    new_btn = ([[InlineKeyboardButton("➕ New Online request", callback_data="cs:new")]]
+               if is_online(user_id) else [])
     if not rows:
-        return "📋 <b>Open cases</b>\n\nNothing open right now 🎉", None
+        return ("📋 <b>Open cases</b>\n\nNothing open right now 🎉",
+                InlineKeyboardMarkup(new_btn) if new_btn else None)
     lines = ["📋 <b>Open cases</b>", ""]
     if mine:
         lines.append(f"Your channels: {len(own)} · Others: {len(rest)}")
     else:
         lines.append(f"{len(rows)} open")
-    lines += ["", "↩️ handed back to SH · ☑️SH / ☑️ON one side has closed it",
+    lines += ["", "📣 Online request · ↩️ handed back to SH",
+              "☑️SH / ☑️ON one side has closed it",
               "⏰ due today · 🚨 overdue", "", "<i>Tap a case to open it.</i>"]
     # Own channels first, a page at a time: keeps it scannable on a phone and
     # well under Telegram's 100-button limit.
@@ -802,7 +857,7 @@ def cases_list(user_id: int, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
             nav.append(InlineKeyboardButton("Next ▶️", callback_data=f"cs:l:{page + 1}"))
         buttons.append(nav)
     buttons.append([InlineKeyboardButton("🔄 Refresh", callback_data=here)])
-    return "\n".join(lines), InlineKeyboardMarkup(buttons)
+    return "\n".join(lines), InlineKeyboardMarkup(new_btn + buttons)
 
 
 def case_view(case_id: int, user_id: int) -> tuple[str, InlineKeyboardMarkup]:
@@ -885,6 +940,7 @@ async def on_cases_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         async with write_lock:
             close_case(case_id, uid, side="sh")
         await refresh_case_post(context.bot, case_id)
+        await notify_reply(context.bot, case_id, uid, closed=True)
         await query.answer("Closed on the SH side ✓")
     elif action == "f" and is_admin(uid):
         async with write_lock:
@@ -1005,6 +1061,8 @@ async def on_case_note_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await refresh_case_post(context.bot, case_id)
     if action == "h":
         await announce_handback(context.bot, case_id, uid, note)
+    else:
+        await notify_reply(context.bot, case_id, uid, note=note)
     text, kb = case_view(case_id, uid)
     await update.message.reply_text(
         ("✅ Sent back to SH. They'll see it at the top of their next /handover." if action == "h" else "📝 Note saved.") + "\n\n" + text,
@@ -1109,6 +1167,7 @@ async def on_store_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     async with write_lock:
         close_case(case_id, uid, side=side)
     await refresh_case_post(context.bot, case_id)
+    await notify_reply(context.bot, case_id, uid, closed=True)
     await query.answer(f"Closed on the {'Online' if side == 'on' else 'SH'} side ✓")
 
 

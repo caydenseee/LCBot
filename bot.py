@@ -864,7 +864,8 @@ def main() -> None:
     app.add_handler(
         ConversationHandler(
             entry_points=[
-                CallbackQueryHandler(on_handover_add, pattern=r"^ho:add$")
+                CallbackQueryHandler(on_handover_add, pattern=r"^ho:add$"),
+                CallbackQueryHandler(on_request_start, pattern=r"^cs:new$"),
             ],
             states={
                 HO_SECTION: [CallbackQueryHandler(on_ho_section, pattern=r"^hs:")],
