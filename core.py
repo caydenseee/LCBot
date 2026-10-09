@@ -1949,10 +1949,12 @@ def log_case(case_id: int, user_id: int | None, side: str, action: str,
         (case_id, user_id, side, action, note or None, now().isoformat()))
 
 
-def latest_note(case_id: int):
-    """The newest note left on a case, or None."""
-    return q1("SELECT * FROM case_log WHERE case_id=? AND note IS NOT NULL "
-              "ORDER BY id DESC LIMIT 1", (case_id,))
+def latest_note(case_id: int, actions=("note", "handed back")):
+    """The newest note someone wrote on a case (not edit records), or None."""
+    marks = ",".join("?" * len(actions))
+    return q1(f"SELECT * FROM case_log WHERE case_id=? AND note IS NOT NULL "
+              f"AND action IN ({marks}) ORDER BY id DESC LIMIT 1",
+              (case_id, *actions))
 
 
 def case_history(case_id: int) -> list:
@@ -2299,7 +2301,7 @@ def open_cases() -> list:
 def case_row_to_dict(r) -> dict:
     back = ""
     if r["handed_back"]:
-        n = latest_note(r["id"])
+        n = latest_note(r["id"], ("handed back",))
         if n:
             back = f"{display_name_of(n['user_id'], 'Online')}: {n['note']}"
     return {
@@ -2618,6 +2620,7 @@ ONLINE_HELP = (
     "  ✅ close it on your side\n"
     "  📝 add a note (what's done, what's next)\n"
     "  ↩️ hand it back to SH if you need something from them\n"
+    "  ✏️ edit it if a detail is wrong\n"
     "/help — this list again\n\n"
     "<i>A case is fully closed once both SH and Online have ticked it.</i>"
 )

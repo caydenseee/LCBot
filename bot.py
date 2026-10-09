@@ -888,11 +888,15 @@ def main() -> None:
     app.add_handler(
         ConversationHandler(
             entry_points=[
-                CallbackQueryHandler(on_case_note_start, pattern=r"^cs:[nh]:\d+$")
+                CallbackQueryHandler(on_case_note_start, pattern=r"^cs:[nh]:\d+$"),
+                CallbackQueryHandler(on_case_edit_start, pattern=r"^cs:ef:\d+:\w+$"),
             ],
             states={
                 CASE_NOTE: [
                     MessageHandler(filters.TEXT & ~filters.COMMAND, on_case_note_text)
+                ],
+                CASE_EDIT: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, on_case_edit_text)
                 ],
             },
             fallbacks=[CommandHandler("cancel", cancel)],
@@ -900,7 +904,8 @@ def main() -> None:
             conversation_timeout=1800,
         )
     )
-    app.add_handler(CallbackQueryHandler(on_cases_button, pattern=r"^cs:[lvxf]"))
+    app.add_handler(CallbackQueryHandler(on_cases_button,
+                                         pattern=r"^cs:(l|v|x|f|e|ep)(:|$)"))
     app.add_handler(
         ConversationHandler(
             entry_points=[CommandHandler("addreview", cmd_addreview)],

@@ -837,7 +837,9 @@ def case_view(case_id: int, user_id: int) -> tuple[str, InlineKeyboardMarkup]:
             buttons.append([InlineKeyboardButton("✅ Close (Online side)",
                                                  callback_data=f"cs:x:{case_id}")])
         buttons.append([InlineKeyboardButton("📝 Add a note",
-                                             callback_data=f"cs:n:{case_id}")])
+                                             callback_data=f"cs:n:{case_id}"),
+                        InlineKeyboardButton("✏️ Edit",
+                                             callback_data=f"cs:e:{case_id}")])
         if online:
             buttons.append([InlineKeyboardButton("↩️ Hand back to SH",
                                                  callback_data=f"cs:h:{case_id}")])
@@ -886,6 +888,18 @@ async def on_cases_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.answer("Force closed ✓")
     else:
         await query.answer()
+
+    if action == "e":
+        text, kb = edit_picker(case_id)
+        await query.edit_message_text(text, parse_mode=constants.ParseMode.HTML,
+                                      reply_markup=kb)
+        return
+    if action == "ep":
+        prio = parts[3]
+        if prio in [e for e, _ in PRIORITIES]:
+            async with write_lock:
+                save_case_edit(case_id, uid, "prio", prio)
+            await refresh_case_post(context.bot, case_id)
 
     if action == "l":
         text, kb = cases_list(uid, page=case_id)
@@ -950,4 +964,95 @@ async def on_case_note_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         ("↩️ Handed back to SH." if action == "h" else "📝 Note saved.") + "\n\n" + text,
         reply_markup=kb,
     )
+    return ConversationHandler.END
+
+
+# --------------------------------------------------------------------------
+# ✏️ Editing a case from /cases
+# --------------------------------------------------------------------------
+
+CASE_EDIT = 271
+EDIT_LABELS = {"prio": "Urgency", **{k: label for k, label, _ in CASE_FIELDS}}
+
+
+def edit_picker(case_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    if not r:
+        return "That case is gone.", InlineKeyboardMarkup(
+            [[InlineKeyboardButton("◀️ All cases", callback_data="cs:l")]])
+    rows = [[InlineKeyboardButton(f"{e} {n}", callback_data=f"cs:ep:{case_id}:{e}")
+             for e, n in PRIORITIES]]
+    # Cases written before the six questions only have free text to show.
+    keys = [k for k, _, _ in CASE_FIELDS] if r["order_no"] is not None else ["username"]
+    rows += [[InlineKeyboardButton(EDIT_LABELS[k], callback_data=f"cs:ef:{case_id}:{k}")]
+             for k in keys]
+    rows.append([InlineKeyboardButton("◀️ Back to the case", callback_data=f"cs:v:{case_id}")])
+    note = ("" if r["order_no"] is not None else
+            "\n\n<i>This case was written before the new format, so only the "
+            "urgency and username can be changed.</i>")
+    return (f"✏️ <b>Edit {esc(r['username'])}</b>\n\nTap the urgency to change it, "
+            f"or pick what to rewrite.{note}"), InlineKeyboardMarkup(rows)
+
+
+def save_case_edit(case_id: int, user_id: int, key: str, value: str) -> None:
+    """Change one part of a case, rebuild its written-out body, and log it."""
+    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    old = r[key] or ""
+    if old == value:
+        return
+    run(f"UPDATE ho_cases SET {key}=? WHERE id=?", (value or None, case_id))
+    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    if r["order_no"] is not None:
+        d = {k: r[k] or "" for k, _, _ in CASE_FIELDS}
+        run("UPDATE ho_cases SET body=? WHERE id=?", (compose_body(d), case_id))
+    side = "on" if is_online(user_id) else "sh"
+    log_case(case_id, user_id, side, "edited",
+             f"{EDIT_LABELS[key]}: {old or '(blank)'} → {value or '(blank)'}")
+
+
+async def on_case_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """cs:ef:<id>:<field> — ask for the new text."""
+    query = update.callback_query
+    uid = query.from_user.id
+    _, _, raw, key = query.data.split(":", 3)
+    if not may_see_cases(uid) or key not in EDIT_LABELS or key == "prio":
+        await query.answer("You can't do that here.", show_alert=True)
+        return ConversationHandler.END
+    r = q1("SELECT * FROM ho_cases WHERE id=?", (int(raw),))
+    if not r:
+        await query.answer("That case is gone.", show_alert=True)
+        return ConversationHandler.END
+    await query.answer()
+    context.user_data["case_edit"] = (int(raw), key)
+    optional = key == "done"
+    await query.edit_message_text(
+        f"✏️ <b>{esc(EDIT_LABELS[key])}</b> for {esc(r['username'])}\n\n"
+        f"Now: <i>{esc(r[key] or '(blank)')}</i>\n\n"
+        f"Send the new {esc(EDIT_LABELS[key].lower())}."
+        + (" Send <code>-</code> to clear it." if optional else "")
+        + "\n\n<i>/cancel to leave it as it is</i>",
+        parse_mode=constants.ParseMode.HTML,
+    )
+    return CASE_EDIT
+
+
+async def on_case_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    case_id, key = context.user_data.pop("case_edit", (0, ""))
+    if not case_id:
+        return ConversationHandler.END
+    uid = update.effective_user.id
+    value = update.message.text.strip()
+    if key == "done" and value == "-":
+        value = ""
+    elif len(value) < 2:
+        context.user_data["case_edit"] = (case_id, key)
+        await update.message.reply_text(
+            f"I need the {EDIT_LABELS[key].lower()} here. Try again, or /cancel.")
+        return CASE_EDIT
+    async with write_lock:
+        save_case_edit(case_id, uid, key, value)
+    await refresh_case_post(context.bot, case_id)
+    text, kb = case_view(case_id, uid)
+    await update.message.reply_text(f"✏️ {EDIT_LABELS[key]} updated.\n\n" + text,
+                                    reply_markup=kb)
     return ConversationHandler.END
