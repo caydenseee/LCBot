@@ -500,6 +500,17 @@ def handover_payload(user_id: int) -> dict:
             "channelName": CHANNEL_NAMES.get(r["channel"] or "", ""),
             "due": due.strftime("%a %-d %b"),
             "sla": "" if closed else sla_mark(due, today),
+            "shClosed": bool(r["sh_closed"]),
+            "onClosed": bool(r["on_closed"]),
+            "handedBack": bool(r["handed_back"]),
+            "waiting": (not closed) and bool(r["sh_closed"] or r["on_closed"]
+                                             or r["handed_back"]),
+            "status": case_status_line(r),
+            "group": order_kind(r["platform"], r["store"]),
+            "region": ("TH" if r["channel"] == "TH" else
+                       (r["channel"] or "").split("_")[-1] if r["channel"] != "WEBSTORE" else ""),
+            "note": note_line(r["id"]),
+            "history": case_history_lines(r["id"]),
         }
         if closed:
             out["closedBy"] = display_name_of(r["closed_by"], "") if r["closed_by"] else ""
@@ -510,6 +521,8 @@ def handover_payload(user_id: int) -> dict:
         return out
 
     return {
+        "isOnline": is_online(user_id),
+        "myChannels": online_channels(user_id),
         "openCases": [shape(r) for r in open_rows],
         "closedCases": [shape(r, True) for r in closed_rows],
         "stores": [{"flag": f, "store": st,
@@ -528,12 +541,55 @@ def handover_payload(user_id: int) -> dict:
     }
 
 
+def case_history_lines(case_id: int, limit: int = 8) -> list:
+    out = []
+    for h in case_history(case_id)[-limit:]:
+        when = datetime.fromisoformat(h["created_at"]).strftime("%-d %b %H:%M")
+        who = display_name_of(h["user_id"], "") if h["user_id"] else ""
+        line = f"{when} · {who or h['side']}: {h['action']}"
+        if h["note"]:
+            line += f" — {h['note']}"
+        out.append(line)
+    return out
+
+
+# What the Online team may do from the app.
+ONLINE_POSTS = {"/api/case/toggle", "/api/case/note", "/api/case/handback"}
+
+
+def web_case_handback(user_id: int, case_id: int, note: str) -> dict:
+    if not is_online(user_id):
+        return {"ok": False, "error": "Only the Online team hands cases back."}
+    note = (note or "").strip()
+    if len(note) < 2:
+        return {"ok": False, "error": "Say what you need from SH first."}
+    row = q1("SELECT username FROM ho_cases WHERE id=?", (case_id,))
+    if not row:
+        return {"ok": False, "error": "That case is gone."}
+    hand_back_case(case_id, user_id, note[:500])
+    on_bot_loop(refresh_case_post(bot_ref(), case_id))
+    on_bot_loop(announce_handback(bot_ref(), case_id, user_id, note[:500]))
+    return {"ok": True, "username": row["username"]}
+
+
+def web_case_note(user_id: int, case_id: int, note: str) -> dict:
+    note = (note or "").strip()
+    if len(note) < 2:
+        return {"ok": False, "error": "Type a few words first."}
+    row = q1("SELECT username FROM ho_cases WHERE id=?", (case_id,))
+    if not row:
+        return {"ok": False, "error": "That case is gone."}
+    log_case(case_id, user_id, "on" if is_online(user_id) else "sh", "note", note[:500])
+    on_bot_loop(refresh_case_post(bot_ref(), case_id))
+    return {"ok": True, "username": row["username"]}
+
+
 def web_case_toggle(user_id: int, case_id: int, close: bool) -> dict:
     row = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
     if not row:
         return {"ok": False, "error": "That case is gone."}
     if close:
-        close_case(case_id, user_id)
+        close_case(case_id, user_id, "on" if is_online(user_id) else "sh")
     else:
         reopen_case(case_id, user_id)
     on_bot_loop(refresh_case_post(bot_ref(), case_id))
@@ -725,8 +781,7 @@ def web_has_access(user_id: int) -> bool:
     finally:
         conn.close()
     if row:
-        # The Online team uses /cases for now; the app is SH's.
-        return row[0] == "active" and row[1] != "online"
+        return row[0] == "active"
     return not ADMIN_IDS
 
 
@@ -759,6 +814,12 @@ class MiniAppHandler(BaseHTTPRequestHandler):
         if path == "/health":
             self._send(200, b'{"ok":true}')
             return
+        if path.startswith("/api/") and path not in ("/api/handover", "/api/home"):
+            # The Online team's app is the handover view only: no week, pay or team.
+            user = verify_init_data(self.headers.get("X-Init-Data", ""))
+            if user and "id" in user and is_online(int(user["id"])):
+                self._send(403, b'{"error":"online team: handover only"}')
+                return
         if path == "/api/handover":
             try:
                 user = verify_init_data(self.headers.get("X-Init-Data", ""))
@@ -806,6 +867,10 @@ class MiniAppHandler(BaseHTTPRequestHandler):
                 uid = int(user["id"])
                 if not web_has_access(uid):
                     self._send(403, b'{"error":"no access"}')
+                    return
+                if is_online(uid):
+                    # Their app is the handover view only.
+                    self._send(200, json.dumps({"online": True}).encode())
                     return
                 data = home_payload(uid)
                 data["slotsToday"] = todays_slots(uid)
@@ -915,6 +980,9 @@ class MiniAppHandler(BaseHTTPRequestHandler):
         if not web_has_access(uid):
             self._send(403, b'{"error":"no access"}')
             return
+        if is_online(uid) and path not in ONLINE_POSTS:
+            self._send(403, b'{"error":"online team: handover only"}')
+            return
 
         length = int(self.headers.get("Content-Length") or 0)
         try:
@@ -941,6 +1009,20 @@ class MiniAppHandler(BaseHTTPRequestHandler):
             except (TypeError, ValueError):
                 cid = 0
             out = (web_case_toggle(uid, cid, bool(body.get("close", True)))
+                   if cid else {"ok": False, "error": "No case given."})
+        elif path == "/api/case/handback":
+            try:
+                cid = int(body.get("id", 0))
+            except (TypeError, ValueError):
+                cid = 0
+            out = (web_case_handback(uid, cid, str(body.get("note", "")))
+                   if cid else {"ok": False, "error": "No case given."})
+        elif path == "/api/case/note":
+            try:
+                cid = int(body.get("id", 0))
+            except (TypeError, ValueError):
+                cid = 0
+            out = (web_case_note(uid, cid, str(body.get("note", "")))
                    if cid else {"ok": False, "error": "No case given."})
         elif path == "/api/handover/post":
             out = web_handover_post(uid, body.get("storeChats", True) is not False)

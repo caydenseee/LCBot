@@ -952,13 +952,7 @@ async def on_case_note_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
             log_case(case_id, uid, side, "note", note)
     await refresh_case_post(context.bot, case_id)
     if action == "h":
-        r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
-        await post_ops(
-            context.bot,
-            f"↩️ {display_name_of(uid, 'Online')} handed a case back to SH\n"
-            f"{r['prio']} {r['username']} · {CHANNEL_NAMES.get(r['channel'] or '', '')}\n"
-            f"Needs: {note}\n\nIt's at the top of the next /handover.",
-        )
+        await announce_handback(context.bot, case_id, uid, note)
     text, kb = case_view(case_id, uid)
     await update.message.reply_text(
         ("↩️ Handed back to SH." if action == "h" else "📝 Note saved.") + "\n\n" + text,

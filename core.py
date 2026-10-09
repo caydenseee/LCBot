@@ -36,7 +36,6 @@ from telegram import (
     KeyboardButton,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
-    MenuButtonCommands,
     MenuButtonDefault,
     MenuButtonWebApp,
     WebAppInfo,
@@ -2025,6 +2024,18 @@ def force_close_case(case_id: int, admin_id: int) -> None:
     log_case(case_id, admin_id, "admin", "force closed")
 
 
+async def announce_handback(bot, case_id: int, user_id: int, note: str) -> None:
+    """Tell TC Online straight away that Online needs something from SH."""
+    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    if r:
+        await post_ops(
+            bot,
+            f"↩️ {display_name_of(user_id, 'Online')} handed a case back to SH\n"
+            f"{r['prio']} {r['username']} · {CHANNEL_NAMES.get(r['channel'] or '', '')}\n"
+            f"Needs: {note}\n\nIt's at the top of the next /handover.",
+        )
+
+
 def hand_back_case(case_id: int, user_id: int, note: str) -> None:
     """Online needs something from SH: open it again on SH's side, flagged."""
     run(
@@ -2621,6 +2632,8 @@ ONLINE_HELP = (
     "  📝 add a note (what's done, what's next)\n"
     "  ↩️ hand it back to SH if you need something from them\n"
     "  ✏️ edit it if a detail is wrong\n"
+    "Or tap <b>App</b> by the 📎 for the same cases, sorted into "
+    "Shopee, Lazada and Webstore.\n"
     "/help — this list again\n\n"
     "<i>A case is fully closed once both SH and Online have ticked it.</i>"
 )
@@ -2645,13 +2658,10 @@ async def refresh_menu_for(bot, user_id: int) -> None:
             scope=BotCommandScopeChat(user_id),
         )
         if PUBLIC_URL:
-            # The app is SH's, so the Online team gets the command list there
-            # instead; everyone else falls back to the shared App button.
+            # Everyone gets the shared App button; the Online team's app opens
+            # on their handover view. (Clears any older per-person button.)
             await bot.set_chat_menu_button(
-                chat_id=user_id,
-                menu_button=MenuButtonCommands() if role == "online"
-                else MenuButtonDefault(),
-            )
+                chat_id=user_id, menu_button=MenuButtonDefault())
     except Exception as e:
         log.info("Couldn't refresh menu for %s: %s", user_id, e)
 
@@ -2831,6 +2841,29 @@ MINIAPP_HTML = """<!DOCTYPE html>
      color: var(--tg-theme-text-color,#111); }
   .case .more { font-size:11px; color: var(--tg-theme-link-color,#2a7);
      margin-top:6px; cursor:pointer; }
+  .case .st { font-size:12px; font-weight:600; margin-top:6px; }
+  .case .nt { font-size:12px; margin-top:6px; padding:6px 8px; border-radius:8px;
+     background: var(--tg-theme-secondary-bg-color, rgba(0,0,0,.04)); }
+  .case .hist { font-size:11px; color: var(--tg-theme-hint-color,#888);
+     margin-top:8px; line-height:1.5; }
+  .case .addnote { margin-top:8px; display:flex; gap:6px; align-items:flex-end; }
+  .case .addnote textarea { flex:1; min-height:38px; font-size:13px; }
+  .case .acts { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+  .case .acts button { flex:1 1 auto; padding:8px 10px; border:0; border-radius:8px;
+     background: var(--tg-theme-button-color,#2a7);
+     color: var(--tg-theme-button-text-color,#fff); font-size:13px; }
+  .case .acts button.soft { background: var(--tg-theme-secondary-bg-color,#eee);
+     color: var(--tg-theme-text-color,#111); }
+  .otabs { display:flex; gap:6px; margin:10px 0 6px; }
+  .otabs button { flex:1; padding:8px 4px; border:0; border-radius:8px; font-size:13px;
+     background: var(--tg-theme-secondary-bg-color,#eee);
+     color: var(--tg-theme-text-color,#111); }
+  .otabs button.on { background: var(--tg-theme-button-color,#2a7);
+     color: var(--tg-theme-button-text-color,#fff); font-weight:600; }
+  .otabs.small button { padding:6px 4px; font-size:12px; }
+  .case .addnote button { flex:0 0 auto; padding:8px 12px; border:0; border-radius:8px;
+     background: var(--tg-theme-button-color,#2a7);
+     color: var(--tg-theme-button-text-color,#fff); font-size:13px; }
   .stale { color:#b26a00; }
   .fld { margin-bottom:14px; }
   .fld label { display:block; font-size:11px; font-weight:700; letter-spacing:.05em;
@@ -2887,9 +2920,12 @@ window.addEventListener('unhandledrejection', e =>
 const tg = window.Telegram?.WebApp;
 if (tg) { tg.ready(); tg.expand(); }
 let VIEW = 'home', MODE = 'week', START = '', WHICH = 'now', IS_ADMIN = false;
+// The Online team's app: handover cases only, sorted into platform tabs.
+let ONLINE = false, ON_GROUP = '', ON_REGION = '';
 const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 
 function navBar() {
+  if (ONLINE) return '';
   const items = [['home','🏠','Home'], ['week','📅','Week'],
                  ['me','🕐','Hours'], ['ho','📝','Handover']];
   if (IS_ADMIN) items.push(['team','👥','Team']);
@@ -2935,6 +2971,7 @@ async function loadHome() {
   const app = document.getElementById('app');
   const r = { ok: true, json: () => getJSON('/api/home') };
   const d = await r.json();
+  if (d.online) { ONLINE = true; VIEW = 'ho'; return loadHandover(); }
   IS_ADMIN = !!d.isAdmin;
 
   let h = `<h1>${esc(d.name)}</h1><div class="sub">${esc(d.today)}</div>`;
@@ -3051,10 +3088,12 @@ let HO = null, HO_FORM = null, HO_SHOWN = {}, HO_CHOOSE = false;
 let AGENT = null;   // whose detail we're looking at
 
 function caseCard(c, closed) {
+  // SH's tick: done once SH has closed it, even while Online still has to.
+  const ticked = closed || c.shClosed;
   let h = `<div class="case${closed ? ' gone' : ''}">`;
   h += '<div class="top">';
-  h += `<div class="tick${closed ? '' : ' on'}" data-id="${c.id}" `
-     + `data-close="${closed ? '0' : '1'}">${closed ? '' : '✓'}</div>`;
+  h += `<div class="tick${ticked ? '' : ' on'}" data-id="${c.id}" `
+     + `data-close="${ticked ? '0' : '1'}">${ticked ? '' : '✓'}</div>`;
   h += '<div style="flex:1">';
   h += `<div class="nm">${c.sla ? c.sla + ' ' : ''}${esc(c.prio)} ${esc(c.username)}</div>`;
   const bits = [];
@@ -3069,12 +3108,23 @@ function caseCard(c, closed) {
     + `${esc(c.due)}</span>`);
   if (c.section === 'follow') bits.push('follow up');
   h += `<div class="meta">${bits.join(' · ')}</div>`;
+  if (c.waiting) h += `<div class="st">${esc(c.status)}</div>`;
   h += '</div></div>';
+  if (c.note) h += `<div class="nt">${esc(c.note)}</div>`;
   if (HO_SHOWN[c.id]) {
     h += `<div class="body">${esc(c.body)}</div>`;
+    if (c.history && c.history.length) {
+      h += '<div class="hist">🕓 ' + c.history.map(esc).join('<br>') + '</div>';
+    }
+    if (!closed) {
+      h += `<div class="addnote"><textarea id="note_${c.id}" rows="1" `
+         + `placeholder="Add a note for SH and Online"></textarea>`
+         + `<button data-addnote="${c.id}">Add</button></div>`;
+    }
     h += `<div class="more" data-hide="${c.id}">Hide</div>`;
   } else {
-    h += `<div class="more" data-show="${c.id}">Show the case</div>`;
+    h += `<div class="more" data-show="${c.id}">Show the case`
+       + `${c.history && c.history.length ? ' · notes & history' : ''}</div>`;
   }
   h += '</div>';
   return h;
@@ -3130,6 +3180,7 @@ async function loadHandover() {
   const app = document.getElementById('app');
   const d = await getJSON('/api/handover');
   HO = d;
+  if (d.isOnline) { ONLINE = true; renderOnline(d); return; }
 
   let h = '<h1>Handover</h1>';
   const n = d.openCases.length;
@@ -3143,8 +3194,11 @@ async function loadHandover() {
 
   if (n) {
     h += '<h2>Still open</h2>';
-    h += '<div class="note" style="margin-top:0">Untick a case to close it.</div>';
-    for (const c of d.openCases) h += caseCard(c, false);
+    h += '<div class="note" style="margin-top:0">Untick a case to close it. '
+       + 'Cases waiting on Online stay here until they close it too.</div>';
+    // Anything Online handed back goes first: someone is waiting on SH.
+    const order = [...d.openCases].sort((a, b) => (b.handedBack - a.handedBack) || (a.id - b.id));
+    for (const c of order) h += caseCard(c, false);
   }
 
   h += '<button class="big" id="newCase" style="margin-top:14px">+  Add a case</button>';
@@ -3177,6 +3231,20 @@ function wireHandover() {
         { id: Number(el.dataset.id), close: el.dataset.close === '1' });
       if (!out.ok) { toast(out.error || 'Could not change that.'); return; }
       toast(out.closed ? 'Closed ' + out.username : 'Reopened ' + out.username);
+      await loadHandover();
+    };
+  });
+  document.querySelectorAll('[data-addnote]').forEach(el => {
+    el.onclick = async () => {
+      const id = el.dataset.addnote;
+      const box = document.getElementById('note_' + id);
+      const note = box ? box.value.trim() : '';
+      if (!note) { toast('Type a note first.'); return; }
+      el.disabled = true;
+      const out = await post('/api/case/note', { id: Number(id), note });
+      el.disabled = false;
+      if (!out.ok) { toast(out.error || 'Could not save that.'); return; }
+      toast('Note added');
       await loadHandover();
     };
   });
@@ -3260,6 +3328,120 @@ function keepForm() {
   }
   const st = document.getElementById('store');
   if (st) HO_FORM.store = st.value;
+}
+
+const ON_GROUPS = [['SHOPEE', 'Shopee'], ['LAZADA', 'Lazada'], ['WEBSTORE', 'Webstore']];
+const CH_GROUP = { SHOPEE_SG: 'SHOPEE', SHOPEE_MY: 'SHOPEE', LAZADA_SG: 'LAZADA',
+                   LAZADA_MY: 'LAZADA', TH: 'SHOPEE', WEBSTORE: 'WEBSTORE' };
+
+function onlineCard(c, mine) {
+  let h = '<div class="case"><div class="top"><div style="flex:1">';
+  h += `<div class="nm">${c.sla ? c.sla + ' ' : ''}${esc(c.prio)} ${esc(c.username)}`
+     + `${mine ? '' : ' <span class="meta">· not your channel</span>'}</div>`;
+  const bits = [];
+  if (c.store) bits.push(esc(c.flag) + esc(c.store));
+  else if (c.channelName) bits.push(esc(c.channelName));
+  if (c.from) bits.push('from ' + esc(c.from));
+  if (c.due) bits.push(`<span class="${c.sla ? 'stale' : ''}">`
+    + (c.sla === '🚨' ? 'overdue, was due ' : c.sla ? 'due today, ' : 'due ')
+    + `${esc(c.due)}</span>`);
+  h += `<div class="meta">${bits.join(' · ')}</div>`;
+  if (c.waiting) h += `<div class="st">${esc(c.status)}</div>`;
+  h += '</div></div>';
+  if (c.note) h += `<div class="nt">${esc(c.note)}</div>`;
+  if (HO_SHOWN[c.id]) {
+    h += `<div class="body">${esc(c.body)}</div>`;
+    if (c.history && c.history.length) {
+      h += '<div class="hist">🕓 ' + c.history.map(esc).join('<br>') + '</div>';
+    }
+    h += `<div class="addnote"><textarea id="note_${c.id}" rows="2" `
+       + `placeholder="A note, or what you need from SH"></textarea></div>`;
+    h += '<div class="acts">';
+    if (!c.onClosed) h += `<button data-onclose="${c.id}">✅ Close (Online)</button>`;
+    h += `<button class="soft" data-addnote="${c.id}">📝 Add note</button>`;
+    h += `<button class="soft" data-handback="${c.id}">↩️ Hand back to SH</button>`;
+    h += '</div>';
+    h += `<div class="more" data-hide="${c.id}">Hide</div>`;
+  } else {
+    h += `<div class="more" data-show="${c.id}">Open the case</div>`;
+  }
+  return h + '</div>';
+}
+
+function renderOnline(d) {
+  const app = document.getElementById('app');
+  const mine = new Set(d.myChannels || []);
+  const open = d.openCases;
+  if (!ON_GROUP) {
+    const first = open.find(c => mine.has(c.channel));
+    ON_GROUP = first ? first.group
+      : (d.myChannels && d.myChannels.length ? CH_GROUP[d.myChannels[0]] : 'SHOPEE');
+  }
+  const regions = ON_GROUP === 'WEBSTORE' ? [] : ['SG', 'MY', 'TH'];
+  if (ON_REGION && !regions.includes(ON_REGION)) ON_REGION = '';
+
+  const nMine = open.filter(c => mine.has(c.channel)).length;
+  let h = '<h1>Handover cases</h1>';
+  h += `<div class="sub">${open.length} open`
+     + `${mine.size ? ' · ' + nMine + ' on your channels' : ''}</div>`;
+
+  h += '<div class="otabs">' + ON_GROUPS.map(([g, label]) => {
+    const n = open.filter(c => c.group === g).length;
+    return `<button data-og="${g}" class="${ON_GROUP === g ? 'on' : ''}">${label}${n ? ' (' + n + ')' : ''}</button>`;
+  }).join('') + '</div>';
+  if (regions.length) {
+    const inGroup = open.filter(c => c.group === ON_GROUP);
+    h += '<div class="otabs small">'
+       + `<button data-or="" class="${ON_REGION ? '' : 'on'}">All</button>`
+       + regions.map(rg => {
+           const n = inGroup.filter(c => c.region === rg).length;
+           return `<button data-or="${rg}" class="${ON_REGION === rg ? 'on' : ''}">${rg}${n ? ' (' + n + ')' : ''}</button>`;
+         }).join('') + '</div>';
+  }
+
+  const shown = open
+    .filter(c => c.group === ON_GROUP && (!ON_REGION || c.region === ON_REGION))
+    .sort((a, b) => (mine.has(b.channel) - mine.has(a.channel)) || (a.id - b.id));
+  if (!shown.length) h += '<div class="note">Nothing open here 🎉</div>';
+  for (const c of shown) h += onlineCard(c, mine.has(c.channel));
+
+  const closed = d.closedCases.filter(c => c.group === ON_GROUP
+    && (!ON_REGION || c.region === ON_REGION));
+  if (closed.length) {
+    h += '<h2>Closed recently</h2>';
+    h += '<div class="note" style="margin-top:0">Tick one to reopen it.</div>';
+    for (const c of closed) h += caseCard(c, true);
+  }
+  app.innerHTML = h;
+  wireHandover();
+  document.querySelectorAll('[data-og]').forEach(el => {
+    el.onclick = () => { ON_GROUP = el.dataset.og; ON_REGION = ''; renderOnline(d); };
+  });
+  document.querySelectorAll('[data-or]').forEach(el => {
+    el.onclick = () => { ON_REGION = el.dataset.or; renderOnline(d); };
+  });
+  document.querySelectorAll('[data-onclose]').forEach(el => {
+    el.onclick = async () => {
+      el.disabled = true;
+      const out = await post('/api/case/toggle', { id: Number(el.dataset.onclose), close: true });
+      if (!out.ok) { el.disabled = false; toast(out.error || 'Could not close that.'); return; }
+      toast('Closed on the Online side');
+      await loadHandover();
+    };
+  });
+  document.querySelectorAll('[data-handback]').forEach(el => {
+    el.onclick = async () => {
+      const id = el.dataset.handback;
+      const box = document.getElementById('note_' + id);
+      const note = box ? box.value.trim() : '';
+      if (!note) { toast('Say what you need from SH in the box first.'); return; }
+      el.disabled = true;
+      const out = await post('/api/case/handback', { id: Number(id), note });
+      if (!out.ok) { el.disabled = false; toast(out.error || 'Could not hand that back.'); return; }
+      toast('Handed back to SH');
+      await loadHandover();
+    };
+  });
 }
 
 async function loadWeek() {
