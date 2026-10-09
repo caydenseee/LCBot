@@ -1823,7 +1823,8 @@ CHANNELS = [
     ("LAZADA_SG", "🇸🇬", "Lazada SG"),
     ("LAZADA_MY", "🇲🇾", "Lazada MY"),
     ("TH", "🇹🇭", "TH"),
-    ("WEBSTORE", "🌐", "TC Webstore"),
+    ("WEBSTORE", "🇸🇬", "TC Webstore SG"),
+    ("WEBSTORE_MY", "🇲🇾", "TC Webstore MY"),
 ]
 CHANNEL_NAMES = {key: f"{flag} {name}" for key, flag, name in CHANNELS}
 STORE_CHANNEL = {
@@ -1838,13 +1839,26 @@ STORE_CHANNEL = {
     "[MY]SHPSONOS": "SHOPEE_MY",
     "THLAZSONOS": "TH",
     "[TH]SHPSONOS": "TH",
+    "[SG]WEBSTORE": "WEBSTORE",
+    "[MY]WEBSTORE": "WEBSTORE_MY",
 }
+# Livechat cases come from one of the two webstores.
+WEBSTORES = [
+    ("🇸🇬", "[SG]WEBSTORE"),
+    ("🇲🇾", "[MY]WEBSTORE"),
+]
+
+
+def stores_for(platform: str | None) -> list:
+    """The stores an agent picks from: marketplaces for Duoke, webstores for Livechat."""
+    return WEBSTORES if (platform or "").upper() == "LIVECHAT" else STORES
 
 
 def channel_for(platform: str | None, store: str | None) -> str:
-    """Duoke cases go by store; Livechat is always the webstore."""
+    """Cases go by store. Livechat cases from before the MY webstore had no
+    store, and those were all the SG webstore."""
     if (platform or "").upper() == "LIVECHAT":
-        return "WEBSTORE"
+        return STORE_CHANNEL.get(store or "", "WEBSTORE")
     return STORE_CHANNEL.get(store or "", "")
 
 
@@ -1879,6 +1893,7 @@ ORDER_EXAMPLES = {
     "LAZADA": "173908941991792",
     "SHOPEE": "2609046GFY4T9B",
     "WEBSTORE": "#40665-TCSG",
+    "WEBSTORE_MY": "#40665-TCMY",
 }
 
 
@@ -1894,6 +1909,8 @@ def order_kind(platform: str | None, store: str | None) -> str:
 
 def case_example(key: str, platform: str | None, store: str | None) -> str:
     if key == "order_no":
+        if channel_for(platform, store) == "WEBSTORE_MY":
+            return ORDER_EXAMPLES["WEBSTORE_MY"]
         return ORDER_EXAMPLES[order_kind(platform, store)]
     return CASE_EXAMPLES.get(key, "")
 
@@ -2073,13 +2090,20 @@ def hand_back_case(case_id: int, user_id: int, note: str | None) -> None:
 
 
 def parse_channel(text: str) -> str | None:
-    """'Shopee SG', 'shopee_sg', 'TH', 'Webstore' — all find their channel."""
-    want = re.sub(r"[^a-z]", "", (text or "").lower())
+    """'Shopee SG', 'shopee_sg', 'TH', 'Webstore MY' — all find their channel."""
+    def norm(t):
+        return re.sub(r"[^a-z]", "", t.lower())
+    want = norm(text or "")
+    want = want[2:] if want.startswith("tc") else want      # "TC Webstore SG"
     for key, _, name in CHANNELS:
-        if want in (re.sub(r"[^a-z]", "", key.lower()),
-                    re.sub(r"[^a-z]", "", name.lower())):
+        names = {norm(key), norm(name), norm(name).removeprefix("tc")}
+        if key == "WEBSTORE":
+            names |= {"webstoresg", "sgwebstore"}
+        if key == "WEBSTORE_MY":
+            names |= {"mywebstore"}
+        if want in names:
             return key
-    return "WEBSTORE" if want == "webstore" else None
+    return None
 
 
 def channel_chat(channel: str | None) -> dict | None:
@@ -3171,24 +3195,21 @@ function caseForm(d) {
     + d.platforms.map(p =>
         `<button data-f="platform" data-v="${p}" class="${f.platform === p ? 'on' : ''}">▫️${esc(p)}</button>`
       ).join('') + '</div></div>';
-  if (f.platform === 'DUOKE') {
+  const storeList = f.platform === 'LIVECHAT' ? d.webstores : d.stores;
+  if (f.platform) {
     h += '<div class="fld"><label>Store</label><select id="store">'
       + '<option value="">Pick one…</option>'
-      + d.stores.map(s =>
+      + storeList.map(s =>
           `<option value="${esc(s.store)}"${f.store === s.store ? ' selected' : ''}>${esc(s.flag)}${esc(s.store)} · ${esc(s.channel)}</option>`
         ).join('') + '</select></div>';
   }
-  if (f.platform === 'LIVECHAT') {
-    h += '<div class="note" style="margin-top:0">Goes to 🌐 TC Webstore</div>';
-  }
   const long = { happened: 1, done: 1, need: 1 };
-  const picked = d.stores.find(s => s.store === f.store);
+  const picked = storeList.find(s => s.store === f.store);
   for (const fd of d.fields) {
     const v = esc(f[fd.key] || '');
     let eg = fd.example;
     if (fd.key === 'order_no') {
-      eg = f.platform === 'LIVECHAT' ? d.webstoreOrderExample
-        : (picked ? picked.orderExample : 'Pick a store first');
+      eg = picked ? picked.orderExample : 'Pick a store first';
     }
     h += `<div class="fld"><label>${esc(fd.label)}${fd.required ? '' : ' (optional)'}</label>`;
     h += `<div class="note" style="margin:0 0 4px">${esc(fd.hint)}</div>`;
@@ -3295,7 +3316,7 @@ function wireHandover() {
     el.onclick = () => {
       keepForm();
       HO_FORM[el.dataset.f] = el.dataset.v;
-      if (el.dataset.f === 'platform' && el.dataset.v !== 'DUOKE') HO_FORM.store = '';
+      if (el.dataset.f === 'platform') HO_FORM.store = '';
       loadHandover();
     };
   });
@@ -3358,7 +3379,8 @@ function keepForm() {
 
 const ON_GROUPS = [['SHOPEE', 'Shopee'], ['LAZADA', 'Lazada'], ['WEBSTORE', 'Webstore']];
 const CH_GROUP = { SHOPEE_SG: 'SHOPEE', SHOPEE_MY: 'SHOPEE', LAZADA_SG: 'LAZADA',
-                   LAZADA_MY: 'LAZADA', TH: 'SHOPEE', WEBSTORE: 'WEBSTORE' };
+                   LAZADA_MY: 'LAZADA', TH: 'SHOPEE', WEBSTORE: 'WEBSTORE',
+                   WEBSTORE_MY: 'WEBSTORE' };
 
 function onlineCard(c, mine) {
   let h = '<div class="case"><div class="top"><div style="flex:1">';
@@ -3403,7 +3425,7 @@ function renderOnline(d) {
     ON_GROUP = first ? first.group
       : (d.myChannels && d.myChannels.length ? CH_GROUP[d.myChannels[0]] : 'SHOPEE');
   }
-  const regions = ON_GROUP === 'WEBSTORE' ? [] : ['SG', 'MY', 'TH'];
+  const regions = ON_GROUP === 'WEBSTORE' ? ['SG', 'MY'] : ['SG', 'MY', 'TH'];
   if (ON_REGION && !regions.includes(ON_REGION)) ON_REGION = '';
 
   const nMine = open.filter(c => mine.has(c.channel)).length;
