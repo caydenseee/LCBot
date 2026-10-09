@@ -738,10 +738,13 @@ async def cmd_handovers(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 # /cases — the Online team's view of handover cases
 # --------------------------------------------------------------------------
 
-CASE_NOTE = 270
-
-
 def may_see_cases(user_id: int) -> bool:
+    """Anyone with access: SH agents (notes, closing their side), the Online
+    team, and admins."""
+    return agent_status(user_id) == "active" or is_owner(user_id)
+
+
+def may_edit_cases(user_id: int) -> bool:
     return is_online(user_id) or is_admin(user_id)
 
 
@@ -835,10 +838,10 @@ def case_view(case_id: int, user_id: int) -> tuple[str, InlineKeyboardMarkup]:
         if not online and not r["sh_closed"]:
             buttons.append([InlineKeyboardButton("✅ Close (SH side)",
                                                  callback_data=f"cs:s:{case_id}")])
-        buttons.append([InlineKeyboardButton("📝 Add a note",
-                                             callback_data=f"cs:n:{case_id}"),
-                        InlineKeyboardButton("✏️ Edit",
-                                             callback_data=f"cs:e:{case_id}")])
+        row = [InlineKeyboardButton("📝 Add a note", callback_data=f"cs:n:{case_id}")]
+        if may_edit_cases(user_id):
+            row.append(InlineKeyboardButton("✏️ Edit", callback_data=f"cs:e:{case_id}"))
+        buttons.append(row)
         if online:
             buttons.append([InlineKeyboardButton("↩️ Hand back to SH",
                                                  callback_data=f"cs:h:{case_id}")])
@@ -856,9 +859,6 @@ async def cmd_cases(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if agent_status(uid) != "active" and not is_owner(uid):
         await gate(update)
         return
-    if not may_see_cases(uid):
-        await update.message.reply_text("Use /handover to see and close cases.")
-        return
     text, kb = cases_list(uid)
     await update.message.reply_text(text, parse_mode=constants.ParseMode.HTML,
                                     reply_markup=kb)
@@ -870,7 +870,7 @@ async def on_cases_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     query = update.callback_query
     uid = query.from_user.id
     if not may_see_cases(uid):
-        await query.answer("That's for the Online team and admins.", show_alert=True)
+        await query.answer("Send /start to the bot first.", show_alert=True)
         return
     parts = query.data.split(":")
     action = parts[1]
@@ -894,6 +894,8 @@ async def on_cases_button(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     else:
         await query.answer()
 
+    if action in ("e", "ep") and not may_edit_cases(uid):
+        return
     if action == "e":
         text, kb = edit_picker(case_id)
         await query.edit_message_text(text, parse_mode=constants.ParseMode.HTML,
@@ -1015,8 +1017,6 @@ async def on_case_note_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 # ✏️ Editing a case from /cases
 # --------------------------------------------------------------------------
 
-CASE_EDIT = 271
-EDIT_LABELS = {"prio": "Urgency", **{k: label for k, label, _ in CASE_FIELDS}}
 
 
 def edit_picker(case_id: int) -> tuple[str, InlineKeyboardMarkup]:
@@ -1038,28 +1038,12 @@ def edit_picker(case_id: int) -> tuple[str, InlineKeyboardMarkup]:
             f"or pick what to rewrite.{note}"), InlineKeyboardMarkup(rows)
 
 
-def save_case_edit(case_id: int, user_id: int, key: str, value: str) -> None:
-    """Change one part of a case, rebuild its written-out body, and log it."""
-    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
-    old = r[key] or ""
-    if old == value:
-        return
-    run(f"UPDATE ho_cases SET {key}=? WHERE id=?", (value or None, case_id))
-    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
-    if r["order_no"] is not None:
-        d = {k: r[k] or "" for k, _, _ in CASE_FIELDS}
-        run("UPDATE ho_cases SET body=? WHERE id=?", (compose_body(d), case_id))
-    side = "on" if is_online(user_id) else "sh"
-    log_case(case_id, user_id, side, "edited",
-             f"{EDIT_LABELS[key]}: {old or '(blank)'} → {value or '(blank)'}")
-
-
 async def on_case_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """cs:ef:<id>:<field> — ask for the new text."""
     query = update.callback_query
     uid = query.from_user.id
     _, _, raw, key = query.data.split(":", 3)
-    if not may_see_cases(uid) or key not in EDIT_LABELS or key == "prio":
+    if not may_edit_cases(uid) or key not in EDIT_LABELS or key == "prio":
         await query.answer("You can't do that here.", show_alert=True)
         return ConversationHandler.END
     r = q1("SELECT * FROM ho_cases WHERE id=?", (int(raw),))
@@ -1100,3 +1084,133 @@ async def on_case_edit_text(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await update.message.reply_text(f"✏️ {EDIT_LABELS[key]} updated.\n\n" + text,
                                     reply_markup=kb)
     return ConversationHandler.END
+
+
+async def on_store_close(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """sc:x:<id> — ✅ Close under a case in a store chat. Closes the tapper's
+    own side: Online team or SH. The message updates; nothing new is posted."""
+    query = update.callback_query
+    uid = query.from_user.id
+    if not may_see_cases(uid):
+        await query.answer("This is for the SH and Online teams.", show_alert=True)
+        return
+    case_id = int(query.data.split(":")[2])
+    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    if not r or r["closed"]:
+        await query.answer("That case is already closed.")
+        await refresh_case_post(context.bot, case_id)
+        return
+    side = "on" if is_online(uid) else "sh"
+    if r[f"{side}_closed"]:
+        other = "SH" if side == "on" else "Online"
+        await query.answer(f"Already closed on your side — waiting on {other}.",
+                           show_alert=True)
+        return
+    async with write_lock:
+        close_case(case_id, uid, side=side)
+    await refresh_case_post(context.bot, case_id)
+    await query.answer(f"Closed on the {'Online' if side == 'on' else 'SH'} side ✓")
+
+
+# --------------------------------------------------------------------------
+# 📊 Case report — weekly for the Online team and admins, or /report anytime
+# --------------------------------------------------------------------------
+
+def fmt_span(seconds: float) -> str:
+    hours = seconds / 3600
+    return f"{hours:.1f} h" if hours < 24 else f"{hours / 24:.1f} days"
+
+
+def case_report(channels: list, first: date, last: date) -> str:
+    """How each channel's cases went between first and last (inclusive)."""
+    start = datetime.combine(first, time(0, 0), TZ).isoformat()
+    end = datetime.combine(last + timedelta(days=1), time(0, 0), TZ).isoformat()
+    today = now().date()
+    lines = [f"📊 <b>Case report · {first.strftime('%-d %b')} – {last.strftime('%-d %b')}</b>"]
+    totals = {"new": 0, "closed": 0, "open": 0, "overdue": 0, "back": 0}
+    for key, flag, name in CHANNELS:
+        if key not in channels:
+            continue
+        new = q1("SELECT COUNT(*) c FROM ho_cases WHERE channel=? AND created_at>=? "
+                 "AND created_at<?", (key, start, end))["c"]
+        done = q("SELECT created_at, closed_at FROM ho_cases WHERE channel=? AND closed=1 "
+                 "AND closed_at>=? AND closed_at<?", (key, start, end))
+        open_rows = q("SELECT the_date, prio FROM ho_cases WHERE channel=? AND closed=0", (key,))
+        overdue = sum(1 for r in open_rows
+                      if sla_mark(case_due(date.fromisoformat(r["the_date"]), r["prio"]), today) == "🚨")
+        back = q1("SELECT COUNT(*) c FROM case_log l JOIN ho_cases h ON h.id=l.case_id "
+                  "WHERE h.channel=? AND l.action='handed back' AND l.created_at>=? "
+                  "AND l.created_at<?", (key, start, end))["c"]
+        spans = [(datetime.fromisoformat(r["closed_at"]) - datetime.fromisoformat(r["created_at"])).total_seconds()
+                 for r in done if r["closed_at"] and r["created_at"]]
+        for k, v in (("new", new), ("closed", len(done)), ("open", len(open_rows)),
+                     ("overdue", overdue), ("back", back)):
+            totals[k] += v
+        lines += ["", f"<b>{flag} {esc(name)}</b>"]
+        if not (new or done or open_rows or back):
+            lines.append("  Quiet — no cases")
+            continue
+        lines.append(f"  🆕 {new} new · ✅ {len(done)} closed · ⏳ {len(open_rows)} open"
+                     + (f" (🚨 {overdue} overdue)" if overdue else ""))
+        extra = []
+        if back:
+            extra.append(f"↩️ {back} handed back")
+        if spans:
+            extra.append(f"⏱ {fmt_span(sum(spans) / len(spans))} avg to close")
+        if extra:
+            lines.append("  " + " · ".join(extra))
+    if len(channels) > 1:
+        lines += ["", f"<b>All</b>: 🆕 {totals['new']} · ✅ {totals['closed']} · "
+                      f"⏳ {totals['open']}" + (f" (🚨 {totals['overdue']})" if totals["overdue"] else "")
+                      + (f" · ↩️ {totals['back']}" if totals["back"] else "")]
+    return "\n".join(lines)
+
+
+def report_channels(user_id: int) -> list:
+    """Admins see every channel; the Online team sees their own."""
+    if is_admin(user_id) and not is_online(user_id):
+        return [k for k, _, _ in CHANNELS]
+    return online_channels(user_id)
+
+
+async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/report — the last 7 days for your channels (admins: all of them)."""
+    if update.effective_chat.type != constants.ChatType.PRIVATE:
+        return
+    uid = update.effective_user.id
+    if not (is_online(uid) or is_admin(uid)):
+        return
+    channels = report_channels(uid)
+    if not channels:
+        await update.message.reply_text("You don't have any channels yet — an admin sets them.")
+        return
+    today = now().date()
+    await update.message.reply_text(case_report(channels, today - timedelta(days=6), today),
+                                    parse_mode=constants.ParseMode.HTML)
+
+
+async def job_case_report(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Monday morning: last week's cases, to each Online team member for their
+    channels and to admins for all of them."""
+    if now().weekday() != 0:
+        return
+    first, last = week_bounds(now().date() - timedelta(days=7))
+    sent = set()
+    for pm in online_team():
+        mine = json.loads(pm["channels"] or "[]")
+        if mine and pm["user_id"] not in sent:
+            try:
+                await context.bot.send_message(pm["user_id"], case_report(mine, first, last),
+                                               parse_mode=constants.ParseMode.HTML)
+                sent.add(pm["user_id"])
+            except Exception as e:
+                log.info("Couldn't send %s their case report: %s", pm["user_id"], e)
+    everything = case_report([k for k, _, _ in CHANNELS], first, last)
+    for aid in admin_ids():
+        if aid in sent:
+            continue
+        try:
+            await context.bot.send_message(aid, everything, parse_mode=constants.ParseMode.HTML)
+        except Exception:
+            pass
+    log.info("Case reports sent for %s", first)

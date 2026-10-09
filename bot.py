@@ -657,6 +657,11 @@ async def post_init(app: Application) -> None:
         job_week_digest, time(dmins // 60, dmins % 60, tzinfo=TZ),
         name="week-digest",
     )
+    rmins = parse_time_token(os.environ.get("REPORT_TIME", "").strip() or "09:00")
+    app.job_queue.run_daily(
+        job_case_report, time(rmins // 60, rmins % 60, tzinfo=TZ),
+        name="case-report",
+    )
     log.info(
         "Weekly backup scheduled for %s at %s",
         ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"][BACKUP_DAY % 7],
@@ -704,7 +709,10 @@ def main() -> None:
             states={
                 ASK_NAME: [
                     MessageHandler(filters.TEXT & ~filters.COMMAND, got_name)
-                ]
+                ],
+                CASE_NOTE: [   # /start note_<id> from a store chat's 📝 Note
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, on_case_note_text)
+                ],
             },
             fallbacks=[CommandHandler("cancel", cancel)],
         )
@@ -884,8 +892,10 @@ def main() -> None:
     app.add_handler(CommandHandler("handover", cmd_handover))
     app.add_handler(CommandHandler("handovers", cmd_handovers))
     app.add_handler(CommandHandler("linkchat", cmd_linkchat))
+    app.add_handler(CallbackQueryHandler(on_store_close, pattern=r"^sc:x:\d+$"))
     app.add_handler(CommandHandler("cases", cmd_cases))
     app.add_handler(CommandHandler("pmalerts", cmd_pmalerts))
+    app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(
         ConversationHandler(
             entry_points=[

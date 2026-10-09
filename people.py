@@ -47,6 +47,22 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     status = agent_status(user.id)
 
+    # From 📝 Note under a case in a store chat: take the note here, privately.
+    if context.args and context.args[0].startswith("note_") and (
+            status == "active" or is_owner(user.id)):
+        raw = context.args[0][5:]
+        r = q1("SELECT username, closed FROM ho_cases WHERE id=?",
+               (int(raw),)) if raw.isdigit() else None
+        if r and not r["closed"]:
+            context.user_data["case_note"] = ("n", int(raw))
+            await update.message.reply_text(
+                f"📝 <b>Note on {esc(r['username'])}</b>\n\nWhat's the latest? "
+                "(e.g. refund done, waiting on courier)\n\n<i>/cancel to stop</i>",
+                parse_mode=constants.ParseMode.HTML)
+            return CASE_NOTE
+        await update.message.reply_text("That case is closed or gone.")
+        return ConversationHandler.END
+
     if status == "active" and is_online(user.id):
         touch_agent(user, dm_ok=1)
         await update.message.reply_text(

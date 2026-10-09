@@ -1717,6 +1717,7 @@ HO_SECTION, HO_PRIO, HO_PLATFORM, HO_STORE, HO_BODY, HO_MORE = range(221, 227)
 REVIEW_PHOTO = 230
 RESTORE_FILE, RESTORE_OK = 250, 251
 HO_PICK = 231
+CASE_NOTE, CASE_EDIT = 270, 271
 OT_WHEN = 260
 SWAP_PICK, SWAP_WHO, SWAP_REASON = 240, 241, 242
 
@@ -2040,6 +2041,25 @@ def close_case(case_id: int, user_id: int, side: str = "sh") -> None:
         )
 
 
+EDIT_LABELS = {"prio": "Urgency", **{k: label for k, label, _ in CASE_FIELDS}}
+
+
+def save_case_edit(case_id: int, user_id: int, key: str, value: str) -> None:
+    """Change one part of a case, rebuild its written-out body, and log it."""
+    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    old = r[key] or ""
+    if old == value:
+        return
+    run(f"UPDATE ho_cases SET {key}=? WHERE id=?", (value or None, case_id))
+    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    if r["order_no"] is not None:
+        d = {k: r[k] or "" for k, _, _ in CASE_FIELDS}
+        run("UPDATE ho_cases SET body=? WHERE id=?", (compose_body(d), case_id))
+    side = "on" if is_online(user_id) else "sh"
+    log_case(case_id, user_id, side, "edited",
+             f"{EDIT_LABELS[key]}: {old or '(blank)'} → {value or '(blank)'}")
+
+
 def reopen_case(case_id: int, user_id: int | None = None) -> None:
     """Back to open on both sides."""
     run(
@@ -2154,6 +2174,21 @@ def render_channel_post(post_id: int) -> str:
     return "\n".join(out)
 
 
+def channel_post_keyboard(post_id: int, bot_username: str | None):
+    """✅ Close and 📝 Note under each case still open. Close works in place;
+    Note opens a private chat with the bot, so nothing is typed in the group."""
+    rows = []
+    for r in q("SELECT id, username FROM ho_cases WHERE post_id=? AND closed=0 "
+               "ORDER BY id", (post_id,))[:45]:
+        who = (r["username"] or "case")[:20]
+        row = [InlineKeyboardButton(f"✅ Close · {who}", callback_data=f"sc:x:{r['id']}")]
+        if bot_username:
+            row.append(InlineKeyboardButton(
+                f"📝 Note · {who}", url=f"https://t.me/{bot_username}?start=note_{r['id']}"))
+        rows.append(row)
+    return InlineKeyboardMarkup(rows) if rows else None
+
+
 async def post_new_cases_to_chats(bot, agent_id: int) -> int:
     """Send each store's chat the new cases from this handover, one message
     per chat. Returns how many messages went out."""
@@ -2189,7 +2224,9 @@ async def post_new_cases_to_chats(bot, agent_id: int) -> int:
                 (pid, *ids))
             kw = {"message_thread_id": where["thread"]} if where.get("thread") else {}
             try:
-                msg = await bot.send_message(where["chat"], render_channel_post(pid), **kw)
+                msg = await bot.send_message(
+                    where["chat"], render_channel_post(pid),
+                    reply_markup=channel_post_keyboard(pid, bot.username), **kw)
                 run("UPDATE channel_posts SET message_id=? WHERE id=?",
                     (msg.message_id, pid))
                 sent += 1
@@ -2259,6 +2296,7 @@ async def refresh_case_post(bot, case_id: int) -> None:
         await bot.edit_message_text(
             render_channel_post(p["id"]), chat_id=p["chat_id"],
             message_id=p["message_id"],
+            reply_markup=channel_post_keyboard(p["id"], bot.username),
         )
     except BadRequest as e:
         if "not modified" not in str(e).lower():
@@ -2596,6 +2634,7 @@ AGENT_COMMANDS = [
     ("clockin", "Start my shift — or /clockin 2pm-4pm"),
     ("clockout", "End my shift"),
     ("handover", "Add or update handover cases"),
+    ("cases", "Open cases — notes and closing your side"),
     ("payslip", "Open the app"),
     ("dropshift", "Ask to drop a shift"),
     ("pickup", "Ask to take an open shift"),
@@ -2634,8 +2673,8 @@ ADMIN_GROUPS = [
         ("dropreqs", "Shift requests waiting"),
         ("handovers", "Recent closing handovers"),
         ("linkchat", "Link a store's chat to its cases"),
-        ("cases", "Open cases — close, note, force close"),
         ("pmalerts", "New-case messages to the Online team on/off"),
+        ("report", "Case report by channel, last 7 days"),
         ("channels", "Online team and the channels they cover"),
         ("access", "Who approved or declined whom"),
         ("roster", "Who's on the list"),
@@ -2682,6 +2721,7 @@ ONLINE_HELP = (
     "  📝 add a note (what's done, what's next)\n"
     "  ↩️ hand it back to SH if you need something from them\n"
     "  ✏️ edit it if a detail is wrong\n"
+    "/report — how your channels' cases went this past week\n"
     "Or tap <b>App</b> by the 📎 for the same cases, sorted into "
     "Shopee, Lazada and Webstore.\n"
     "/help — this list again\n\n"
@@ -2690,6 +2730,7 @@ ONLINE_HELP = (
 
 ONLINE_COMMANDS = [
     ("cases", "Open cases for your channels"),
+    ("report", "Your channels' cases, last 7 days"),
     ("help", "List commands"),
 ]
 
@@ -2971,7 +3012,7 @@ const tg = window.Telegram?.WebApp;
 if (tg) { tg.ready(); tg.expand(); }
 let VIEW = 'home', MODE = 'week', START = '', WHICH = 'now', IS_ADMIN = false;
 // The Online team's app: handover cases only, sorted into platform tabs.
-let ONLINE = false, ON_GROUP = '', ON_REGION = '';
+let ONLINE = false, ON_GROUP = '', ON_REGION = '', ON_EDIT = {};
 const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 
 function navBar() {
@@ -3402,18 +3443,55 @@ function onlineCard(c, mine) {
     if (c.history && c.history.length) {
       h += '<div class="hist">🕓 ' + c.history.map(esc).join('<br>') + '</div>';
     }
+    if (ON_EDIT[c.id]) return h + editForm(c) + '</div>';
     h += `<div class="addnote"><textarea id="note_${c.id}" rows="2" `
        + `placeholder="A note, or what you need from SH"></textarea></div>`;
     h += '<div class="acts">';
     if (!c.onClosed) h += `<button data-onclose="${c.id}">✅ Close (Online)</button>`;
     h += `<button class="soft" data-addnote="${c.id}">📝 Add note</button>`;
     h += `<button class="soft" data-handback="${c.id}">↩️ Hand back to SH</button>`;
+    h += `<button class="soft" data-edit="${c.id}">✏️ Edit</button>`;
     h += '</div>';
     h += `<div class="more" data-hide="${c.id}">Hide</div>`;
   } else {
     h += `<div class="more" data-show="${c.id}">Open the case</div>`;
   }
   return h + '</div>';
+}
+
+function editForm(c) {
+  const f = ON_EDIT[c.id];
+  let h = '<div class="body">';
+  h += '<div class="fld"><label>How urgent</label><div class="pick">'
+    + HO.priorities.map(p =>
+        `<button data-eprio="${c.id}" data-v="${p.emoji}" class="${f.prio === p.emoji ? 'on' : ''}">${p.emoji} ${esc(p.name)}</button>`
+      ).join('') + '</div></div>';
+  const long = { happened: 1, done: 1, need: 1 };
+  for (const fd of HO.fields) {
+    if (!(fd.key in c.fields)) continue;
+    const v = esc(f[fd.key] ?? '');
+    h += `<div class="fld"><label>${esc(fd.label)}${fd.required ? '' : ' (optional)'}</label>`;
+    h += long[fd.key]
+      ? `<textarea id="e_${c.id}_${fd.key}" rows="2">${v}</textarea>`
+      : `<input id="e_${c.id}_${fd.key}" value="${v}">`;
+    h += '</div>';
+  }
+  if (!('order_no' in c.fields)) {
+    h += '<div class="note">This case was written before the new format, so only '
+       + 'the urgency and username can be changed.</div>';
+  }
+  h += `<div class="acts"><button data-esave="${c.id}">Save changes</button>`
+     + `<button class="soft" data-ecancel="${c.id}">Cancel</button></div>`;
+  return h + '</div>';
+}
+
+function keepEdit(id) {
+  const f = ON_EDIT[id];
+  if (!f) return;
+  for (const fd of HO.fields) {
+    const el = document.getElementById(`e_${id}_${fd.key}`);
+    if (el) f[fd.key] = el.value;
+  }
 }
 
 function renderOnline(d) {
@@ -3474,6 +3552,37 @@ function renderOnline(d) {
       const out = await post('/api/case/toggle', { id: Number(el.dataset.onclose), close: true });
       if (!out.ok) { el.disabled = false; toast(out.error || 'Could not close that.'); return; }
       toast('Closed on the Online side');
+      await loadHandover();
+    };
+  });
+  document.querySelectorAll('[data-edit]').forEach(el => {
+    el.onclick = () => {
+      const c = open.find(x => x.id === Number(el.dataset.edit));
+      if (!c) return;
+      ON_EDIT[c.id] = Object.assign({ prio: c.prio }, c.fields);
+      renderOnline(d);
+    };
+  });
+  document.querySelectorAll('[data-eprio]').forEach(el => {
+    el.onclick = () => {
+      const id = Number(el.dataset.eprio);
+      keepEdit(id);
+      ON_EDIT[id].prio = el.dataset.v;
+      renderOnline(d);
+    };
+  });
+  document.querySelectorAll('[data-ecancel]').forEach(el => {
+    el.onclick = () => { delete ON_EDIT[Number(el.dataset.ecancel)]; renderOnline(d); };
+  });
+  document.querySelectorAll('[data-esave]').forEach(el => {
+    el.onclick = async () => {
+      const id = Number(el.dataset.esave);
+      keepEdit(id);
+      el.disabled = true; el.textContent = 'Saving…';
+      const out = await post('/api/case/edit', { id, changes: ON_EDIT[id] });
+      if (!out.ok) { el.disabled = false; el.textContent = 'Save changes'; toast(out.error || 'Could not save that.'); return; }
+      delete ON_EDIT[id];
+      toast('Saved');
       await loadHandover();
     };
   });

@@ -511,6 +511,9 @@ def handover_payload(user_id: int) -> dict:
                 r["channel"] or "", (r["channel"] or "").split("_")[-1]),
             "note": note_line(r["id"]),
             "history": case_history_lines(r["id"]),
+            # The parts of the case, for editing. Older cases only have free text.
+            "fields": ({k: r[k] or "" for k, _, _ in CASE_FIELDS}
+                       if r["order_no"] is not None else {"username": r["username"] or ""}),
         }
         if closed:
             out["closedBy"] = display_name_of(r["closed_by"], "") if r["closed_by"] else ""
@@ -557,7 +560,33 @@ def case_history_lines(case_id: int, limit: int = 8) -> list:
 
 
 # What the Online team may do from the app.
-ONLINE_POSTS = {"/api/case/toggle", "/api/case/note", "/api/case/handback"}
+ONLINE_POSTS = {"/api/case/toggle", "/api/case/note", "/api/case/handback",
+                "/api/case/edit"}
+
+
+def web_case_edit(user_id: int, case_id: int, changes: dict) -> dict:
+    """Online team and admins: change a case's urgency or its parts."""
+    if not (is_online(user_id) or is_admin(user_id)):
+        return {"ok": False, "error": "Only the Online team and admins edit cases."}
+    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    if not r:
+        return {"ok": False, "error": "That case is gone."}
+    allowed = ([k for k, _, _ in CASE_FIELDS] if r["order_no"] is not None
+               else ["username"])
+    todo = {}
+    if changes.get("prio") in [e for e, _ in PRIORITIES]:
+        todo["prio"] = changes["prio"]
+    for key, label, required in CASE_FIELDS:
+        if key not in allowed or key not in changes:
+            continue
+        value = str(changes[key] or "").strip()[:500]
+        if required and len(value) < 2:
+            return {"ok": False, "error": f"Fill in: {label}."}
+        todo[key] = value
+    for key, value in todo.items():
+        save_case_edit(case_id, user_id, key, value)
+    on_bot_loop(refresh_case_post(bot_ref(), case_id))
+    return {"ok": True, "username": r["username"]}
 
 
 def web_case_handback(user_id: int, case_id: int, note: str) -> dict:
@@ -1022,6 +1051,14 @@ class MiniAppHandler(BaseHTTPRequestHandler):
             except (TypeError, ValueError):
                 cid = 0
             out = (web_case_handback(uid, cid, str(body.get("note", "")))
+                   if cid else {"ok": False, "error": "No case given."})
+        elif path == "/api/case/edit":
+            try:
+                cid = int(body.get("id", 0))
+            except (TypeError, ValueError):
+                cid = 0
+            changes = body.get("changes") if isinstance(body.get("changes"), dict) else {}
+            out = (web_case_edit(uid, cid, changes)
                    if cid else {"ok": False, "error": "No case given."})
         elif path == "/api/case/note":
             try:
