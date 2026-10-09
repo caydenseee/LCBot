@@ -1212,6 +1212,19 @@ def is_locked(week_id: int, user_id: int) -> bool:
     )
 
 
+def tag_list(people, room: int = TG_LIMIT) -> str:
+    """Everyone's @handle. Only cut short with +N if the message would
+    otherwise go over Telegram's length limit."""
+    tags = [f"@{p['username']}" if p["username"] else esc(p["name"]) for p in people]
+    shown = []
+    for i, tag in enumerate(tags):
+        left = len(tags) - i - 1
+        if len(", ".join(shown + [tag])) + (len(f" +{left}") if left else 0) > room:
+            return ", ".join(shown) + f" +{len(tags) - len(shown)}"
+        shown.append(tag)
+    return ", ".join(shown)
+
+
 def render_board(week_id: int, compact: bool = False) -> tuple[str, InlineKeyboardMarkup]:
     """The whole week in one message."""
     w = q1("SELECT * FROM weeks WHERE id=?", (week_id,))
@@ -1275,11 +1288,8 @@ def render_board(week_id: int, compact: bool = False) -> tuple[str, InlineKeyboa
             rows += [slot_buttons[i : i + 5] for i in range(0, len(slot_buttons), 5)]
 
     if st["missing"] and not closed:
-        names = ", ".join(
-            f"@{x['username']}" if x["username"] else x["name"] for x in st["missing"][:10]
-        )
-        extra = f" +{len(st['missing']) - 10}" if len(st["missing"]) > 10 else ""
-        lines += ["", f"⏳ Not yet confirmed: {names}{extra}"]
+        room = TG_LIMIT - len("\n".join(lines)) - 120   # leave room for the footer
+        lines += ["", f"⏳ Not yet confirmed: {tag_list(st['missing'], room)}"]
 
     if not closed and GROUP_BUTTONS:
         rows.append(
@@ -1354,12 +1364,8 @@ def render_header(week_id: int) -> tuple[str, InlineKeyboardMarkup]:
         lines.append("🎉 Every slot covered")
 
     if st["missing"] and w["status"] == "open":
-        names = ", ".join(
-            f"@{a['username']}" if a["username"] else a["name"]
-            for a in st["missing"][:10]
-        )
-        extra = f" +{len(st['missing']) - 10}" if len(st["missing"]) > 10 else ""
-        lines.append(f"⏳ Not yet confirmed: {names}{extra}")
+        room = TG_LIMIT - len("\n".join(lines)) - 60
+        lines.append(f"⏳ Not yet confirmed: {tag_list(st['missing'], room)}")
 
     kb = []
     if w["status"] == "open":
