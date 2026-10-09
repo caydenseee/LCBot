@@ -1965,12 +1965,20 @@ def log_case(case_id: int, user_id: int | None, side: str, action: str,
         (case_id, user_id, side, action, note or None, now().isoformat()))
 
 
-def latest_note(case_id: int, actions=("note", "handed back")):
+def latest_note(case_id: int, actions=("note", "handed back"), side: str | None = None):
     """The newest note someone wrote on a case (not edit records), or None."""
     marks = ",".join("?" * len(actions))
+    extra, args = ("AND side=? ", (side,)) if side else ("", ())
     return q1(f"SELECT * FROM case_log WHERE case_id=? AND note IS NOT NULL "
-              f"AND action IN ({marks}) ORDER BY id DESC LIMIT 1",
-              (case_id, *actions))
+              f"AND action IN ({marks}) {extra}ORDER BY id DESC LIMIT 1",
+              (case_id, *actions, *args))
+
+
+def reusable_note(case_id: int, user_id: int):
+    """The note this person just left, if it's still the latest word on the
+    case — so handing back doesn't make them type it twice."""
+    n = latest_note(case_id)
+    return n if n and n["user_id"] == user_id and n["action"] == "note" else None
 
 
 def case_history(case_id: int) -> list:
@@ -2053,8 +2061,9 @@ async def announce_handback(bot, case_id: int, user_id: int, note: str) -> None:
         )
 
 
-def hand_back_case(case_id: int, user_id: int, note: str) -> None:
-    """Online needs something from SH: open it again on SH's side, flagged."""
+def hand_back_case(case_id: int, user_id: int, note: str | None) -> None:
+    """Online needs something from SH: open it again on SH's side, flagged.
+    note=None when it reuses the note they just left (already in the log)."""
     run(
         "UPDATE ho_cases SET handed_back=1, closed=0, closed_by=NULL, "
         "closed_at=NULL, sh_closed=0, sh_closed_by=NULL, sh_closed_at=NULL "
@@ -2329,7 +2338,7 @@ def open_cases() -> list:
 def case_row_to_dict(r) -> dict:
     back = ""
     if r["handed_back"]:
-        n = latest_note(r["id"], ("handed back",))
+        n = latest_note(r["id"], ("handed back", "note"), side="on")
         if n:
             back = f"{display_name_of(n['user_id'], 'Online')}: {n['note']}"
     return {
@@ -3450,8 +3459,8 @@ function renderOnline(d) {
     el.onclick = async () => {
       const id = el.dataset.handback;
       const box = document.getElementById('note_' + id);
+      // An empty box hands it back with the note they already left.
       const note = box ? box.value.trim() : '';
-      if (!note) { toast('Say what you need from SH in the box first.'); return; }
       el.disabled = true;
       const out = await post('/api/case/handback', { id: Number(id), note });
       if (!out.ok) { el.disabled = false; toast(out.error || 'Could not hand that back.'); return; }

@@ -925,6 +925,21 @@ async def on_case_note_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
     context.user_data["case_note"] = (action, int(raw))
     r = q1("SELECT username FROM ho_cases WHERE id=?", (int(raw),))
     who = r["username"] if r else "this case"
+    mine = reusable_note(int(raw), uid) if action == "h" else None
+    if mine:
+        await query.edit_message_text(
+            f"↩️ <b>Hand {esc(who)} back to SH</b>\n\nUse your note?\n"
+            f"<i>{esc(mine['note'])}</i>",
+            parse_mode=constants.ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ Yes, hand back with this note",
+                                      callback_data=f"cs:hy:{raw}")],
+                [InlineKeyboardButton("✏️ Write a different message",
+                                      callback_data=f"cs:hw:{raw}")],
+                [InlineKeyboardButton("◀️ Back to the case", callback_data=f"cs:v:{raw}")],
+            ]),
+        )
+        return CASE_NOTE
     ask = (f"↩️ <b>Hand {esc(who)} back to SH</b>\n\nWhat do you need from them?"
            if action == "h" else
            f"📝 <b>Note on {esc(who)}</b>\n\nWhat's the latest? "
@@ -932,6 +947,36 @@ async def on_case_note_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await query.edit_message_text(ask + "\n\n<i>/cancel to stop</i>",
                                   parse_mode=constants.ParseMode.HTML)
     return CASE_NOTE
+
+
+async def on_handback_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """cs:hy hand back with the note they just left · cs:hw type a new one ·
+    cs:v back to the case."""
+    query = update.callback_query
+    uid = query.from_user.id
+    _, action, raw = query.data.split(":")
+    case_id = int(raw)
+    await query.answer()
+    if action == "hw":
+        context.user_data["case_note"] = ("h", case_id)
+        r = q1("SELECT username FROM ho_cases WHERE id=?", (case_id,))
+        await query.edit_message_text(
+            f"↩️ <b>Hand {esc(r['username'] if r else 'this case')} back to SH</b>"
+            "\n\nWhat do you need from them?\n\n<i>/cancel to stop</i>",
+            parse_mode=constants.ParseMode.HTML)
+        return CASE_NOTE
+    context.user_data.pop("case_note", None)
+    if action == "hy" and is_online(uid):
+        mine = reusable_note(case_id, uid)
+        if mine:
+            async with write_lock:
+                hand_back_case(case_id, uid, None)
+            await refresh_case_post(context.bot, case_id)
+            await announce_handback(context.bot, case_id, uid, mine["note"])
+    text, kb = case_view(case_id, uid)
+    await query.edit_message_text(
+        ("↩️ Handed back to SH.\n\n" if action == "hy" else "") + text, reply_markup=kb)
+    return ConversationHandler.END
 
 
 async def on_case_note_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:

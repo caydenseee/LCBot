@@ -560,15 +560,20 @@ ONLINE_POSTS = {"/api/case/toggle", "/api/case/note", "/api/case/handback"}
 def web_case_handback(user_id: int, case_id: int, note: str) -> dict:
     if not is_online(user_id):
         return {"ok": False, "error": "Only the Online team hands cases back."}
-    note = (note or "").strip()
-    if len(note) < 2:
-        return {"ok": False, "error": "Say what you need from SH first."}
+    note = (note or "").strip()[:500]
     row = q1("SELECT username FROM ho_cases WHERE id=?", (case_id,))
     if not row:
         return {"ok": False, "error": "That case is gone."}
-    hand_back_case(case_id, user_id, note[:500])
+    reuse = None
+    if len(note) < 2:
+        # An empty box means "use the note I just left".
+        reuse = reusable_note(case_id, user_id)
+        if not reuse:
+            return {"ok": False, "error": "Say what you need from SH in the box first."}
+        note = reuse["note"]
+    hand_back_case(case_id, user_id, None if reuse else note)
     on_bot_loop(refresh_case_post(bot_ref(), case_id))
-    on_bot_loop(announce_handback(bot_ref(), case_id, user_id, note[:500]))
+    on_bot_loop(announce_handback(bot_ref(), case_id, user_id, note))
     return {"ok": True, "username": row["username"]}
 
 

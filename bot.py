@@ -894,7 +894,8 @@ def main() -> None:
             ],
             states={
                 CASE_NOTE: [
-                    MessageHandler(filters.TEXT & ~filters.COMMAND, on_case_note_text)
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, on_case_note_text),
+                    CallbackQueryHandler(on_handback_choice, pattern=r"^cs:(hy|hw|v):\d+$"),
                 ],
                 CASE_EDIT: [
                     MessageHandler(filters.TEXT & ~filters.COMMAND, on_case_edit_text)
