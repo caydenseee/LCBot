@@ -510,6 +510,9 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     user = update.effective_user
+    if is_online(user.id):
+        await update.message.reply_text(ONLINE_HELP, parse_mode=constants.ParseMode.HTML)
+        return
     role = role_of(user.id)
     lines = ["<b>How to use me</b>", ""]
 
@@ -843,7 +846,10 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(on_plan_toggle, pattern=r"^p:"))
     app.add_handler(CallbackQueryHandler(on_plan_nav, pattern=r"^pd:"))
     app.add_handler(CallbackQueryHandler(on_clockin_slot, pattern=r"^ci:\d+:\d+$"))
-    app.add_handler(CallbackQueryHandler(on_access_decision, pattern=r"^(ap|dn):\d+$"))
+    app.add_handler(CallbackQueryHandler(on_access_decision, pattern=r"^(ap|dn|ao):\d+$"))
+    app.add_handler(CallbackQueryHandler(on_channel_pick, pattern=r"^tc:\d+:"))
+    app.add_handler(CommandHandler("channels", cmd_channels))
+    app.add_handler(CommandHandler("actas", cmd_actas))
     app.add_handler(CallbackQueryHandler(on_plan_quick, pattern=r"^pq:"))
     app.add_handler(CallbackQueryHandler(on_handover_none, pattern=r"^ho:none$"))
     app.add_handler(CallbackQueryHandler(on_handover_carry, pattern=r"^ho:carry$"))
@@ -878,6 +884,30 @@ def main() -> None:
     app.add_handler(CommandHandler("handover", cmd_handover))
     app.add_handler(CommandHandler("handovers", cmd_handovers))
     app.add_handler(CommandHandler("linkchat", cmd_linkchat))
+    app.add_handler(CommandHandler("cases", cmd_cases))
+    app.add_handler(CommandHandler("pmalerts", cmd_pmalerts))
+    app.add_handler(
+        ConversationHandler(
+            entry_points=[
+                CallbackQueryHandler(on_case_note_start, pattern=r"^cs:[nh]:\d+$"),
+                CallbackQueryHandler(on_case_edit_start, pattern=r"^cs:ef:\d+:\w+$"),
+            ],
+            states={
+                CASE_NOTE: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, on_case_note_text),
+                    CallbackQueryHandler(on_handback_choice, pattern=r"^cs:(hy|hw|v):\d+$"),
+                ],
+                CASE_EDIT: [
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, on_case_edit_text)
+                ],
+            },
+            fallbacks=[CommandHandler("cancel", cancel)],
+            allow_reentry=True,
+            conversation_timeout=1800,
+        )
+    )
+    app.add_handler(CallbackQueryHandler(on_cases_button,
+                                         pattern=r"^cs:(l|v|x|s|f|e|ep)(:|$)"))
     app.add_handler(
         ConversationHandler(
             entry_points=[CommandHandler("addreview", cmd_addreview)],

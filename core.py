@@ -35,6 +35,8 @@ from telegram import (
     BotCommand,
     KeyboardButton,
     ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
+    MenuButtonDefault,
     MenuButtonWebApp,
     WebAppInfo,
     BotCommandScopeAllGroupChats,
@@ -158,6 +160,9 @@ OPS_CHAT_ID = env_int("OPS_CHAT_ID")
 OPS_THREAD_ID = env_int("OPS_THREAD_ID") or None
 # Mini App. PUBLIC_URL comes from Railway once you generate a domain.
 PUBLIC_URL = os.environ.get("PUBLIC_URL", "").strip().rstrip("/")
+# Set TEST_MODE=on only on the test bot: lets the owner try the Online team's
+# side themselves with /actas. Never set it on the live bot.
+TEST_MODE = os.environ.get("TEST_MODE", "").strip().lower() in {"1", "true", "yes", "on"}
 # Telegram's webview caches a Mini App per URL, so a bad page can survive a
 # deploy. Stamping the URL on startup makes every deploy a fresh address.
 BUILD_STAMP = datetime.now().strftime("%Y%m%d%H%M%S")
@@ -442,6 +447,7 @@ for _col, _ddl in [
     ("requested_at", "TEXT"),
     ("decided_by", "INTEGER"),
     ("decided_at", "TEXT"),
+    ("channels", "TEXT"),            # Online team: JSON list of channel keys
 ]:
     if _col not in _cols:
         db.execute(f"ALTER TABLE agents ADD COLUMN {_col} {_ddl}")
@@ -467,12 +473,27 @@ for _col, _ddl in [
 for _col, _ddl in [
     ("chat_posted", "INTEGER NOT NULL DEFAULT 0"),
     ("post_id", "INTEGER"),
+    ("handed_back", "INTEGER NOT NULL DEFAULT 0"),
+    ("pm_notified", "INTEGER NOT NULL DEFAULT 0"),
 ]:
     if _col not in _hc_cols:
         db.execute(f"ALTER TABLE ho_cases ADD COLUMN {_col} {_ddl}")
+if "pm_notified" not in _hc_cols:
+    # Platform managers only hear about cases added from now on.
+    db.execute("UPDATE ho_cases SET pm_notified=1")
 if "chat_posted" not in _hc_cols:
     # Only cases added from now on go to the store chats.
     db.execute("UPDATE ho_cases SET chat_posted=1")
+# Who did what to a case, and any note they left.
+db.execute("""CREATE TABLE IF NOT EXISTS case_log (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    case_id    INTEGER NOT NULL,
+    user_id    INTEGER,
+    side       TEXT,
+    action     TEXT NOT NULL,
+    note       TEXT,
+    created_at TEXT NOT NULL
+)""")
 # One message in a store's chat, listing new cases from one handover.
 db.execute("""CREATE TABLE IF NOT EXISTS channel_posts (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1009,8 +1030,23 @@ def admin_ids() -> list:
     return sorted(ids)
 
 
+def is_online(user_id: int) -> bool:
+    """The Online team: platform managers who only see handover cases."""
+    return role_of(user_id) == "online"
+
+
+def online_channels(user_id: int) -> list:
+    row = q1("SELECT channels FROM agents WHERE user_id=?", (user_id,))
+    return json.loads(row["channels"]) if row and row["channels"] else []
+
+
 def role_of(user_id: int) -> str:
     if is_owner(user_id):
+        if TEST_MODE:
+            # The owner trying out the Online team's side with /actas online.
+            row = q1("SELECT role FROM agents WHERE user_id=?", (user_id,))
+            if row and row["role"] == "online":
+                return "online"
         return "owner"
     row = q1("SELECT role FROM agents WHERE user_id=? AND active=1", (user_id,))
     return row["role"] if row else "agent"
@@ -1157,7 +1193,7 @@ def apply_fixed_slots(week_id: int) -> int:
 
 
 def week_stats(week_id: int) -> dict:
-    roster = q("SELECT * FROM agents WHERE status='active' AND on_avails=1")
+    roster = q("SELECT * FROM agents WHERE status='active' AND role<>'online' AND on_avails=1")
     confirmed = {
         r["user_id"] for r in q("SELECT user_id FROM confirmations WHERE week_id=?", (week_id,))
     }
@@ -1685,10 +1721,18 @@ OT_WHEN = 260
 SWAP_PICK, SWAP_WHO, SWAP_REASON = 240, 241, 242
 
 
+ONLINE_ONLY = ("That's for the SH team. Use /cases to see your open cases, "
+               "or /help.")
+
+
 async def gate(update: Update) -> bool:
     """True if this person may use the bot. Replies if not."""
     uid = update.effective_user.id
     status = agent_status(uid)
+    if status == "active" and is_online(uid):
+        if update.message:
+            await update.message.reply_text(ONLINE_ONLY)
+        return False
     if status == "active":
         return True
     msg = {
@@ -1703,6 +1747,9 @@ async def gate(update: Update) -> bool:
 async def gate_cb(query) -> bool:
     """Same, for button taps."""
     status = agent_status(query.from_user.id)
+    if status == "active" and is_online(query.from_user.id):
+        await query.answer(ONLINE_ONLY, show_alert=True)
+        return False
     if status == "active":
         return True
     msg = {
@@ -1890,10 +1937,52 @@ def sla_mark(due: date, today: date | None = None) -> str:
     return "⏰" if today == due else ""
 
 
+def online_team() -> list:
+    """Everyone in the Online team. On the test bot (TEST_MODE) the owner
+    counts too once they've picked channels, even while back on the SH side,
+    so one person can test both sides."""
+    rows = q("SELECT * FROM agents WHERE role='online' AND status='active'")
+    if TEST_MODE:
+        seen = {r["user_id"] for r in rows}
+        rows += [r for r in q("SELECT * FROM agents WHERE channels IS NOT NULL "
+                              "AND channels <> '[]'")
+                 if is_owner(r["user_id"]) and r["user_id"] not in seen]
+    return rows
+
+
 def online_covers(channel: str | None) -> bool:
-    """Whether a case on this channel also needs the Online team's tick.
-    No one has the Online role yet, so SH's tick alone closes a case."""
-    return False
+    """Whether a case on this channel also needs the Online team's tick:
+    true once someone in the Online role looks after that channel."""
+    if not channel:
+        return False
+    return any(channel in json.loads(r["channels"] or "[]") for r in online_team())
+
+
+def log_case(case_id: int, user_id: int | None, side: str, action: str,
+             note: str = "") -> None:
+    run("INSERT INTO case_log (case_id, user_id, side, action, note, created_at)"
+        " VALUES (?,?,?,?,?,?)",
+        (case_id, user_id, side, action, note or None, now().isoformat()))
+
+
+def latest_note(case_id: int, actions=("note", "handed back"), side: str | None = None):
+    """The newest note someone wrote on a case (not edit records), or None."""
+    marks = ",".join("?" * len(actions))
+    extra, args = ("AND side=? ", (side,)) if side else ("", ())
+    return q1(f"SELECT * FROM case_log WHERE case_id=? AND note IS NOT NULL "
+              f"AND action IN ({marks}) {extra}ORDER BY id DESC LIMIT 1",
+              (case_id, *actions, *args))
+
+
+def reusable_note(case_id: int, user_id: int):
+    """The note this person just left, if it's still the latest word on the
+    case — so handing back doesn't make them type it twice."""
+    n = latest_note(case_id)
+    return n if n and n["user_id"] == user_id and n["action"] == "note" else None
+
+
+def case_history(case_id: int) -> list:
+    return q("SELECT * FROM case_log WHERE case_id=? ORDER BY id", (case_id,))
 
 
 def insert_case(agent_id: int, d: dict, the_date: date) -> int:
@@ -1920,9 +2009,10 @@ def close_case(case_id: int, user_id: int, side: str = "sh") -> None:
     ts = now().isoformat()
     run(
         f"UPDATE ho_cases SET {side}_closed=1, {side}_closed_by=?, "
-        f"{side}_closed_at=? WHERE id=?",
+        f"{side}_closed_at=?, handed_back=0 WHERE id=?",
         (user_id, ts, case_id),
     )
+    log_case(case_id, user_id, side, "closed")
     row = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
     if row and row["sh_closed"] and (
         row["on_closed"] or not online_covers(row["channel"])
@@ -1933,7 +2023,7 @@ def close_case(case_id: int, user_id: int, side: str = "sh") -> None:
         )
 
 
-def reopen_case(case_id: int) -> None:
+def reopen_case(case_id: int, user_id: int | None = None) -> None:
     """Back to open on both sides."""
     run(
         "UPDATE ho_cases SET closed=0, closed_by=NULL, closed_at=NULL, "
@@ -1941,6 +2031,45 @@ def reopen_case(case_id: int) -> None:
         "on_closed=0, on_closed_by=NULL, on_closed_at=NULL WHERE id=?",
         (case_id,),
     )
+    log_case(case_id, user_id, "on" if user_id and is_online(user_id)
+             else "sh", "reopened")
+
+
+def force_close_case(case_id: int, admin_id: int) -> None:
+    """Admins: close both sides when one side never will."""
+    ts = now().isoformat()
+    run(
+        "UPDATE ho_cases SET closed=1, closed_by=?, closed_at=?, handed_back=0, "
+        "sh_closed=1, sh_closed_by=COALESCE(sh_closed_by, ?), "
+        "sh_closed_at=COALESCE(sh_closed_at, ?), "
+        "on_closed=1, on_closed_by=COALESCE(on_closed_by, ?), "
+        "on_closed_at=COALESCE(on_closed_at, ?) WHERE id=?",
+        (admin_id, ts, admin_id, ts, admin_id, ts, case_id),
+    )
+    log_case(case_id, admin_id, "admin", "force closed")
+
+
+async def announce_handback(bot, case_id: int, user_id: int, note: str) -> None:
+    """Tell TC Online straight away that Online needs something from SH."""
+    r = q1("SELECT * FROM ho_cases WHERE id=?", (case_id,))
+    if r:
+        await post_ops(
+            bot,
+            f"↩️ {display_name_of(user_id, 'Online')} handed a case back to SH\n"
+            f"{r['prio']} {r['username']} · {CHANNEL_NAMES.get(r['channel'] or '', '')}\n"
+            f"Needs: {note}\n\nIt's at the top of the next /handover.",
+        )
+
+
+def hand_back_case(case_id: int, user_id: int, note: str | None) -> None:
+    """Online needs something from SH: open it again on SH's side, flagged.
+    note=None when it reuses the note they just left (already in the log)."""
+    run(
+        "UPDATE ho_cases SET handed_back=1, closed=0, closed_by=NULL, "
+        "closed_at=NULL, sh_closed=0, sh_closed_by=NULL, sh_closed_at=NULL "
+        "WHERE id=?", (case_id,),
+    )
+    log_case(case_id, user_id, "on", "handed back", note)
 
 
 def parse_channel(text: str) -> str | None:
@@ -1966,12 +2095,22 @@ def case_status_line(r) -> str:
         when = (datetime.fromisoformat(r["closed_at"]).strftime("%-d %b %H:%M")
                 if r["closed_at"] else "")
         return "✅ Closed" + (f" by {who}" if who else "") + (f" · {when}" if when else "")
+    if r["handed_back"]:
+        return "↩️ Handed back to SH"
     if r["sh_closed"]:
         return "☑️ SH closed · ⬜ waiting on Online"
     if r["on_closed"]:
         return "☑️ Online closed · ⬜ waiting on SH"
     due = case_due(date.fromisoformat(r["the_date"]), r["prio"])
     return f"🔸 Open · due {due.strftime('%a %-d %b')}"
+
+
+def note_line(case_id: int) -> str:
+    n = latest_note(case_id)
+    if not n:
+        return ""
+    when = datetime.fromisoformat(n["created_at"]).strftime("%-d %b %H:%M")
+    return f"📝 {when} · {display_name_of(n['user_id'], '')}: {n['note']}"
 
 
 def render_channel_post(post_id: int) -> str:
@@ -1982,8 +2121,12 @@ def render_channel_post(post_id: int) -> str:
     out = [f"📋 Handover · {CHANNEL_NAMES.get(p['channel'], p['channel'])}",
            f"{day}" + (f" · from {who}" if who else "")]
     for r in cases:
-        out += ["", "──────────", case_status_line(r),
-                render_case(case_row_to_dict(r))]
+        out += ["", "──────────", case_status_line(r)]
+        c = case_row_to_dict(r)
+        c["handback"] = ""                  # the note line below says it
+        out.append(render_case(c))
+        if note_line(r["id"]):              # the latest word, under the case
+            out += ["", note_line(r["id"])]
     return "\n".join(out)
 
 
@@ -2050,6 +2193,37 @@ def skip_store_chats() -> None:
     run("UPDATE ho_cases SET chat_posted=1 WHERE chat_posted=0")
 
 
+async def notify_pms(bot, agent_id: int) -> None:
+    """After a handover, a short DM to each platform manager whose channels
+    have new cases. One message per person per handover, not per case."""
+    rows = q("SELECT * FROM ho_cases WHERE pm_notified=0 ORDER BY id")
+    if not rows:
+        return
+    run("UPDATE ho_cases SET pm_notified=1 WHERE pm_notified=0")
+    if setting("pm_alerts", "on") == "off":
+        return
+    by_channel: dict = {}
+    for r in rows:
+        if not r["closed"]:
+            by_channel.setdefault(r["channel"], []).append(r)
+    who = display_name_of(agent_id, "SH")
+    for pm in online_team():
+        mine = [ch for ch in json.loads(pm["channels"] or "[]") if ch in by_channel]
+        if not mine:
+            continue
+        lines = [f"🆕 New cases from {who}'s handover", ""]
+        for ch in mine:
+            cases = by_channel[ch]
+            names = ", ".join(c["username"] for c in cases[:5])
+            more = f" +{len(cases) - 5}" if len(cases) > 5 else ""
+            lines.append(f"{CHANNEL_NAMES.get(ch, ch)}: {len(cases)} ({names}{more})")
+        lines += ["", "Open /cases to see them."]
+        try:
+            await bot.send_message(pm["user_id"], "\n".join(lines))
+        except Exception as e:
+            log.info("Couldn't message %s about new cases: %s", pm["user_id"], e)
+
+
 async def refresh_case_post(bot, case_id: int) -> None:
     """Edit the store chat's message so a case's line shows how it stands now."""
     r = q1("SELECT post_id FROM ho_cases WHERE id=?", (case_id,))
@@ -2084,7 +2258,10 @@ def render_case(c: dict) -> str:
     lines = [f"▫️{c['platform']}", f"{c['prio']} {c['username']}"]
     if c.get("store"):                       # Duoke only — Livechat has no brands
         lines.append(f"{c.get('flag', '')}{c['store']}")
-    return "\n".join(lines) + "\n" + c["body"].strip()
+    out = "\n".join(lines) + "\n" + c["body"].strip()
+    if c.get("handback"):
+        out += f"\n↩️ Handed back by {c['handback']}"
+    return out
 
 
 def render_handover(cases: list, who: str, the_date: date,
@@ -2159,7 +2336,13 @@ def open_cases() -> list:
 
 
 def case_row_to_dict(r) -> dict:
+    back = ""
+    if r["handed_back"]:
+        n = latest_note(r["id"], ("handed back", "note"), side="on")
+        if n:
+            back = f"{display_name_of(n['user_id'], 'Online')}: {n['note']}"
     return {
+        "handback": back,
         "section": r["section"], "prio": r["prio"], "platform": r["platform"],
         "flag": r["flag"], "store": r["store"], "username": r["username"],
         "body": r["body"],
@@ -2427,6 +2610,9 @@ ADMIN_GROUPS = [
         ("dropreqs", "Shift requests waiting"),
         ("handovers", "Recent closing handovers"),
         ("linkchat", "Link a store's chat to its cases"),
+        ("cases", "Open cases — close, note, force close"),
+        ("pmalerts", "New-case messages to the Online team on/off"),
+        ("channels", "Online team and the channels they cover"),
         ("access", "Who approved or declined whom"),
         ("roster", "Who's on the list"),
         ("rename", "Fix someone's name on the schedule"),
@@ -2465,10 +2651,31 @@ ADMIN_COMMANDS = AGENT_COMMANDS + [
 ]
 
 
+ONLINE_HELP = (
+    "👋 <b>Online team</b>\n\n"
+    "/cases — open handover cases, your channels first. Tap one to:\n"
+    "  ✅ close it on your side\n"
+    "  📝 add a note (what's done, what's next)\n"
+    "  ↩️ hand it back to SH if you need something from them\n"
+    "  ✏️ edit it if a detail is wrong\n"
+    "Or tap <b>App</b> by the 📎 for the same cases, sorted into "
+    "Shopee, Lazada and Webstore.\n"
+    "/help — this list again\n\n"
+    "<i>A case is fully closed once both SH and Online have ticked it.</i>"
+)
+
+ONLINE_COMMANDS = [
+    ("cases", "Open cases for your channels"),
+    ("help", "List commands"),
+]
+
+
 async def refresh_menu_for(bot, user_id: int) -> None:
     """Re-publish one person's menu after their role changes."""
     role = role_of(user_id)
     pairs = ADMIN_COMMANDS if role in ("admin", "owner") else AGENT_COMMANDS
+    if role == "online":
+        pairs = ONLINE_COMMANDS
     if role == "owner":
         pairs = pairs + OWNER_EXTRA
     try:
@@ -2476,6 +2683,11 @@ async def refresh_menu_for(bot, user_id: int) -> None:
             [BotCommand(c, d) for c, d in pairs],
             scope=BotCommandScopeChat(user_id),
         )
+        if PUBLIC_URL:
+            # Everyone gets the shared App button; the Online team's app opens
+            # on their handover view. (Clears any older per-person button.)
+            await bot.set_chat_menu_button(
+                chat_id=user_id, menu_button=MenuButtonDefault())
     except Exception as e:
         log.info("Couldn't refresh menu for %s: %s", user_id, e)
 
@@ -2496,7 +2708,8 @@ async def publish_command_menus(app: Application) -> None:
             )
             elevated = set(ADMIN_IDS) | {
                 r["user_id"]
-                for r in q("SELECT user_id FROM agents WHERE role='admin' AND active=1")
+                for r in q("SELECT user_id FROM agents WHERE role IN ('admin', "
+                           "'online') AND active=1")
             }
             for uid in elevated:
                 await refresh_menu_for(bot, uid)
@@ -2654,6 +2867,29 @@ MINIAPP_HTML = """<!DOCTYPE html>
      color: var(--tg-theme-text-color,#111); }
   .case .more { font-size:11px; color: var(--tg-theme-link-color,#2a7);
      margin-top:6px; cursor:pointer; }
+  .case .st { font-size:12px; font-weight:600; margin-top:6px; }
+  .case .nt { font-size:12px; margin-top:6px; padding:6px 8px; border-radius:8px;
+     background: var(--tg-theme-secondary-bg-color, rgba(0,0,0,.04)); }
+  .case .hist { font-size:11px; color: var(--tg-theme-hint-color,#888);
+     margin-top:8px; line-height:1.5; }
+  .case .addnote { margin-top:8px; display:flex; gap:6px; align-items:flex-end; }
+  .case .addnote textarea { flex:1; min-height:38px; font-size:13px; }
+  .case .acts { display:flex; flex-wrap:wrap; gap:6px; margin-top:8px; }
+  .case .acts button { flex:1 1 auto; padding:8px 10px; border:0; border-radius:8px;
+     background: var(--tg-theme-button-color,#2a7);
+     color: var(--tg-theme-button-text-color,#fff); font-size:13px; }
+  .case .acts button.soft { background: var(--tg-theme-secondary-bg-color,#eee);
+     color: var(--tg-theme-text-color,#111); }
+  .otabs { display:flex; gap:6px; margin:10px 0 6px; }
+  .otabs button { flex:1; padding:8px 4px; border:0; border-radius:8px; font-size:13px;
+     background: var(--tg-theme-secondary-bg-color,#eee);
+     color: var(--tg-theme-text-color,#111); }
+  .otabs button.on { background: var(--tg-theme-button-color,#2a7);
+     color: var(--tg-theme-button-text-color,#fff); font-weight:600; }
+  .otabs.small button { padding:6px 4px; font-size:12px; }
+  .case .addnote button { flex:0 0 auto; padding:8px 12px; border:0; border-radius:8px;
+     background: var(--tg-theme-button-color,#2a7);
+     color: var(--tg-theme-button-text-color,#fff); font-size:13px; }
   .stale { color:#b26a00; }
   .fld { margin-bottom:14px; }
   .fld label { display:block; font-size:11px; font-weight:700; letter-spacing:.05em;
@@ -2710,9 +2946,12 @@ window.addEventListener('unhandledrejection', e =>
 const tg = window.Telegram?.WebApp;
 if (tg) { tg.ready(); tg.expand(); }
 let VIEW = 'home', MODE = 'week', START = '', WHICH = 'now', IS_ADMIN = false;
+// The Online team's app: handover cases only, sorted into platform tabs.
+let ONLINE = false, ON_GROUP = '', ON_REGION = '';
 const esc = s => String(s).replace(/[&<>]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
 
 function navBar() {
+  if (ONLINE) return '';
   const items = [['home','🏠','Home'], ['week','📅','Week'],
                  ['me','🕐','Hours'], ['ho','📝','Handover']];
   if (IS_ADMIN) items.push(['team','👥','Team']);
@@ -2758,6 +2997,7 @@ async function loadHome() {
   const app = document.getElementById('app');
   const r = { ok: true, json: () => getJSON('/api/home') };
   const d = await r.json();
+  if (d.online) { ONLINE = true; VIEW = 'ho'; return loadHandover(); }
   IS_ADMIN = !!d.isAdmin;
 
   let h = `<h1>${esc(d.name)}</h1><div class="sub">${esc(d.today)}</div>`;
@@ -2874,10 +3114,12 @@ let HO = null, HO_FORM = null, HO_SHOWN = {}, HO_CHOOSE = false;
 let AGENT = null;   // whose detail we're looking at
 
 function caseCard(c, closed) {
+  // SH's tick: done once SH has closed it, even while Online still has to.
+  const ticked = closed || c.shClosed;
   let h = `<div class="case${closed ? ' gone' : ''}">`;
   h += '<div class="top">';
-  h += `<div class="tick${closed ? '' : ' on'}" data-id="${c.id}" `
-     + `data-close="${closed ? '0' : '1'}">${closed ? '' : '✓'}</div>`;
+  h += `<div class="tick${ticked ? '' : ' on'}" data-id="${c.id}" `
+     + `data-close="${ticked ? '0' : '1'}">${ticked ? '' : '✓'}</div>`;
   h += '<div style="flex:1">';
   h += `<div class="nm">${c.sla ? c.sla + ' ' : ''}${esc(c.prio)} ${esc(c.username)}</div>`;
   const bits = [];
@@ -2892,12 +3134,23 @@ function caseCard(c, closed) {
     + `${esc(c.due)}</span>`);
   if (c.section === 'follow') bits.push('follow up');
   h += `<div class="meta">${bits.join(' · ')}</div>`;
+  if (c.waiting) h += `<div class="st">${esc(c.status)}</div>`;
   h += '</div></div>';
+  if (c.note) h += `<div class="nt">${esc(c.note)}</div>`;
   if (HO_SHOWN[c.id]) {
     h += `<div class="body">${esc(c.body)}</div>`;
+    if (c.history && c.history.length) {
+      h += '<div class="hist">🕓 ' + c.history.map(esc).join('<br>') + '</div>';
+    }
+    if (!closed) {
+      h += `<div class="addnote"><textarea id="note_${c.id}" rows="1" `
+         + `placeholder="Add a note for SH and Online"></textarea>`
+         + `<button data-addnote="${c.id}">Add</button></div>`;
+    }
     h += `<div class="more" data-hide="${c.id}">Hide</div>`;
   } else {
-    h += `<div class="more" data-show="${c.id}">Show the case</div>`;
+    h += `<div class="more" data-show="${c.id}">Show the case`
+       + `${c.history && c.history.length ? ' · notes & history' : ''}</div>`;
   }
   h += '</div>';
   return h;
@@ -2953,6 +3206,7 @@ async function loadHandover() {
   const app = document.getElementById('app');
   const d = await getJSON('/api/handover');
   HO = d;
+  if (d.isOnline) { ONLINE = true; renderOnline(d); return; }
 
   let h = '<h1>Handover</h1>';
   const n = d.openCases.length;
@@ -2966,8 +3220,11 @@ async function loadHandover() {
 
   if (n) {
     h += '<h2>Still open</h2>';
-    h += '<div class="note" style="margin-top:0">Untick a case to close it.</div>';
-    for (const c of d.openCases) h += caseCard(c, false);
+    h += '<div class="note" style="margin-top:0">Untick a case to close it. '
+       + 'Cases waiting on Online stay here until they close it too.</div>';
+    // Anything Online handed back goes first: someone is waiting on SH.
+    const order = [...d.openCases].sort((a, b) => (b.handedBack - a.handedBack) || (a.id - b.id));
+    for (const c of order) h += caseCard(c, false);
   }
 
   h += '<button class="big" id="newCase" style="margin-top:14px">+  Add a case</button>';
@@ -3000,6 +3257,20 @@ function wireHandover() {
         { id: Number(el.dataset.id), close: el.dataset.close === '1' });
       if (!out.ok) { toast(out.error || 'Could not change that.'); return; }
       toast(out.closed ? 'Closed ' + out.username : 'Reopened ' + out.username);
+      await loadHandover();
+    };
+  });
+  document.querySelectorAll('[data-addnote]').forEach(el => {
+    el.onclick = async () => {
+      const id = el.dataset.addnote;
+      const box = document.getElementById('note_' + id);
+      const note = box ? box.value.trim() : '';
+      if (!note) { toast('Type a note first.'); return; }
+      el.disabled = true;
+      const out = await post('/api/case/note', { id: Number(id), note });
+      el.disabled = false;
+      if (!out.ok) { toast(out.error || 'Could not save that.'); return; }
+      toast('Note added');
       await loadHandover();
     };
   });
@@ -3083,6 +3354,120 @@ function keepForm() {
   }
   const st = document.getElementById('store');
   if (st) HO_FORM.store = st.value;
+}
+
+const ON_GROUPS = [['SHOPEE', 'Shopee'], ['LAZADA', 'Lazada'], ['WEBSTORE', 'Webstore']];
+const CH_GROUP = { SHOPEE_SG: 'SHOPEE', SHOPEE_MY: 'SHOPEE', LAZADA_SG: 'LAZADA',
+                   LAZADA_MY: 'LAZADA', TH: 'SHOPEE', WEBSTORE: 'WEBSTORE' };
+
+function onlineCard(c, mine) {
+  let h = '<div class="case"><div class="top"><div style="flex:1">';
+  h += `<div class="nm">${c.sla ? c.sla + ' ' : ''}${esc(c.prio)} ${esc(c.username)}`
+     + `${mine ? '' : ' <span class="meta">· not your channel</span>'}</div>`;
+  const bits = [];
+  if (c.store) bits.push(esc(c.flag) + esc(c.store));
+  else if (c.channelName) bits.push(esc(c.channelName));
+  if (c.from) bits.push('from ' + esc(c.from));
+  if (c.due) bits.push(`<span class="${c.sla ? 'stale' : ''}">`
+    + (c.sla === '🚨' ? 'overdue, was due ' : c.sla ? 'due today, ' : 'due ')
+    + `${esc(c.due)}</span>`);
+  h += `<div class="meta">${bits.join(' · ')}</div>`;
+  if (c.waiting) h += `<div class="st">${esc(c.status)}</div>`;
+  h += '</div></div>';
+  if (c.note) h += `<div class="nt">${esc(c.note)}</div>`;
+  if (HO_SHOWN[c.id]) {
+    h += `<div class="body">${esc(c.body)}</div>`;
+    if (c.history && c.history.length) {
+      h += '<div class="hist">🕓 ' + c.history.map(esc).join('<br>') + '</div>';
+    }
+    h += `<div class="addnote"><textarea id="note_${c.id}" rows="2" `
+       + `placeholder="A note, or what you need from SH"></textarea></div>`;
+    h += '<div class="acts">';
+    if (!c.onClosed) h += `<button data-onclose="${c.id}">✅ Close (Online)</button>`;
+    h += `<button class="soft" data-addnote="${c.id}">📝 Add note</button>`;
+    h += `<button class="soft" data-handback="${c.id}">↩️ Hand back to SH</button>`;
+    h += '</div>';
+    h += `<div class="more" data-hide="${c.id}">Hide</div>`;
+  } else {
+    h += `<div class="more" data-show="${c.id}">Open the case</div>`;
+  }
+  return h + '</div>';
+}
+
+function renderOnline(d) {
+  const app = document.getElementById('app');
+  const mine = new Set(d.myChannels || []);
+  const open = d.openCases;
+  if (!ON_GROUP) {
+    const first = open.find(c => mine.has(c.channel));
+    ON_GROUP = first ? first.group
+      : (d.myChannels && d.myChannels.length ? CH_GROUP[d.myChannels[0]] : 'SHOPEE');
+  }
+  const regions = ON_GROUP === 'WEBSTORE' ? [] : ['SG', 'MY', 'TH'];
+  if (ON_REGION && !regions.includes(ON_REGION)) ON_REGION = '';
+
+  const nMine = open.filter(c => mine.has(c.channel)).length;
+  let h = '<h1>Handover cases</h1>';
+  h += `<div class="sub">${open.length} open`
+     + `${mine.size ? ' · ' + nMine + ' on your channels' : ''}</div>`;
+
+  h += '<div class="otabs">' + ON_GROUPS.map(([g, label]) => {
+    const n = open.filter(c => c.group === g).length;
+    return `<button data-og="${g}" class="${ON_GROUP === g ? 'on' : ''}">${label}${n ? ' (' + n + ')' : ''}</button>`;
+  }).join('') + '</div>';
+  if (regions.length) {
+    const inGroup = open.filter(c => c.group === ON_GROUP);
+    h += '<div class="otabs small">'
+       + `<button data-or="" class="${ON_REGION ? '' : 'on'}">All</button>`
+       + regions.map(rg => {
+           const n = inGroup.filter(c => c.region === rg).length;
+           return `<button data-or="${rg}" class="${ON_REGION === rg ? 'on' : ''}">${rg}${n ? ' (' + n + ')' : ''}</button>`;
+         }).join('') + '</div>';
+  }
+
+  const shown = open
+    .filter(c => c.group === ON_GROUP && (!ON_REGION || c.region === ON_REGION))
+    .sort((a, b) => (mine.has(b.channel) - mine.has(a.channel)) || (a.id - b.id));
+  if (!shown.length) h += '<div class="note">Nothing open here 🎉</div>';
+  for (const c of shown) h += onlineCard(c, mine.has(c.channel));
+
+  const closed = d.closedCases.filter(c => c.group === ON_GROUP
+    && (!ON_REGION || c.region === ON_REGION));
+  if (closed.length) {
+    h += '<h2>Closed recently</h2>';
+    h += '<div class="note" style="margin-top:0">Tick one to reopen it.</div>';
+    for (const c of closed) h += caseCard(c, true);
+  }
+  app.innerHTML = h;
+  wireHandover();
+  document.querySelectorAll('[data-og]').forEach(el => {
+    el.onclick = () => { ON_GROUP = el.dataset.og; ON_REGION = ''; renderOnline(d); };
+  });
+  document.querySelectorAll('[data-or]').forEach(el => {
+    el.onclick = () => { ON_REGION = el.dataset.or; renderOnline(d); };
+  });
+  document.querySelectorAll('[data-onclose]').forEach(el => {
+    el.onclick = async () => {
+      el.disabled = true;
+      const out = await post('/api/case/toggle', { id: Number(el.dataset.onclose), close: true });
+      if (!out.ok) { el.disabled = false; toast(out.error || 'Could not close that.'); return; }
+      toast('Closed on the Online side');
+      await loadHandover();
+    };
+  });
+  document.querySelectorAll('[data-handback]').forEach(el => {
+    el.onclick = async () => {
+      const id = el.dataset.handback;
+      const box = document.getElementById('note_' + id);
+      // An empty box hands it back with the note they already left.
+      const note = box ? box.value.trim() : '';
+      el.disabled = true;
+      const out = await post('/api/case/handback', { id: Number(id), note });
+      if (!out.ok) { el.disabled = false; toast(out.error || 'Could not hand that back.'); return; }
+      toast('Handed back to SH');
+      await loadHandover();
+    };
+  });
 }
 
 async function loadWeek() {

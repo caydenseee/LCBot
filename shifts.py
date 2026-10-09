@@ -552,7 +552,7 @@ async def on_swap_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     context.user_data["swap_slot"] = slot["id"]
     holders = {h["user_id"] for h in slot_holders(slot["id"])}
     others = [
-        a for a in q("SELECT * FROM agents WHERE status='active' ORDER BY name")
+        a for a in q("SELECT * FROM agents WHERE status='active' AND role<>'online' ORDER BY name")
         if a["user_id"] != query.from_user.id and a["user_id"] not in holders
     ]
     if not others:

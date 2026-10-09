@@ -47,6 +47,14 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     status = agent_status(user.id)
 
+    if status == "active" and is_online(user.id):
+        touch_agent(user, dm_ok=1)
+        await update.message.reply_text(
+            ONLINE_HELP, parse_mode=constants.ParseMode.HTML,
+            reply_markup=ReplyKeyboardRemove(),
+        )
+        return ConversationHandler.END
+
     if status == "active":
         touch_agent(user, dm_ok=1)
         await update.message.reply_text(
@@ -128,7 +136,9 @@ async def got_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             [
                 InlineKeyboardButton("✅ Approve", callback_data=f"ap:{user.id}"),
                 InlineKeyboardButton("🚫 Decline", callback_data=f"dn:{user.id}"),
-            ]
+            ],
+            [InlineKeyboardButton("🛒 Approve as Online team",
+                                  callback_data=f"ao:{user.id}")],
         ]
     )
     sent = await notify_admins(context.bot, text, kb)
@@ -197,16 +207,22 @@ async def on_access_decision(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return
 
-    approve = kind == "ap"
+    approve = kind in ("ap", "ao")
+    online = kind == "ao"
     new_status = "active" if approve else "declined"
     async with write_lock:
         run(
             "UPDATE agents SET status=?, decided_by=?, decided_at=? WHERE user_id=?",
             (new_status, decider.id, now().isoformat(), target_id),
         )
+        if online:
+            # Handover cases only: off the avails, shift calls and roster.
+            run("UPDATE agents SET role='online', on_avails=0, tag_calls=0, "
+                "channels='[]' WHERE user_id=?", (target_id,))
 
     shown = row["display_name"] or row["name"]
-    verdict = "approved ✅" if approve else "declined 🚫"
+    verdict = ("approved for the Online team ✅" if online
+               else "approved ✅" if approve else "declined 🚫")
     await query.answer(f"{shown} {verdict}")
     settled = (
         f"🔔 <b>Access request</b>\n\n<b>{esc(shown)}</b>\n\n"
@@ -226,8 +242,28 @@ async def on_access_decision(update: Update, context: ContextTypes.DEFAULT_TYPE)
         except BadRequest:
             pass
 
+    if online:
+        await context.bot.send_message(
+            decider.id,
+            f"<b>Which channels does {esc(shown)} look after?</b>\n"
+            "Tick all that apply, then Done.",
+            parse_mode=constants.ParseMode.HTML,
+            reply_markup=channel_picker(target_id),
+        )
     try:
-        if approve:
+        if online:
+            await context.bot.send_message(
+                target_id,
+                "👋 <b>You're in, as part of the Online team.</b>\n\n"
+                "/cases — open handover cases, yours first. Tap one to close it, "
+                "add a note or hand it back to SH.\n"
+                "/help — this list again\n\n"
+                "<i>An admin is setting which channels you look after.</i>",
+                parse_mode=constants.ParseMode.HTML,
+                reply_markup=ReplyKeyboardRemove(),
+            )
+            await refresh_menu_for(context.bot, target_id)
+        elif approve:
             await context.bot.send_message(
                 target_id,
                 reply_markup=agent_keyboard(target_id),
@@ -251,6 +287,172 @@ async def on_access_decision(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
     except Exception:
         pass
+
+
+def channel_picker(user_id: int) -> InlineKeyboardMarkup:
+    have = set(online_channels(user_id))
+    rows = [
+        [InlineKeyboardButton(f"{'✅' if key in have else '⬜️'} {flag} {name}",
+                              callback_data=f"tc:{user_id}:{key}")]
+        for key, flag, name in CHANNELS
+    ]
+    rows.append([InlineKeyboardButton("Done", callback_data=f"tc:{user_id}:done")])
+    rows.append([InlineKeyboardButton("Remove from the Online team",
+                                      callback_data=f"tc:{user_id}:remove")])
+    return InlineKeyboardMarkup(rows)
+
+
+def channels_text(user_id: int) -> str:
+    have = online_channels(user_id)
+    return ", ".join(CHANNEL_NAMES[k] for k, _, _ in CHANNELS if k in have) or "none yet"
+
+
+async def on_channel_pick(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admins tick the channels an Online team member looks after."""
+    query = update.callback_query
+    if not is_admin(query.from_user.id):
+        await query.answer("Only admins can change this.", show_alert=True)
+        return
+    _, raw, choice = query.data.split(":", 2)
+    uid = int(raw)
+    row = q1("SELECT * FROM agents WHERE user_id=?", (uid,))
+    if not row:
+        await query.answer("That person isn't on the list any more.", show_alert=True)
+        return
+    shown = row["display_name"] or row["name"]
+
+    if choice == "make":
+        async with write_lock:
+            run("UPDATE agents SET role='online', on_avails=0, tag_calls=0, "
+                "channels=COALESCE(channels, '[]') WHERE user_id=?", (uid,))
+        await refresh_menu_for(context.bot, uid)
+        try:
+            await context.bot.send_message(
+                uid, ONLINE_HELP, parse_mode=constants.ParseMode.HTML,
+                reply_markup=ReplyKeyboardRemove())
+        except Exception:
+            pass
+        await query.answer(f"{shown} is now in the Online team")
+        await query.edit_message_text(
+            f"<b>Which channels does {esc(shown)} look after?</b>\n"
+            "Tick all that apply, then Done.",
+            parse_mode=constants.ParseMode.HTML, reply_markup=channel_picker(uid))
+        return
+    if choice == "remove":
+        async with write_lock:
+            run("UPDATE agents SET role='agent', channels=NULL WHERE user_id=?", (uid,))
+        await refresh_menu_for(context.bot, uid)
+        try:
+            await context.bot.send_message(
+                uid, "You're back on the SH side. /help shows your commands.",
+                reply_markup=agent_keyboard(uid))
+        except Exception:
+            pass
+        await query.answer()
+        await query.edit_message_text(
+            f"{shown} is no longer in the Online team. They're a regular agent "
+            "again — turn their avails and tags back on with /avails and /tag "
+            "if they need them.")
+        return
+    if choice == "done":
+        await query.answer()
+        await query.edit_message_text(
+            f"✅ <b>{esc(shown)}</b> looks after: {esc(channels_text(uid))}",
+            parse_mode=constants.ParseMode.HTML)
+        try:
+            await context.bot.send_message(
+                uid, f"You're set up for: {channels_text(uid)}.\n\n"
+                     "/cases shows those first.")
+        except Exception:
+            pass
+        return
+
+    have = online_channels(uid)
+    have = [k for k in have if k != choice] if choice in have else have + [choice]
+    async with write_lock:
+        run("UPDATE agents SET channels=? WHERE user_id=?", (json.dumps(have), uid))
+    await query.answer()
+    try:
+        await query.edit_message_reply_markup(reply_markup=channel_picker(uid))
+    except BadRequest:
+        pass
+
+
+async def cmd_channels(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/channels         — the Online team and what they look after
+       /channels @mei    — change Mei's channels, or add her to the team"""
+    if update.effective_chat.type != constants.ChatType.PRIVATE:
+        return
+    if not is_admin(update.effective_user.id):
+        return
+    target = " ".join(context.args).strip()
+    if not target:
+        team = q("SELECT * FROM agents WHERE role='online' AND status='active' "
+                 "ORDER BY name")
+        lines = ["<b>Online team</b>", ""]
+        lines += [f"• {esc(r['display_name'] or r['name'])}: "
+                  f"{esc(channels_text(r['user_id']))}" for r in team] or ["Nobody yet."]
+        lines += ["", "Change someone's channels: <code>/channels @username</code>",
+                  "New people: tap <b>Approve as Online team</b> on their request."]
+        await update.message.reply_text(
+            "\n".join(lines), parse_mode=constants.ParseMode.HTML)
+        return
+
+    row = find_agent(target)
+    if not row:
+        await update.message.reply_text("I can't find that person. Try their @username.")
+        return
+    shown = row["display_name"] or row["name"]
+    if row["role"] != "online":
+        await update.message.reply_text(
+            f"{shown} isn't in the Online team. Move them over? They'll only "
+            "see handover cases, and come off the avails and shift calls.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+                "🛒 Move to the Online team", callback_data=f"tc:{row['user_id']}:make")]]),
+        )
+        return
+    await update.message.reply_text(
+        f"<b>Which channels does {esc(shown)} look after?</b>\n"
+        "Tick all that apply, then Done.",
+        parse_mode=constants.ParseMode.HTML,
+        reply_markup=channel_picker(row["user_id"]),
+    )
+
+
+async def cmd_actas(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/actas online | /actas sh — test bot only (TEST_MODE=on): the owner
+    switches their own account to the Online team's side and back."""
+    user = update.effective_user
+    if (not TEST_MODE or not is_owner(user.id)
+            or update.effective_chat.type != constants.ChatType.PRIVATE):
+        return
+    want = context.args[0].lower() if context.args else ""
+    if want not in ("online", "sh"):
+        await update.message.reply_text(
+            "Test mode: /actas online to see the Online team's side, "
+            "/actas sh to come back.")
+        return
+    async with write_lock:
+        touch_agent(user, dm_ok=1)
+        if want == "online":
+            run("UPDATE agents SET role='online', status='active', "
+                "channels=COALESCE(channels, '[]') WHERE user_id=?", (user.id,))
+        else:
+            run("UPDATE agents SET role='agent', status='active' WHERE user_id=?",
+                (user.id,))
+    await refresh_menu_for(context.bot, user.id)
+    if want == "online":
+        await update.message.reply_text(
+            "🧪 <b>Test mode: you're on the Online team's side now.</b>\n"
+            "/actas sh switches back.\n\n" + ONLINE_HELP,
+            parse_mode=constants.ParseMode.HTML, reply_markup=ReplyKeyboardRemove())
+        await update.message.reply_text(
+            "<b>Which channels do you look after?</b>\nTick all that apply, then Done.",
+            parse_mode=constants.ParseMode.HTML, reply_markup=channel_picker(user.id))
+    else:
+        await update.message.reply_text(
+            "🧪 Back on the SH side. /help shows your commands.",
+            reply_markup=agent_keyboard(user.id))
 
 
 async def cmd_access(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -356,7 +558,7 @@ async def cmd_roster(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     if not is_admin(update.effective_user.id):
         return
-    rows = q("SELECT * FROM agents WHERE status='active' ORDER BY name")
+    rows = q("SELECT * FROM agents WHERE status='active' AND role<>'online' ORDER BY name")
     waiting = q1("SELECT COUNT(*) c FROM agents WHERE status='pending'")["c"]
     if not rows:
         await reply_long(update.message, 
@@ -468,8 +670,8 @@ async def cmd_tag(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(update.effective_user.id):
         return
     if not context.args:
-        on = q("SELECT * FROM agents WHERE status='active' AND tag_calls=1 ORDER BY name")
-        off = q("SELECT * FROM agents WHERE status='active' AND tag_calls=0 ORDER BY name")
+        on = q("SELECT * FROM agents WHERE status='active' AND role<>'online' AND tag_calls=1 ORDER BY name")
+        off = q("SELECT * FROM agents WHERE status='active' AND role<>'online' AND tag_calls=0 ORDER BY name")
         lines = [f"<b>Tagged in the nightly post ({len(on)})</b>"]
         lines += [f"  {esc(a['display_name'] or a['name'])}" for a in on] or ["  nobody"]
         lines += ["", f"<b>Not tagged ({len(off)})</b>"]
@@ -515,8 +717,8 @@ async def cmd_salaried(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not is_admin(update.effective_user.id):
         return
     if not context.args:
-        sal = q("SELECT * FROM agents WHERE status='active' AND salaried=1 ORDER BY name")
-        hourly = q("SELECT * FROM agents WHERE status='active' AND salaried=0 ORDER BY name")
+        sal = q("SELECT * FROM agents WHERE status='active' AND role<>'online' AND salaried=1 ORDER BY name")
+        hourly = q("SELECT * FROM agents WHERE status='active' AND role<>'online' AND salaried=0 ORDER BY name")
         lines = [f"<b>Salaried — no hourly pay ({len(sal)})</b>"]
         lines += [f"  {esc(a['display_name'] or a['name'])}" for a in sal] or ["  nobody"]
         lines += ["", f"<b>Paid hourly ({len(hourly)})</b>"]
@@ -569,8 +771,8 @@ async def cmd_avails(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     if not is_admin(update.effective_user.id):
         return
     if not context.args:
-        on = q("SELECT * FROM agents WHERE status='active' AND on_avails=1 ORDER BY name")
-        off = q("SELECT * FROM agents WHERE status='active' AND on_avails=0 ORDER BY name")
+        on = q("SELECT * FROM agents WHERE status='active' AND role<>'online' AND on_avails=1 ORDER BY name")
+        off = q("SELECT * FROM agents WHERE status='active' AND role<>'online' AND on_avails=0 ORDER BY name")
         lines = [f"<b>On the avails roster ({len(on)})</b>"]
         lines += [f"  {esc(a['display_name'] or a['name'])}" for a in on] or ["  nobody"]
         lines += ["", f"<b>Not tagged or chased ({len(off)})</b>"]
